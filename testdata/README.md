@@ -5,6 +5,7 @@
 The following small compatibility fixtures come from the Apache ORC repository and are licensed under Apache License 2.0 (see the repository's `LICENSE` file):
 
 - `apache-test1.orc`: `examples/TestOrcFile.test1.orc`; primitive, nested, list, and map values.
+- `apache-row-index.orc`: `examples/orc_index_int_string.orc`; integer and string row-group indexes.
 - `apache-string-binary-stats.orc`: `examples/TestOrcFile.testStringAndBinaryStatistics.orc`; nullable strings and binary values with file and stripe statistics.
 - `apache-stripe-stats.orc`: `examples/TestOrcFile.testStripeLevelStats.orc`; three stripes with file and stripe statistics.
 
