@@ -10,10 +10,15 @@ import (
 // ColumnStatistics contains the statistics recorded for one ORC type id.
 // Type-specific fields are nil when the file does not include that statistic.
 type ColumnStatistics struct {
+	// NumberOfValues is the number of non-null values recorded for this column.
 	NumberOfValues    uint64
 	HasNumberOfValues bool
-	HasNull           bool
-	HasNullSet        bool
+	// HasNull reports whether the column includes any null values.
+	HasNull bool
+	// HasNullSet reports whether the file explicitly stores the hasNull field.
+	HasNullSet bool
+	// The type-specific statistics below are nil when the file does not include
+	// the corresponding statistic.
 	Integer           *IntegerStatistics
 	Double            *DoubleStatistics
 	String            *StringStatistics
