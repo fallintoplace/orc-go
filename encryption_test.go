@@ -125,6 +125,25 @@ func TestEncryptedColumnRoundTrip(t *testing.T) {
 			if !reflect.DeepEqual(got, rows) {
 				t.Fatalf("ReadAll() = %#v, want %#v", got, rows)
 			}
+			indexes, err := reader.RowIndexes()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(indexes) != 2 {
+				t.Fatalf("encrypted row-index stripes = %d, want 2", len(indexes))
+			}
+			secretIndex := findColumnRowIndex(t, indexes, 1)
+			if len(secretIndex.Entries) != 1 {
+				t.Fatalf("first encrypted secret row groups = %d, want 1", len(secretIndex.Entries))
+			}
+			firstSecret := secretIndex.Entries[0].Statistics
+			if firstSecret.NumberOfValues != 1 || firstSecret.String == nil || firstSecret.String.Minimum != "secret-one" || firstSecret.String.Maximum != "secret-one" {
+				t.Fatalf("decrypted encrypted row-group statistics = %+v", firstSecret)
+			}
+			secondSecret := findColumnRowIndex(t, []StripeRowIndexes{indexes[1]}, 1).Entries[0].Statistics
+			if secondSecret.NumberOfValues != 1 || secondSecret.String == nil || secondSecret.String.Minimum != "secret-three" || secondSecret.String.Maximum != "secret-three" {
+				t.Fatalf("second decrypted encrypted row-group statistics = %+v", secondSecret)
+			}
 			if len(reader.footer.encryption.variants) != 2 || reader.footer.encryption.keyProvider != 1 {
 				t.Fatalf("unexpected file encryption metadata: %#v", reader.footer.encryption)
 			}
@@ -150,6 +169,14 @@ func TestEncryptedColumnRoundTrip(t *testing.T) {
 			}
 			if !reflect.DeepEqual(masked, wantMasked) {
 				t.Fatalf("keyless ReadAll() = %#v, want %#v", masked, wantMasked)
+			}
+			maskedIndexes, err := keyless.RowIndexes()
+			if err != nil {
+				t.Fatal(err)
+			}
+			maskedSecret := findColumnRowIndex(t, maskedIndexes, 1)
+			if len(maskedSecret.Entries) != 1 || maskedSecret.Entries[0].Statistics.NumberOfValues != 0 || !maskedSecret.Entries[0].Statistics.HasNull {
+				t.Fatalf("keyless encrypted row-group statistics = %+v", maskedSecret)
 			}
 
 			unavailable, err := NewReaderWithOptions(bytes.NewReader(output.Bytes()), int64(output.Len()), ReaderOptions{

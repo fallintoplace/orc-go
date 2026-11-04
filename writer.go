@@ -42,6 +42,11 @@ type WriterOptions struct {
 	// MaxRowsPerStripe flushes a stripe after this many rows. Zero writes all rows
 	// as one stripe when Close is called.
 	MaxRowsPerStripe uint64
+	// RowIndexStride sets the maximum rows per row-index entry. Zero uses the
+	// ORC default of 10,000 rows. Values below 1,000 are not supported.
+	RowIndexStride uint64
+	// DisableRowIndexes omits row-index streams and sets the stride to zero.
+	DisableRowIndexes bool
 	// EncryptColumns encrypts each named root field and its type subtree.
 	EncryptColumns []EncryptionRule
 	// KeyProvider supplies the master keys named by EncryptColumns.
@@ -62,6 +67,9 @@ type Writer struct {
 	fileEncryption fileEncryption
 	rowCount       uint64
 	stripeRows     uint64
+	rowIndexStride uint64
+	rowsInRowGroup uint64
+	rowGroupRows   []uint64
 	stripeInfos    [][]byte
 	fileStatistics []ColumnStatistics
 	stripeStats    []stripeStatistics
@@ -74,19 +82,23 @@ type Writer struct {
 }
 
 type writerColumn struct {
-	id        uint32
-	name      string
-	kind      TypeKind
-	precision uint32
-	scale     uint32
-	maxLength uint32
-	values    []any
+	id           uint32
+	name         string
+	kind         TypeKind
+	precision    uint32
+	scale        uint32
+	maxLength    uint32
+	values       []any
+	rowGroupEnds []int
 }
 
 type writerStream struct {
-	kind   uint32
-	column uint32
-	data   []byte
+	kind            uint32
+	column          uint32
+	data            []byte
+	segments        [][]byte
+	groupOffsets    []uint64
+	groupBitOffsets []uint8
 }
 
 // NewWriter creates a writer for a root STRUCT whose fields are
@@ -95,6 +107,18 @@ type writerStream struct {
 func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Writer, error) {
 	if destination == nil {
 		return nil, errors.New("ORC writer destination is nil")
+	}
+	if options.DisableRowIndexes {
+		if options.RowIndexStride != 0 {
+			return nil, errors.New("ORC row-index stride cannot be set when row indexes are disabled")
+		}
+	} else {
+		if options.RowIndexStride == 0 {
+			options.RowIndexStride = 10_000
+		}
+		if options.RowIndexStride < 1_000 || options.RowIndexStride > uint64(^uint32(0)) {
+			return nil, fmt.Errorf("ORC row-index stride must be between 1,000 and %d, got %d", uint64(^uint32(0)), options.RowIndexStride)
+		}
 	}
 	types := cloneTypes(schema)
 	if err := validateTypes(types); err != nil {
@@ -179,6 +203,7 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 		columns:        columns,
 		columnByName:   columnByName,
 		options:        options,
+		rowIndexStride: options.RowIndexStride,
 		encryption:     encryption,
 		encryptionFor:  encryptionFor,
 		fileEncryption: fileEncryption,
@@ -218,6 +243,12 @@ func (w *Writer) WriteRow(row Row) error {
 	}
 	w.rowCount++
 	w.stripeRows++
+	if w.rowIndexStride > 0 {
+		w.rowsInRowGroup++
+		if w.rowsInRowGroup == w.rowIndexStride {
+			w.recordRowGroupEnd()
+		}
+	}
 	if w.options.MaxRowsPerStripe > 0 && w.stripeRows >= w.options.MaxRowsPerStripe {
 		if err := w.flushStripe(); err != nil {
 			w.writeErr = err
@@ -426,6 +457,7 @@ func (w *Writer) encodeFileTail() ([]byte, error) {
 		footer = appendProtoBytesField(footer, 5, encodeUserMetadataItem(item))
 	}
 	footer = appendProtoVarintField(footer, 6, w.rowCount)
+	footer = appendProtoVarintField(footer, 8, w.rowIndexStride)
 	for _, statistics := range w.fileStatistics {
 		footer = appendProtoBytesField(footer, 7, encodeColumnStatistics(statistics))
 	}
@@ -460,6 +492,9 @@ func (w *Writer) flushStripe() error {
 	if w.stripeRows == 0 {
 		return nil
 	}
+	if w.rowIndexStride > 0 && w.rowsInRowGroup > 0 {
+		w.recordRowGroupEnd()
+	}
 	stripeData, stripeInfo, stripeStats, err := w.encodeStripe(w.bodyOffset, w.stripeRows)
 	if err != nil {
 		return err
@@ -486,13 +521,31 @@ func (w *Writer) flushStripe() error {
 	w.stripeStats = append(w.stripeStats, stripeStatistics{columns: cloneColumnStatistics(stripeStats)})
 	w.bodyOffset += uint64(len(stripeData))
 	w.stripeRows = 0
+	w.rowsInRowGroup = 0
+	w.rowGroupRows = nil
 	for i := range w.columns {
 		w.columns[i].values = nil
+		w.columns[i].rowGroupEnds = nil
 	}
 	return nil
 }
 
+func (w *Writer) recordRowGroupEnd() {
+	for i := range w.columns {
+		w.columns[i].rowGroupEnds = append(w.columns[i].rowGroupEnds, len(w.columns[i].values))
+	}
+	w.rowGroupRows = append(w.rowGroupRows, w.rowsInRowGroup)
+	w.rowsInRowGroup = 0
+}
+
 func (w *Writer) encodeStripe(offset, rows uint64) ([]byte, []byte, []ColumnStatistics, error) {
+	if w.rowIndexStride > 0 {
+		return w.encodeStripeWithIndexes(offset, rows)
+	}
+	return w.encodeStripeWithoutIndexes(offset, rows)
+}
+
+func (w *Writer) encodeStripeWithoutIndexes(offset, rows uint64) ([]byte, []byte, []ColumnStatistics, error) {
 	stripeID := uint64(len(w.stripeInfos) + 1)
 	if len(w.encryption) > 0 && stripeID > 0xffffff {
 		return nil, nil, nil, fmt.Errorf("ORC encryption supports at most 0xffffff stripes")
