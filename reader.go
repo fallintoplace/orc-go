@@ -35,6 +35,7 @@ type Reader struct {
 	source     io.ReaderAt
 	size       int64
 	closer     io.Closer
+	options    ReaderOptions
 	postScript postScript
 	footer     fileFooter
 	metadataAt int64
@@ -43,6 +44,11 @@ type Reader struct {
 
 // Open opens an ORC file from disk.
 func Open(path string) (*Reader, error) {
+	return OpenWithOptions(path, ReaderOptions{})
+}
+
+// OpenWithOptions opens a file with options for reading encrypted columns.
+func OpenWithOptions(path string, options ReaderOptions) (*Reader, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -52,7 +58,7 @@ func Open(path string) (*Reader, error) {
 		file.Close()
 		return nil, err
 	}
-	reader, err := NewReader(file, info.Size())
+	reader, err := NewReaderWithOptions(file, info.Size(), options)
 	if err != nil {
 		file.Close()
 		return nil, err
@@ -64,6 +70,12 @@ func Open(path string) (*Reader, error) {
 // NewReader reads an ORC file from a random access source. The caller retains
 // ownership of source and is responsible for closing it if needed.
 func NewReader(source io.ReaderAt, size int64) (*Reader, error) {
+	return NewReaderWithOptions(source, size, ReaderOptions{})
+}
+
+// NewReaderWithOptions reads an ORC file from a random access source. The
+// caller retains ownership of source and is responsible for closing it.
+func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions) (*Reader, error) {
 	if source == nil {
 		return nil, fmt.Errorf("%w: nil source", ErrInvalidFile)
 	}
@@ -122,10 +134,14 @@ func NewReader(source io.ReaderAt, size int64) (*Reader, error) {
 	if err := validateFooter(footer, metadataAt); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidFile, err)
 	}
+	if err := validateFileEncryption(footer.encryption, footer.types, footer.stripes, footer.stripeEncryption); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidFile, err)
+	}
 
 	return &Reader{
 		source:     source,
 		size:       size,
+		options:    options,
 		postScript: postScript,
 		footer:     footer,
 		metadataAt: metadataAt,

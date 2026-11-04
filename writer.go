@@ -41,25 +41,32 @@ type WriterOptions struct {
 	// MaxRowsPerStripe flushes a stripe after this many rows. Zero writes all rows
 	// as one stripe when Close is called.
 	MaxRowsPerStripe uint64
+	// EncryptColumns encrypts each named root field and its type subtree.
+	EncryptColumns []EncryptionRule
+	// KeyProvider supplies the master keys named by EncryptColumns.
+	KeyProvider KeyProvider
 }
 
 // Writer writes ORC files for root STRUCT schemas with primitive or nested columns.
 // It buffers rows for the current stripe and writes completed stripes to the
 // destination. Close writes the file footer and does not close the destination.
 type Writer struct {
-	destination   io.Writer
-	types         []Type
-	columns       []writerColumn
-	columnByName  map[string]int
-	options       WriterOptions
-	rowCount      uint64
-	stripeRows    uint64
-	stripeInfos   [][]byte
-	bodyOffset    uint64
-	headerWritten bool
-	writeErr      error
-	closed        bool
-	closeErr      error
+	destination    io.Writer
+	types          []Type
+	columns        []writerColumn
+	columnByName   map[string]int
+	options        WriterOptions
+	encryption     []writerEncryptionVariant
+	encryptionFor  []int
+	fileEncryption fileEncryption
+	rowCount       uint64
+	stripeRows     uint64
+	stripeInfos    [][]byte
+	bodyOffset     uint64
+	headerWritten  bool
+	writeErr       error
+	closed         bool
+	closeErr       error
 }
 
 type writerColumn struct {
@@ -153,14 +160,21 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 		columns[subtype].name = name
 		columnByName[name] = int(subtype)
 	}
+	encryption, encryptionFor, fileEncryption, err := prepareWriterEncryption(types, columnByName, options.EncryptColumns, options.KeyProvider)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Writer{
-		destination:  destination,
-		types:        types,
-		columns:      columns,
-		columnByName: columnByName,
-		options:      options,
-		bodyOffset:   uint64(len(fileMagic)),
+		destination:    destination,
+		types:          types,
+		columns:        columns,
+		columnByName:   columnByName,
+		options:        options,
+		encryption:     encryption,
+		encryptionFor:  encryptionFor,
+		fileEncryption: fileEncryption,
+		bodyOffset:     uint64(len(fileMagic)),
 	}, nil
 }
 
@@ -374,6 +388,9 @@ func (w *Writer) encodeFileTail() ([]byte, error) {
 		footer = appendProtoBytesField(footer, 4, encodeType(typ))
 	}
 	footer = appendProtoVarintField(footer, 6, w.rowCount)
+	if len(w.encryption) != 0 {
+		footer = appendProtoBytesField(footer, 10, encodeFileEncryption(w.fileEncryption))
+	}
 	encodedFooter, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, footer)
 	if err != nil {
 		return nil, fmt.Errorf("compress ORC footer: %w", err)
@@ -421,34 +438,83 @@ func (w *Writer) flushStripe() error {
 }
 
 func (w *Writer) encodeStripe(offset, rows uint64) ([]byte, []byte, error) {
+	stripeID := uint64(len(w.stripeInfos) + 1)
+	if len(w.encryption) > 0 && stripeID > 0xffffff {
+		return nil, nil, fmt.Errorf("ORC encryption supports at most 0xffffff stripes")
+	}
 	var streamBytes []byte
 	var streamFooter []byte
 	encodings := make([]columnEncoding, len(w.types))
+	variantStreams := make([][]writerStream, len(w.encryption))
+	variantEncodings := make([][]columnEncoding, len(w.encryption))
 	for _, column := range w.columns {
-		columnStreams, encoding, err := w.encodeColumn(column)
-		if err != nil {
-			return nil, nil, fmt.Errorf("encode column %q: %w", column.name, err)
+		variantIndex := w.encryptionFor[column.id]
+		maskedColumn := column
+		if variantIndex >= 0 {
+			if column.id == w.encryption[variantIndex].root {
+				maskedColumn.values = make([]any, len(column.values))
+			} else {
+				maskedColumn.values = nil
+			}
 		}
-		encodings[column.id] = encoding
-		for _, stream := range columnStreams {
+		maskedStreams, maskedEncoding, err := w.encodeColumn(maskedColumn)
+		if err != nil {
+			return nil, nil, fmt.Errorf("encode masked column %q: %w", column.name, err)
+		}
+		encodings[column.id] = maskedEncoding
+		for _, stream := range maskedStreams {
 			encoded, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, stream.data)
 			if err != nil {
 				return nil, nil, fmt.Errorf("compress stream kind %d for column %q: %w", stream.kind, column.name, err)
 			}
 			streamBytes = append(streamBytes, encoded...)
-			message := appendProtoVarintField(nil, 1, uint64(stream.kind))
-			message = appendProtoVarintField(message, 2, uint64(stream.column))
-			message = appendProtoVarintField(message, 3, uint64(len(encoded)))
-			streamFooter = appendProtoBytesField(streamFooter, 1, message)
+			streamFooter = appendStripeStream(streamFooter, stream, uint64(len(encoded)))
+		}
+
+		if variantIndex >= 0 {
+			columnStreams, encoding, err := w.encodeColumn(column)
+			if err != nil {
+				return nil, nil, fmt.Errorf("encode encrypted column %q: %w", column.name, err)
+			}
+			variantEncodings[variantIndex] = append(variantEncodings[variantIndex], encoding)
+			variant := w.encryption[variantIndex]
+			for _, stream := range columnStreams {
+				encoded, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, stream.data)
+				if err != nil {
+					return nil, nil, fmt.Errorf("compress encrypted stream kind %d for column %q: %w", stream.kind, column.name, err)
+				}
+				encoded, err = cryptORCStream(variant.localKey, variant.rule.Algorithm, stream.column, stream.kind, stripeID, encoded)
+				if err != nil {
+					return nil, nil, fmt.Errorf("encrypt stream kind %d for column %q: %w", stream.kind, column.name, err)
+				}
+				variantStreams[variantIndex] = append(variantStreams[variantIndex], writerStream{
+					kind: stream.kind, column: stream.column, data: encoded,
+				})
+			}
 		}
 	}
 
-	for _, encoding := range encodings {
-		message := appendProtoVarintField(nil, 1, uint64(encoding.kind))
-		if encoding.dictionarySize > 0 {
-			message = appendProtoVarintField(message, 2, uint64(encoding.dictionarySize))
+	var encryptedData []byte
+	for variantIndex, streams := range variantStreams {
+		variantFooter := make([]byte, 0)
+		for _, stream := range streams {
+			encryptedData = append(encryptedData, stream.data...)
+			variantFooter = appendStripeStream(variantFooter, stream, uint64(len(stream.data)))
 		}
-		streamFooter = appendProtoBytesField(streamFooter, 2, message)
+		for _, encoding := range variantEncodings[variantIndex] {
+			variantFooter = appendStripeEncoding(variantFooter, encoding)
+		}
+		streamFooter = appendProtoBytesField(streamFooter, 4, variantFooter)
+	}
+	if len(encryptedData) > 0 {
+		virtualStream := appendProtoVarintField(nil, 1, 10) // ENCRYPTED_DATA
+		virtualStream = appendProtoVarintField(virtualStream, 3, uint64(len(encryptedData)))
+		streamFooter = appendProtoBytesField(streamFooter, 1, virtualStream)
+		streamBytes = append(streamBytes, encryptedData...)
+	}
+
+	for _, encoding := range encodings {
+		streamFooter = appendStripeEncoding(streamFooter, encoding)
 	}
 	for _, column := range w.columns {
 		if column.kind == TypeKindTimestamp {
@@ -465,8 +531,29 @@ func (w *Writer) encodeStripe(offset, rows uint64) ([]byte, []byte, error) {
 	stripeInfo = appendProtoVarintField(stripeInfo, 3, uint64(len(streamBytes)))
 	stripeInfo = appendProtoVarintField(stripeInfo, 4, uint64(len(stripeFooter)))
 	stripeInfo = appendProtoVarintField(stripeInfo, 5, rows)
+	if len(w.encryption) > 0 && len(w.stripeInfos) == 0 {
+		stripeInfo = appendProtoVarintField(stripeInfo, 6, stripeID)
+		for _, variant := range w.encryption {
+			stripeInfo = appendProtoBytesField(stripeInfo, 7, variant.encryptedKey)
+		}
+	}
 	stripe := append(streamBytes, stripeFooter...)
 	return stripe, stripeInfo, nil
+}
+
+func appendStripeStream(footer []byte, stream writerStream, length uint64) []byte {
+	message := appendProtoVarintField(nil, 1, uint64(stream.kind))
+	message = appendProtoVarintField(message, 2, uint64(stream.column))
+	message = appendProtoVarintField(message, 3, length)
+	return appendProtoBytesField(footer, 1, message)
+}
+
+func appendStripeEncoding(footer []byte, encoding columnEncoding) []byte {
+	message := appendProtoVarintField(nil, 1, uint64(encoding.kind))
+	if encoding.dictionarySize > 0 {
+		message = appendProtoVarintField(message, 2, uint64(encoding.dictionarySize))
+	}
+	return appendProtoBytesField(footer, 2, message)
 }
 
 func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, columnEncoding, error) {
