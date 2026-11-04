@@ -12,6 +12,8 @@ Work in progress. The reader supports primitive and nested fields, including STR
 
 `ReadRowsWithColumns` and `ReadAllWithColumns` read selected root fields. A selected nested field is returned as a complete nested value.
 
+`ReadRowsRange` and `ReadAllRange` read a zero-based, end-exclusive row range. They skip stripes outside the range. Use the `WithColumns` variants to read selected root fields.
+
 `Reader.FileStatistics()` returns file-level column statistics in schema type-id order. `Reader.StripeStatistics()` returns the same statistics for each stripe. Statistics that are not present in the file have their `Has...` field set to false. Encrypted statistics are not exposed by these methods.
 
 `Reader.RowIndexes()` reads row-group stream positions and optional statistics for each stripe. Columns without a `ROW_INDEX` stream are omitted. Encrypted row indexes are decoded when a key is available; otherwise the masked indexes are returned.
