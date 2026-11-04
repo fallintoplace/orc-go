@@ -36,6 +36,24 @@ func TestReadsApacheORCEncryptedFixture(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ReadAll() = %#v, want %#v", got, want)
 	}
+	statistics, err := reader.EncryptionStatistics("secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statistics.File) != 1 || len(statistics.Stripes) != 1 || len(statistics.Stripes[0]) != 1 {
+		t.Fatalf("encrypted statistics shape = file %d, stripes %#v", len(statistics.File), statistics.Stripes)
+	}
+	fileSecret := statistics.File[0]
+	if fileSecret.NumberOfValues != 3 || fileSecret.HasNull || fileSecret.String == nil || fileSecret.String.Minimum != "apache-secret-0" || fileSecret.String.Maximum != "apache-secret-2" || fileSecret.String.Sum != 45 {
+		t.Fatalf("encrypted file statistics = %+v", fileSecret)
+	}
+	stripeSecret := statistics.Stripes[0][0]
+	if stripeSecret.NumberOfValues != 3 || stripeSecret.HasNull || stripeSecret.String == nil || stripeSecret.String.Minimum != "apache-secret-0" || stripeSecret.String.Maximum != "apache-secret-2" || stripeSecret.String.Sum != 45 {
+		t.Fatalf("encrypted stripe statistics = %+v", stripeSecret)
+	}
+	if _, err := reader.EncryptionStatistics("clear"); !errors.Is(err, ErrColumnNotEncrypted) {
+		t.Fatalf("EncryptionStatistics(clear) error = %v, want ErrColumnNotEncrypted", err)
+	}
 
 	keyless, err := NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -52,6 +70,9 @@ func TestReadsApacheORCEncryptedFixture(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("keyless ReadAll() = %#v, want %#v", got, want)
+	}
+	if _, err := keyless.EncryptionStatistics("secret"); !errors.Is(err, ErrKeyUnavailable) {
+		t.Fatalf("keyless EncryptionStatistics(secret) error = %v, want ErrKeyUnavailable", err)
 	}
 }
 
@@ -85,7 +106,10 @@ func TestEncryptedColumnRoundTrip(t *testing.T) {
 		{Column: "secret", KeyName: "key-128", KeyVersion: 1, Algorithm: EncryptionAESCTR128},
 		{Column: "profile", KeyName: "key-256", KeyVersion: 2, Algorithm: EncryptionAESCTR256},
 	}
-	for _, compression := range []CompressionKind{CompressionNone, CompressionZlib, CompressionZstd} {
+	for _, compression := range []CompressionKind{
+		CompressionNone, CompressionZlib, CompressionSnappy, CompressionLZO,
+		CompressionLZ4, CompressionZstd, CompressionBrotli,
+	} {
 		t.Run(compression.String(), func(t *testing.T) {
 			var output bytes.Buffer
 			writer, err := NewWriter(&output, schema, WriterOptions{
@@ -124,6 +148,44 @@ func TestEncryptedColumnRoundTrip(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, rows) {
 				t.Fatalf("ReadAll() = %#v, want %#v", got, rows)
+			}
+			secretStatistics, err := reader.EncryptionStatistics("secret")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(secretStatistics.File) != 1 || len(secretStatistics.Stripes) != 2 || len(secretStatistics.Stripes[0]) != 1 {
+				t.Fatalf("encrypted secret statistics shape = file %d, stripes %#v", len(secretStatistics.File), secretStatistics.Stripes)
+			}
+			secretFile := secretStatistics.File[0]
+			if secretFile.NumberOfValues != 2 || !secretFile.HasNull || secretFile.String == nil || secretFile.String.Minimum != "secret-one" || secretFile.String.Maximum != "secret-three" || secretFile.String.Sum != 22 {
+				t.Fatalf("encrypted secret file statistics = %+v", secretFile)
+			}
+			if got := secretStatistics.Stripes[0][0]; got.NumberOfValues != 1 || !got.HasNull || got.String == nil || got.String.Minimum != "secret-one" || got.String.Maximum != "secret-one" {
+				t.Fatalf("first encrypted secret stripe statistics = %+v", got)
+			}
+			if got := secretStatistics.Stripes[1][0]; got.NumberOfValues != 1 || got.HasNull || got.String == nil || got.String.Minimum != "secret-three" || got.String.Maximum != "secret-three" {
+				t.Fatalf("second encrypted secret stripe statistics = %+v", got)
+			}
+
+			profileStatistics, err := reader.EncryptionStatistics("profile")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(profileStatistics.File) != 3 || len(profileStatistics.Stripes) != 2 || len(profileStatistics.Stripes[0]) != 3 {
+				t.Fatalf("encrypted profile statistics shape = file %d, stripes %#v", len(profileStatistics.File), profileStatistics.Stripes)
+			}
+			if got := profileStatistics.File[0]; got.NumberOfValues != 2 || !got.HasNull {
+				t.Fatalf("encrypted profile root statistics = %+v", got)
+			}
+			if got := profileStatistics.File[1]; got.NumberOfValues != 1 || !got.HasNull || got.String == nil || got.String.Minimum != "private-one" || got.String.Maximum != "private-one" {
+				t.Fatalf("encrypted profile name statistics = %+v", got)
+			}
+			if got := profileStatistics.File[2]; got.NumberOfValues != 2 || got.HasNull || got.Integer == nil || got.Integer.Minimum != 1 || got.Integer.Maximum != 3 || got.Integer.Sum != 4 {
+				t.Fatalf("encrypted profile rank statistics = %+v", got)
+			}
+			maskedStatistics := reader.FileStatistics()
+			if maskedStatistics[1].NumberOfValues != 0 || !maskedStatistics[1].HasNull || (maskedStatistics[1].String != nil && maskedStatistics[1].String.HasMinimum) {
+				t.Fatalf("public secret statistics expose encrypted values: %+v", maskedStatistics[1])
 			}
 			var ranged []Row
 			if err := reader.ReadRowsRange(2, 3, func(row Row) error {
@@ -168,6 +230,28 @@ func TestEncryptedColumnRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			_, maskedFooter, err := keyless.readStripeStreams(keyless.footer.stripes[0], nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := maskedFooter.encodings[1].kind; got != columnEncodingDictionaryV2 {
+				t.Fatalf("masked secret encoding = %d, want dictionary-v2", got)
+			}
+			maskedSecretStreams := make(map[uint32]bool)
+			for _, stream := range maskedFooter.streams {
+				if stream.column != 1 || (stream.kind != streamKindData && stream.kind != streamKindLength && stream.kind != streamKindDictionaryData) {
+					continue
+				}
+				if stream.length != 0 {
+					t.Errorf("masked secret stream %d has %d bytes, want an empty fallback", stream.kind, stream.length)
+				}
+				maskedSecretStreams[stream.kind] = true
+			}
+			for _, kind := range []uint32{streamKindData, streamKindLength, streamKindDictionaryData} {
+				if !maskedSecretStreams[kind] {
+					t.Errorf("masked secret column is missing empty stream kind %d", kind)
+				}
+			}
 			masked, err := keyless.ReadAll()
 			if err != nil {
 				t.Fatal(err)
@@ -179,6 +263,9 @@ func TestEncryptedColumnRoundTrip(t *testing.T) {
 			}
 			if !reflect.DeepEqual(masked, wantMasked) {
 				t.Fatalf("keyless ReadAll() = %#v, want %#v", masked, wantMasked)
+			}
+			if _, err := keyless.EncryptionStatistics("secret"); !errors.Is(err, ErrKeyUnavailable) {
+				t.Fatalf("keyless EncryptionStatistics(secret) error = %v, want ErrKeyUnavailable", err)
 			}
 			maskedRange, err := keyless.ReadAllRange(2, 3)
 			if err != nil {
@@ -208,6 +295,124 @@ func TestEncryptedColumnRoundTrip(t *testing.T) {
 			}
 			if !reflect.DeepEqual(unavailableRows, wantMasked) {
 				t.Fatalf("unavailable-key ReadAll() = %#v, want %#v", unavailableRows, wantMasked)
+			}
+		})
+	}
+}
+
+func TestEncryptedStatisticsForEmptyFile(t *testing.T) {
+	schema := []Type{
+		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"secret"}},
+		{Kind: TypeKindString},
+	}
+	provider := KeyProviderFunc(func(string, uint32) ([]byte, error) {
+		return bytes.Repeat([]byte{0x41}, 16), nil
+	})
+	for _, compression := range []CompressionKind{CompressionNone, CompressionZlib} {
+		t.Run(compression.String(), func(t *testing.T) {
+			var output bytes.Buffer
+			writer, err := NewWriter(&output, schema, WriterOptions{
+				Compression:    compression,
+				EncryptColumns: []EncryptionRule{{Column: "secret", KeyName: "master", KeyVersion: 1, Algorithm: EncryptionAESCTR128}},
+				KeyProvider:    provider,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			reader, err := NewReaderWithOptions(bytes.NewReader(output.Bytes()), int64(output.Len()), ReaderOptions{KeyProvider: provider})
+			if err != nil {
+				t.Fatal(err)
+			}
+			statistics, err := reader.EncryptionStatistics("secret")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(statistics.File) != 1 || statistics.File[0].NumberOfValues != 0 || !statistics.File[0].HasNumberOfValues || len(statistics.Stripes) != 0 {
+				t.Fatalf("empty-file encrypted statistics = %+v", statistics)
+			}
+		})
+	}
+}
+
+func TestValidateEncryptionStatistics(t *testing.T) {
+	types := []Type{
+		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"secret"}},
+		{Kind: TypeKindString},
+	}
+	validStream := stripeStream{kind: streamKindStripeStatistics, column: 1, hasColumn: true, length: 12}
+	tests := []struct {
+		name       string
+		encryption *fileEncryption
+		stripes    int
+		length     uint64
+		wantErr    bool
+	}{
+		{
+			name: "valid encrypted statistics",
+			encryption: &fileEncryption{variants: []fileEncryptionVariant{{
+				root: 1, stripeStatistics: []stripeStream{validStream},
+			}}},
+			stripes: 1, length: validStream.length,
+		},
+		{
+			name:    "statistics bytes without encryption metadata",
+			length:  1,
+			wantErr: true,
+		},
+		{
+			name: "wrong stream kind",
+			encryption: &fileEncryption{variants: []fileEncryptionVariant{{
+				root: 1, stripeStatistics: []stripeStream{{kind: streamKindData, column: 1, hasColumn: true, length: 12}},
+			}}},
+			stripes: 1, length: 12, wantErr: true,
+		},
+		{
+			name: "missing column id",
+			encryption: &fileEncryption{variants: []fileEncryptionVariant{{
+				root: 1, stripeStatistics: []stripeStream{{kind: streamKindStripeStatistics, length: 12}},
+			}}},
+			stripes: 1, length: 12, wantErr: true,
+		},
+		{
+			name: "column outside encrypted subtree",
+			encryption: &fileEncryption{variants: []fileEncryptionVariant{{
+				root: 1, stripeStatistics: []stripeStream{{kind: streamKindStripeStatistics, column: 0, hasColumn: true, length: 12}},
+			}}},
+			stripes: 1, length: 12, wantErr: true,
+		},
+		{
+			name: "zero-length stream with stripes",
+			encryption: &fileEncryption{variants: []fileEncryptionVariant{{
+				root: 1, stripeStatistics: []stripeStream{{kind: streamKindStripeStatistics, column: 1, hasColumn: true}},
+			}}},
+			stripes: 1, wantErr: true,
+		},
+		{
+			name: "declared length mismatch",
+			encryption: &fileEncryption{variants: []fileEncryptionVariant{{
+				root: 1, stripeStatistics: []stripeStream{validStream},
+			}}},
+			stripes: 1, length: 11, wantErr: true,
+		},
+		{
+			name: "zero-length descriptor without stripes",
+			encryption: &fileEncryption{variants: []fileEncryptionVariant{{
+				root: 1, stripeStatistics: []stripeStream{{kind: streamKindStripeStatistics, column: 1, hasColumn: true}},
+			}}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateEncryptionStatistics(test.encryption, types, test.stripes, test.length)
+			if test.wantErr && err == nil {
+				t.Fatal("validateEncryptionStatistics() succeeded, want error")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("validateEncryptionStatistics() error = %v", err)
 			}
 		})
 	}
@@ -254,6 +459,18 @@ func TestEncryptedColumnWriterRejectsInvalidOptions(t *testing.T) {
 		KeyProvider:    validProvider,
 	}); err == nil {
 		t.Fatal("NewWriter() succeeded with a noncontiguous encrypted subtree")
+	}
+}
+
+func TestEncryptedDataStripeIDReservesStatisticsID(t *testing.T) {
+	if err := validateEncryptedDataStripeID(maxORCEncryptionStripeID - 1); err != nil {
+		t.Fatalf("last data stripe ID before the reserved statistics ID: %v", err)
+	}
+	if err := validateEncryptedDataStripeID(maxORCEncryptionStripeID); err == nil {
+		t.Fatal("data stripe ID reserved for statistics was accepted")
+	}
+	if _, err := cryptORCStream(bytes.Repeat([]byte{1}, 16), EncryptionAESCTR128, 1, streamKindFileStatistics, maxORCEncryptionStripeID, nil); err != nil {
+		t.Fatalf("reserved stripe ID cannot encrypt statistics: %v", err)
 	}
 }
 

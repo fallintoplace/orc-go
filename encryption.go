@@ -12,6 +12,16 @@ import (
 	"github.com/fallintoplace/orc-go/internal/wire"
 )
 
+const maxORCEncryptionStripeID uint64 = 0xffffff
+
+func validateEncryptedDataStripeID(stripeID uint64) error {
+	// The encrypted file and stripe statistics use the next stripe ID.
+	if stripeID == 0 || stripeID >= maxORCEncryptionStripeID {
+		return fmt.Errorf("encrypted ORC files support at most %d stripes; one stripe ID is reserved for statistics", maxORCEncryptionStripeID-1)
+	}
+	return nil
+}
+
 // EncryptionAlgorithm selects the AES key size used for ORC column streams.
 type EncryptionAlgorithm uint32
 
@@ -56,6 +66,13 @@ var ErrKeyUnavailable = errors.New("ORC encryption key is unavailable")
 // that this implementation cannot read.
 var ErrUnsupportedEncryption = errors.New("unsupported ORC encryption")
 
+// ErrColumnNotEncrypted is returned when a column has no encrypted variant.
+var ErrColumnNotEncrypted = errors.New("ORC column is not encrypted")
+
+// ErrEncryptedStatisticsUnavailable is returned when encrypted statistics are
+// not stored for a column or are incomplete.
+var ErrEncryptedStatisticsUnavailable = errors.New("encrypted ORC statistics are unavailable")
+
 // ReaderOptions controls key lookup when reading encrypted columns.
 type ReaderOptions struct {
 	// KeyProvider resolves the master keys used to wrap ORC local keys. If nil,
@@ -70,9 +87,11 @@ type encryptionKeyDescription struct {
 }
 
 type fileEncryptionVariant struct {
-	root         uint32
-	key          uint32
-	encryptedKey []byte
+	root             uint32
+	key              uint32
+	encryptedKey     []byte
+	stripeStatistics []stripeStream
+	fileStatistics   []byte
 }
 
 type dataMask struct {
@@ -100,12 +119,30 @@ type writerKeyID struct {
 }
 
 type writerEncryptionVariant struct {
-	rule         EncryptionRule
-	root         uint32
-	last         uint32
-	key          uint32
-	encryptedKey []byte
-	localKey     []byte
+	rule             EncryptionRule
+	root             uint32
+	last             uint32
+	key              uint32
+	encryptedKey     []byte
+	localKey         []byte
+	fileStatistics   []ColumnStatistics
+	stripeStatistics [][]ColumnStatistics
+}
+
+func makeEmptyEncryptionStatistics(root, last uint32) []ColumnStatistics {
+	statistics := make([]ColumnStatistics, int(last-root)+1)
+	for index := range statistics {
+		statistics[index] = newEmptyColumnStatistics()
+	}
+	return statistics
+}
+
+func encodeStripeStreamDescriptor(stream stripeStream) []byte {
+	data := appendProtoVarintField(nil, 1, uint64(stream.kind))
+	if stream.hasColumn {
+		data = appendProtoVarintField(data, 2, uint64(stream.column))
+	}
+	return appendProtoVarintField(data, 3, stream.length)
 }
 
 func prepareWriterEncryption(types []Type, rootColumns map[string]int, rules []EncryptionRule, provider KeyProvider) ([]writerEncryptionVariant, []int, fileEncryption, error) {
@@ -186,12 +223,14 @@ func prepareWriterEncryption(types []Type, rootColumns map[string]int, rules []E
 			columnVariants[id] = variantIndex
 		}
 		variants = append(variants, writerEncryptionVariant{
-			rule:         rule,
-			root:         uint32(root),
-			last:         last,
-			key:          keyIndex,
-			encryptedKey: encryptedKey,
-			localKey:     localKey,
+			rule:             rule,
+			root:             uint32(root),
+			last:             last,
+			key:              keyIndex,
+			encryptedKey:     encryptedKey,
+			localKey:         localKey,
+			fileStatistics:   makeEmptyEncryptionStatistics(uint32(root), last),
+			stripeStatistics: make([][]ColumnStatistics, int(last-uint32(root))+1),
 		})
 		file.variants = append(file.variants, fileEncryptionVariant{
 			root:         uint32(root),
@@ -467,6 +506,22 @@ func parseFileEncryptionVariant(data []byte) (fileEncryptionVariant, error) {
 		case 3:
 			result.encryptedKey, err = fieldBytes(field)
 			hasEncryptedKey = err == nil
+		case 4:
+			var data []byte
+			data, err = fieldBytes(field)
+			if err == nil {
+				var stream stripeStream
+				stream, err = parseStripeStream(data)
+				if err == nil {
+					result.stripeStatistics = append(result.stripeStatistics, stream)
+				}
+			}
+		case 5:
+			var data []byte
+			data, err = fieldBytes(field)
+			if err == nil {
+				result.fileStatistics = append([]byte(nil), data...)
+			}
 		}
 		if err != nil {
 			return fileEncryptionVariant{}, err
@@ -504,6 +559,12 @@ func encodeFileEncryption(encryption fileEncryption) []byte {
 		data = appendProtoVarintField(data, 1, uint64(variant.root))
 		data = appendProtoVarintField(data, 2, uint64(variant.key))
 		data = appendProtoBytesField(data, 3, variant.encryptedKey)
+		for _, stream := range variant.stripeStatistics {
+			data = appendProtoBytesField(data, 4, encodeStripeStreamDescriptor(stream))
+		}
+		if len(variant.fileStatistics) > 0 {
+			data = appendProtoBytesField(data, 5, variant.fileStatistics)
+		}
 		result = appendProtoBytesField(result, 3, data)
 	}
 	if encryption.keyProvider != 0 {
@@ -577,6 +638,43 @@ func validateFileEncryption(encryption *fileEncryption, types []Type, stripes []
 				return fmt.Errorf("stripe %d encrypted local key %d has %d bytes, want %d", i, keyIndex, len(encryptedKey), keyLength)
 			}
 		}
+	}
+	return nil
+}
+
+func validateEncryptionStatistics(encryption *fileEncryption, types []Type, stripeCount int, totalLength uint64) error {
+	if encryption == nil {
+		if totalLength != 0 {
+			return fmt.Errorf("encrypted stripe statistics have no file encryption metadata")
+		}
+		return nil
+	}
+	var length uint64
+	for variantIndex, variant := range encryption.variants {
+		last, err := contiguousEncryptionSubtreeLastColumn(types, variant.root)
+		if err != nil {
+			return fmt.Errorf("ORC encryption variant %d: %w", variantIndex, err)
+		}
+		seen := make(map[uint32]bool, len(variant.stripeStatistics))
+		for _, stream := range variant.stripeStatistics {
+			if stream.kind != streamKindStripeStatistics {
+				return fmt.Errorf("ORC encryption variant %d has stripe statistics stream kind %d", variantIndex, stream.kind)
+			}
+			if !stream.hasColumn || stream.column < variant.root || stream.column > last {
+				return fmt.Errorf("ORC encryption variant %d has stripe statistics for invalid column %d", variantIndex, stream.column)
+			}
+			if (stripeCount > 0 && stream.length == 0) || seen[stream.column] {
+				return fmt.Errorf("ORC encryption variant %d has an empty or duplicate stripe statistics stream for column %d", variantIndex, stream.column)
+			}
+			seen[stream.column] = true
+			if ^uint64(0)-length < stream.length {
+				return fmt.Errorf("ORC encrypted stripe statistics length overflows uint64")
+			}
+			length += stream.length
+		}
+	}
+	if length != totalLength {
+		return fmt.Errorf("ORC encrypted stripe statistics cover %d bytes, postscript declares %d", length, totalLength)
 	}
 	return nil
 }

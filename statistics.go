@@ -19,14 +19,14 @@ type ColumnStatistics struct {
 	HasNullSet bool
 	// The type-specific statistics below are nil when the file does not include
 	// the corresponding statistic.
-	Integer           *IntegerStatistics
-	Double            *DoubleStatistics
-	String            *StringStatistics
-	Bucket            *BucketStatistics
-	Decimal           *DecimalStatistics
-	Date              *DateStatistics
-	Binary            *BinaryStatistics
-	Timestamp         *TimestampStatistics
+	Integer   *IntegerStatistics
+	Double    *DoubleStatistics
+	String    *StringStatistics
+	Bucket    *BucketStatistics
+	Decimal   *DecimalStatistics
+	Date      *DateStatistics
+	Binary    *BinaryStatistics
+	Timestamp *TimestampStatistics
 }
 
 // IntegerStatistics describes integer, byte, and long columns.
@@ -448,6 +448,37 @@ func parseStripeStatistics(data []byte) (stripeStatistics, error) {
 			return stripeStatistics{}, err
 		}
 		result.columns = append(result.columns, stats)
+	}
+	return result, nil
+}
+
+func parseFileStatistics(data []byte) ([]ColumnStatistics, error) {
+	return parseColumnStatisticsList(data, "ORC file statistics")
+}
+
+func parseColumnarStripeStatistics(data []byte) ([]ColumnStatistics, error) {
+	return parseColumnStatisticsList(data, "ORC columnar stripe statistics")
+}
+
+func parseColumnStatisticsList(data []byte, description string) ([]ColumnStatistics, error) {
+	fields, err := wire.Fields(data)
+	if err != nil {
+		return nil, fmt.Errorf("decode %s: %w", description, err)
+	}
+	var result []ColumnStatistics
+	for _, field := range fields {
+		if field.Number != 1 {
+			continue
+		}
+		value, err := fieldBytes(field)
+		if err != nil {
+			return nil, err
+		}
+		statistics, err := parseColumnStatistics(value)
+		if err != nil {
+			return nil, fmt.Errorf("%s column %d: %w", description, len(result), err)
+		}
+		result = append(result, statistics)
 	}
 	return result, nil
 }
