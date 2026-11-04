@@ -4,6 +4,8 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+
+	"github.com/fallintoplace/orc-go/internal/rlev2"
 )
 
 type integerTestStream struct {
@@ -77,6 +79,29 @@ func TestReadRowsPreservesIntegerWidths(t *testing.T) {
 	}
 }
 
+func TestReadAllReadsRLEv2IntegerRows(t *testing.T) {
+	stripes := []integerTestStripe{
+		{rows: 5, streams: []integerTestStream{{kind: streamKindData, column: 1, data: rlev2.EncodeSigned([]int64{1, 2, 3, 4, 5})}}, encoding: []uint32{columnEncodingDirect, columnEncodingDirectV2}},
+		{rows: 4, streams: []integerTestStream{
+			{kind: streamKindPresent, column: 1, data: byteLiteralTestStream([]byte{0xa0})},
+			{kind: streamKindData, column: 1, data: rlev2.EncodeSigned([]int64{8, -10})},
+		}, encoding: []uint32{columnEncodingDirect, columnEncodingDirectV2}},
+	}
+	data := makeIntegerORCFile(t, CompressionNone, []string{"id"}, []TypeKind{TypeKindLong}, stripes)
+	reader, err := NewReader(byteReaderAt(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Row{{"id": int64(1)}, {"id": int64(2)}, {"id": int64(3)}, {"id": int64(4)}, {"id": int64(5)}, {"id": int64(8)}, {"id": nil}, {"id": int64(-10)}, {"id": nil}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+	}
+}
+
 func TestReadRowsPropagatesCallbackError(t *testing.T) {
 	wantErr := errors.New("stop here")
 	data := makeIntegerORCFile(t, CompressionNone, []string{"id"}, []TypeKind{TypeKindLong}, []integerTestStripe{{rows: 1, streams: []integerTestStream{{kind: streamKindData, column: 1, data: integerLiteralTestStream(1)}}}})
@@ -97,8 +122,8 @@ func TestReadRowsRejectsUnsupportedTypesAndEncodings(t *testing.T) {
 		wantErr  error
 	}{
 		{name: "unsupported type", kind: TypeKindString, encoding: columnEncodingDirect, wantErr: ErrUnsupportedType},
-		{name: "RLEv2", kind: TypeKindLong, encoding: columnEncodingDirectV2, wantErr: ErrUnsupportedEncoding},
 		{name: "dictionary", kind: TypeKindLong, encoding: columnEncodingDictionary, wantErr: ErrUnsupportedEncoding},
+		{name: "BYTE with RLEv2", kind: TypeKindByte, encoding: columnEncodingDirectV2, wantErr: ErrUnsupportedEncoding},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {

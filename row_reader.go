@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 
+	"github.com/fallintoplace/orc-go/internal/rlev2"
 	"github.com/fallintoplace/orc-go/internal/wire"
 )
 
@@ -94,10 +95,13 @@ func (r *Reader) ReadRows(yield func(Row) error) error {
 				return fmt.Errorf("stripe %d column %q (id %d): missing column encoding", stripeIndex, column.name, column.id)
 			}
 			encoding := footer.encodings[column.id].kind
-			if encoding != columnEncodingDirect {
+			if encoding != columnEncodingDirect && encoding != columnEncodingDirectV2 {
 				return fmt.Errorf("stripe %d column %q (id %d): %w: kind %d", stripeIndex, column.name, column.id, ErrUnsupportedEncoding, encoding)
 			}
-			values[i], err = decodeIntegerColumn(stripe.NumberOfRows, column, streams)
+			if column.kind == TypeKindByte && encoding != columnEncodingDirect {
+				return fmt.Errorf("stripe %d column %q (id %d): %w: BYTE requires DIRECT encoding", stripeIndex, column.name, column.id, ErrUnsupportedEncoding)
+			}
+			values[i], err = decodeIntegerColumn(stripe.NumberOfRows, column, streams, encoding)
 			if err != nil {
 				return fmt.Errorf("stripe %d column %q (id %d): %w", stripeIndex, column.name, column.id, err)
 			}
@@ -300,7 +304,7 @@ func parseColumnEncoding(data []byte) (columnEncoding, error) {
 	return result, nil
 }
 
-func decodeIntegerColumn(rowCount uint64, column integerColumn, streams map[streamKey][]byte) ([]any, error) {
+func decodeIntegerColumn(rowCount uint64, column integerColumn, streams map[streamKey][]byte, encoding uint32) ([]any, error) {
 	rows, err := checkedSliceLength(rowCount)
 	if err != nil {
 		return nil, err
@@ -346,7 +350,12 @@ func decodeIntegerColumn(rowCount uint64, column integerColumn, streams map[stre
 		return values, nil
 	}
 
-	encodedValues, err := decodeIntegerRLEv1(dataStream, valueCount)
+	var encodedValues []int64
+	if encoding == columnEncodingDirectV2 {
+		encodedValues, err = rlev2.DecodeSigned(dataStream, valueCount)
+	} else {
+		encodedValues, err = decodeIntegerRLEv1(dataStream, valueCount)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("decode DATA stream: %w", err)
 	}
