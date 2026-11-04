@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 
+	"github.com/fallintoplace/orc-go/internal/rlev1"
 	"github.com/fallintoplace/orc-go/internal/rlev2"
 	"github.com/fallintoplace/orc-go/internal/wire"
 )
@@ -414,7 +415,7 @@ func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byt
 	if encoding == columnEncodingDirectV2 {
 		encodedValues, err = rlev2.DecodeSigned(dataStream, valueCount)
 	} else {
-		encodedValues, err = decodeIntegerRLEv1(dataStream, valueCount)
+		encodedValues, err = rlev1.DecodeSigned(dataStream, valueCount)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("decode DATA stream: %w", err)
@@ -499,91 +500,6 @@ func decodeByteRLE(data []byte, expected int) ([]byte, error) {
 		return nil, fmt.Errorf("byte RLE produced %d bytes, want %d", len(values), expected)
 	}
 	return values, nil
-}
-
-func decodeIntegerRLEv1(data []byte, expected int) ([]int64, error) {
-	if expected < 0 {
-		return nil, fmt.Errorf("negative expected integer count %d", expected)
-	}
-	values := make([]int64, 0, expected)
-	for len(data) > 0 {
-		control := int8(data[0])
-		data = data[1:]
-		if control >= 0 {
-			count := int(control) + 3
-			if count > expected-len(values) {
-				return nil, fmt.Errorf("integer RLE produces more than %d values", expected)
-			}
-			if len(data) == 0 {
-				return nil, io.ErrUnexpectedEOF
-			}
-			delta := int8(data[0])
-			data = data[1:]
-			encoded, n, err := readORCVarint(data)
-			if err != nil {
-				return nil, err
-			}
-			data = data[n:]
-			value := decodeZigzag(encoded)
-			for i := 0; i < count; i++ {
-				values = append(values, value)
-				if i+1 < count {
-					value, err = addInt8Delta(value, delta)
-					if err != nil {
-						return nil, err
-					}
-				}
-			}
-			continue
-		}
-
-		count := -int(control)
-		if count > expected-len(values) {
-			return nil, fmt.Errorf("integer RLE produces more than %d values", expected)
-		}
-		for i := 0; i < count; i++ {
-			encoded, n, err := readORCVarint(data)
-			if err != nil {
-				return nil, err
-			}
-			data = data[n:]
-			values = append(values, decodeZigzag(encoded))
-		}
-	}
-	if len(values) != expected {
-		return nil, fmt.Errorf("integer RLE produced %d values, want %d", len(values), expected)
-	}
-	return values, nil
-}
-
-func readORCVarint(data []byte) (uint64, int, error) {
-	var value uint64
-	for i := 0; i < 10; i++ {
-		if i >= len(data) {
-			return 0, 0, io.ErrUnexpectedEOF
-		}
-		b := data[i]
-		if i == 9 && b > 1 {
-			return 0, 0, fmt.Errorf("ORC varint overflows uint64")
-		}
-		value |= uint64(b&0x7f) << (7 * i)
-		if b < 0x80 {
-			return value, i + 1, nil
-		}
-	}
-	return 0, 0, fmt.Errorf("ORC varint is longer than 10 bytes")
-}
-
-func decodeZigzag(value uint64) int64 {
-	return int64(value>>1) ^ -int64(value&1)
-}
-
-func addInt8Delta(value int64, delta int8) (int64, error) {
-	step := int64(delta)
-	if step > 0 && value > math.MaxInt64-step || step < 0 && value < math.MinInt64-step {
-		return 0, fmt.Errorf("integer RLE delta overflows int64")
-	}
-	return value + step, nil
 }
 
 func narrowInteger(value int64, kind TypeKind) (any, error) {

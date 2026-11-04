@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/fallintoplace/orc-go/internal/rlev1"
 	"github.com/fallintoplace/orc-go/internal/rlev2"
 )
 
@@ -356,7 +357,7 @@ func TestDecodeByteRLERunAndLiteralGroups(t *testing.T) {
 
 func TestDecodeIntegerRLEv1NegativeDeltaAndExtremes(t *testing.T) {
 	run := integerRunTestStream(100, -1, 3)
-	got, err := decodeIntegerRLEv1(run, 3)
+	got, err := rlev1.DecodeSigned(run, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,7 +366,7 @@ func TestDecodeIntegerRLEv1NegativeDeltaAndExtremes(t *testing.T) {
 	}
 
 	values := []int64{-9223372036854775808, 9223372036854775807}
-	got, err = decodeIntegerRLEv1(integerLiteralTestStream(values...), len(values))
+	got, err = rlev1.DecodeSigned(integerLiteralTestStream(values...), len(values))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +374,7 @@ func TestDecodeIntegerRLEv1NegativeDeltaAndExtremes(t *testing.T) {
 		t.Fatalf("extreme literals = %v, want %v", got, values)
 	}
 
-	if _, err := decodeIntegerRLEv1(integerRunTestStream(9223372036854775807, 1, 4), 4); err == nil {
+	if _, err := rlev1.DecodeSigned(integerRunTestStream(9223372036854775807, 1, 4), 4); err == nil {
 		t.Fatal("decodeIntegerRLEv1() accepted an overflowing delta run")
 	}
 }
