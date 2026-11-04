@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"time"
 	"unicode/utf8"
 
@@ -704,28 +705,35 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, columnEncodi
 }
 
 func encodeStringDictionary(column writerColumn, values []any, streams []writerStream, useRLEv2 bool) ([]writerStream, columnEncoding, error) {
-	indices := make([]uint64, len(values))
-	dictionaryIndexes := make(map[string]uint64, len(values))
-	dictionaryLengths := make([]uint64, 0, len(values))
-	var dictionaryData []byte
-	var dictionarySize uint64
-	for valueIndex, value := range values {
+	uniqueValues := make([]string, 0, len(values))
+	seenValues := make(map[string]struct{}, len(values))
+	for _, value := range values {
 		text := value.(string)
-		if index, exists := dictionaryIndexes[text]; exists {
-			indices[valueIndex] = index
+		if _, exists := seenValues[text]; exists {
 			continue
 		}
-		if dictionarySize >= math.MaxUint32 {
-			return nil, columnEncoding{}, fmt.Errorf("STRING dictionary has more than %d entries", uint64(math.MaxUint32))
-		}
-		index := dictionarySize
+		seenValues[text] = struct{}{}
+		uniqueValues = append(uniqueValues, text)
+	}
+	if uint64(len(uniqueValues)) > math.MaxUint32 {
+		return nil, columnEncoding{}, fmt.Errorf("STRING dictionary has more than %d entries", uint64(math.MaxUint32))
+	}
+	sort.Strings(uniqueValues)
+
+	dictionaryIndexes := make(map[string]uint64, len(uniqueValues))
+	dictionaryLengths := make([]uint64, 0, len(values))
+	var dictionaryData []byte
+	for index, text := range uniqueValues {
 		data := []byte(text)
-		dictionaryIndexes[text] = index
-		indices[valueIndex] = index
-		dictionarySize++
+		dictionaryIndexes[text] = uint64(index)
 		dictionaryLengths = append(dictionaryLengths, uint64(len(data)))
 		dictionaryData = append(dictionaryData, data...)
 	}
+	indices := make([]uint64, len(values))
+	for valueIndex, value := range values {
+		indices[valueIndex] = dictionaryIndexes[value.(string)]
+	}
+	dictionarySize := uint64(len(uniqueValues))
 
 	encoding := columnEncoding{kind: columnEncodingDictionary, dictionarySize: uint32(dictionarySize)}
 	encodeUnsigned := rlev1.EncodeUnsigned

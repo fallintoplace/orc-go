@@ -56,7 +56,7 @@ func TestWriterWritesStringDictionaries(t *testing.T) {
 		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"text"}},
 		{Kind: TypeKindString},
 	}
-	rows := []Row{{"text": "repeat"}, {"text": "repeat"}, {"text": ""}, {"text": nil}, {"text": "other"}}
+	rows := []Row{{"text": "repeat"}, {"text": "repeat"}, {"text": ""}, {"text": nil}, {"text": "other"}, {"text": "é"}, {"text": "Z"}}
 	for _, useRLEv2 := range []bool{false, true} {
 		t.Run("rlev2="+boolString(useRLEv2), func(t *testing.T) {
 			var output bytes.Buffer
@@ -78,7 +78,12 @@ func TestWriterWritesStringDictionaries(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer reader.Close()
-			_, stripeFooter, err := reader.readStripeStreams(reader.footer.stripes[0], nil)
+			wanted := map[streamKey]bool{
+				{kind: streamKindData, column: 1}:           true,
+				{kind: streamKindLength, column: 1}:         true,
+				{kind: streamKindDictionaryData, column: 1}: true,
+			}
+			streams, stripeFooter, err := reader.readStripeStreams(reader.footer.stripes[0], wanted)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -87,14 +92,31 @@ func TestWriterWritesStringDictionaries(t *testing.T) {
 			if useRLEv2 {
 				wantKind = columnEncodingDictionaryV2
 			}
-			if encoding.kind != wantKind || encoding.dictionarySize != 3 {
-				t.Fatalf("string encoding = %+v, want kind %d and dictionary size 3", encoding, wantKind)
+			if encoding.kind != wantKind || encoding.dictionarySize != 5 {
+				t.Fatalf("string encoding = %+v, want kind %d and dictionary size 5", encoding, wantKind)
+			}
+			if got, want := streams[streamKey{kind: streamKindDictionaryData, column: 1}], []byte("Zotherrepeaté"); !bytes.Equal(got, want) {
+				t.Fatalf("DICTIONARY_DATA = %q, want UTF-8 byte order %q", got, want)
+			}
+			lengths, err := decodeUnsignedIntegerStream(streams[streamKey{kind: streamKindLength, column: 1}], 5, useRLEv2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := []uint64{0, 1, 5, 6, 2}; !reflect.DeepEqual(lengths, want) {
+				t.Fatalf("dictionary LENGTH values = %v, want %v", lengths, want)
+			}
+			indices, err := decodeUnsignedIntegerStream(streams[streamKey{kind: streamKindData, column: 1}], 6, useRLEv2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := []uint64{3, 3, 0, 2, 4, 1}; !reflect.DeepEqual(indices, want) {
+				t.Fatalf("dictionary DATA indexes = %v, want %v", indices, want)
 			}
 			got, err := reader.ReadAll()
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := []Row{{"text": "repeat"}, {"text": "repeat"}, {"text": ""}, {"text": nil}, {"text": "other"}}
+			want := []Row{{"text": "repeat"}, {"text": "repeat"}, {"text": ""}, {"text": nil}, {"text": "other"}, {"text": "é"}, {"text": "Z"}}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("ReadAll() = %#v, want %#v", got, want)
 			}
