@@ -8,7 +8,11 @@ import (
 	"io"
 	"os"
 
+	"github.com/andybalholm/brotli"
 	"github.com/golang/snappy"
+	"github.com/klauspost/compress/zstd"
+	"github.com/pierrec/lz4/v4"
+	"github.com/woozymasta/lzo"
 )
 
 const (
@@ -21,7 +25,7 @@ const (
 var (
 	// ErrInvalidFile is returned when an ORC file's metadata is malformed.
 	ErrInvalidFile = errors.New("invalid ORC file")
-	// ErrUnsupportedCompression is returned for a codec not yet supported by this reader.
+	// ErrUnsupportedCompression is returned for an ORC compression codec that is not supported.
 	ErrUnsupportedCompression = errors.New("unsupported ORC compression")
 )
 
@@ -261,9 +265,79 @@ func decodeSection(kind CompressionKind, blockSize uint64, data []byte) ([]byte,
 			}
 			return snappy.Decode(nil, data)
 		})
+	case CompressionLZO:
+		return decodeORCChunks(data, blockSize, func(data []byte) ([]byte, error) {
+			decoded, consumed, err := lzo.DecompressN(data, lzo.DefaultDecompressOptions(int(blockSize)))
+			if err != nil {
+				return nil, err
+			}
+			if consumed != len(data) {
+				return nil, fmt.Errorf("LZO chunk consumed %d of %d bytes", consumed, len(data))
+			}
+			return decoded, nil
+		})
+	case CompressionLZ4:
+		return decodeORCChunks(data, blockSize, func(data []byte) ([]byte, error) {
+			decoded := make([]byte, int(blockSize))
+			length, err := lz4.UncompressBlock(data, decoded)
+			if err != nil {
+				return nil, err
+			}
+			return decoded[:length], nil
+		})
+	case CompressionZstd:
+		return decodeORCChunks(data, blockSize, func(data []byte) ([]byte, error) {
+			return decodeZstdChunk(data, blockSize)
+		})
+	case CompressionBrotli:
+		return decodeORCChunks(data, blockSize, func(data []byte) ([]byte, error) {
+			return decodeBrotliChunk(data, blockSize)
+		})
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedCompression, kind)
 	}
+}
+
+func decodeZstdChunk(data []byte, blockSize uint64) ([]byte, error) {
+	maxMemory := blockSize
+	if maxMemory < 1<<20 {
+		maxMemory = 1 << 20
+	}
+	maxWindow := blockSize
+	if maxWindow < 1<<10 {
+		maxWindow = 1 << 10
+	}
+	decoder, err := zstd.NewReader(nil,
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderMaxMemory(maxMemory),
+		zstd.WithDecoderMaxWindow(maxWindow),
+		zstd.WithDecodeAllCapLimit(true),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer decoder.Close()
+
+	decoded, err := decoder.DecodeAll(data, make([]byte, 0, int(blockSize)))
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(decoded)) > blockSize {
+		return nil, fmt.Errorf("Zstandard chunk expands to %d bytes, limit is %d", len(decoded), blockSize)
+	}
+	return decoded, nil
+}
+
+func decodeBrotliChunk(data []byte, blockSize uint64) ([]byte, error) {
+	reader := brotli.NewReader(bytes.NewReader(data))
+	decoded, err := io.ReadAll(io.LimitReader(reader, int64(blockSize)+1))
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(decoded)) > blockSize {
+		return nil, fmt.Errorf("Brotli chunk expands beyond %d bytes", blockSize)
+	}
+	return decoded, nil
 }
 
 func decodeORCChunks(data []byte, blockSize uint64, decode func([]byte) ([]byte, error)) ([]byte, error) {

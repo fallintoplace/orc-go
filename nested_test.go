@@ -8,7 +8,7 @@ import (
 )
 
 func TestWriterRoundTripsNestedRows(t *testing.T) {
-	compressions := []CompressionKind{CompressionNone, CompressionZlib, CompressionSnappy}
+	compressions := []CompressionKind{CompressionNone, CompressionZlib, CompressionSnappy, CompressionLZO, CompressionLZ4, CompressionZstd, CompressionBrotli}
 	for _, compression := range compressions {
 		for _, useRLEv2 := range []bool{false, true} {
 			for _, useDictionary := range []bool{false, true} {

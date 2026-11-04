@@ -22,7 +22,7 @@ func TestWriterRoundTripsPrimitiveRows(t *testing.T) {
 		{"enabled": nil, "tiny": nil, "small": int16(12), "count": nil, "big": int64(0), "ratio": nil, "total": 0.0, "label": nil, "payload": nil},
 	}
 
-	for _, compression := range []CompressionKind{CompressionNone, CompressionZlib, CompressionSnappy} {
+	for _, compression := range []CompressionKind{CompressionNone, CompressionZlib, CompressionSnappy, CompressionLZO, CompressionLZ4, CompressionZstd, CompressionBrotli} {
 		for _, useRLEv2 := range []bool{false, true} {
 			name := compression.String()
 			if useRLEv2 {
@@ -248,7 +248,7 @@ func TestNewWriterRejectsUnsupportedSchemasAndOptions(t *testing.T) {
 			{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"value"}},
 			{Kind: TypeKind(99)},
 		}},
-		{name: "unsupported compression", schema: valid, options: WriterOptions{Compression: CompressionLZO}},
+		{name: "unsupported compression", schema: valid, options: WriterOptions{Compression: CompressionKind(99)}},
 		{name: "oversized block", schema: valid, options: WriterOptions{Compression: CompressionSnappy, CompressionBlockSize: maxEncodedChunkLength + 1}},
 	}
 	for _, tc := range testCases {
