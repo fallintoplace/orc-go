@@ -61,6 +61,9 @@ func TestWriterRoundTripsPrimitiveRows(t *testing.T) {
 				if reader.NumRows() != uint64(len(rows)) {
 					t.Fatalf("NumRows() = %d, want %d", reader.NumRows(), len(rows))
 				}
+				if reader.NumStripes() != 1 {
+					t.Fatalf("NumStripes() = %d, want 1 by default", reader.NumStripes())
+				}
 				if gotSchema := reader.Schema(); !reflect.DeepEqual(gotSchema, primitiveWriterSchema()) {
 					t.Fatalf("Schema() = %#v, want %#v", gotSchema, primitiveWriterSchema())
 				}
