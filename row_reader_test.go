@@ -1,7 +1,9 @@
 package orc
 
 import (
+	"encoding/binary"
 	"errors"
+	"math"
 	"reflect"
 	"testing"
 
@@ -102,6 +104,124 @@ func TestReadAllReadsRLEv2IntegerRows(t *testing.T) {
 	}
 }
 
+func TestReadAllReadsBooleanAndFloatingPointRows(t *testing.T) {
+	floatData := make([]byte, 0, 16)
+	for _, value := range []float32{1.5, -2.25, 0, 3.75} {
+		var encoded [4]byte
+		binary.LittleEndian.PutUint32(encoded[:], math.Float32bits(value))
+		floatData = append(floatData, encoded[:]...)
+	}
+	doubleData := make([]byte, 0, 40)
+	for _, value := range []float64{-1.5, 0, 1e100, 2.125, -7.25} {
+		var encoded [8]byte
+		binary.LittleEndian.PutUint64(encoded[:], math.Float64bits(value))
+		doubleData = append(doubleData, encoded[:]...)
+	}
+	stripes := []integerTestStripe{{rows: 6, streams: []integerTestStream{
+		{kind: streamKindPresent, column: 1, data: byteLiteralTestStream([]byte{0xdc})},
+		{kind: streamKindData, column: 1, data: byteLiteralTestStream([]byte{0xa8})},
+		{kind: streamKindPresent, column: 2, data: byteLiteralTestStream([]byte{0xb4})},
+		{kind: streamKindData, column: 2, data: floatData},
+		{kind: streamKindPresent, column: 3, data: byteLiteralTestStream([]byte{0xec})},
+		{kind: streamKindData, column: 3, data: doubleData},
+	}}}
+	want := []Row{
+		{"enabled": true, "ratio": float32(1.5), "amount": float64(-1.5)},
+		{"enabled": false, "ratio": nil, "amount": float64(0)},
+		{"enabled": nil, "ratio": float32(-2.25), "amount": float64(1e100)},
+		{"enabled": true, "ratio": float32(0), "amount": nil},
+		{"enabled": false, "ratio": nil, "amount": float64(2.125)},
+		{"enabled": true, "ratio": float32(3.75), "amount": float64(-7.25)},
+	}
+	for _, compression := range []CompressionKind{CompressionNone, CompressionZlib, CompressionSnappy} {
+		t.Run(compression.String(), func(t *testing.T) {
+			data := makeIntegerORCFile(t, compression,
+				[]string{"enabled", "ratio", "amount"},
+				[]TypeKind{TypeKindBoolean, TypeKindFloat, TypeKindDouble}, stripes)
+			reader, err := NewReader(byteReaderAt(data), int64(len(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := reader.ReadAll()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestReadAllReadsAllNullPrimitiveRowsWithoutDataStreams(t *testing.T) {
+	streams := []integerTestStream{
+		{kind: streamKindPresent, column: 1, data: byteLiteralTestStream([]byte{0x00})},
+		{kind: streamKindPresent, column: 2, data: byteLiteralTestStream([]byte{0x00})},
+		{kind: streamKindPresent, column: 3, data: byteLiteralTestStream([]byte{0x00})},
+	}
+	data := makeIntegerORCFile(t, CompressionNone,
+		[]string{"enabled", "ratio", "amount"},
+		[]TypeKind{TypeKindBoolean, TypeKindFloat, TypeKindDouble},
+		[]integerTestStripe{{rows: 2, streams: streams}})
+	reader, err := NewReader(byteReaderAt(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Row{{"enabled": nil, "ratio": nil, "amount": nil}, {"enabled": nil, "ratio": nil, "amount": nil}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+	}
+}
+
+func TestReadAllReadsBooleanPackedValuesAcrossBytes(t *testing.T) {
+	data := makeIntegerORCFile(t, CompressionNone, []string{"enabled"}, []TypeKind{TypeKindBoolean}, []integerTestStripe{{
+		rows:    9,
+		streams: []integerTestStream{{kind: streamKindData, column: 1, data: byteLiteralTestStream([]byte{0xaa, 0x80})}},
+	}})
+	reader, err := NewReader(byteReaderAt(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Row{
+		{"enabled": true}, {"enabled": false}, {"enabled": true}, {"enabled": false}, {"enabled": true},
+		{"enabled": false}, {"enabled": true}, {"enabled": false}, {"enabled": true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+	}
+}
+
+func TestReadAllReadsBooleanByteRLERuns(t *testing.T) {
+	const rows = 24
+	data := makeIntegerORCFile(t, CompressionNone, []string{"enabled"}, []TypeKind{TypeKindBoolean}, []integerTestStripe{{
+		rows:    rows,
+		streams: []integerTestStream{{kind: streamKindData, column: 1, data: []byte{0x00, 0xff}}},
+	}})
+	reader, err := NewReader(byteReaderAt(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]Row, rows)
+	for i := range want {
+		want[i] = Row{"enabled": true}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+	}
+}
+
 func TestReadRowsPropagatesCallbackError(t *testing.T) {
 	wantErr := errors.New("stop here")
 	data := makeIntegerORCFile(t, CompressionNone, []string{"id"}, []TypeKind{TypeKindLong}, []integerTestStripe{{rows: 1, streams: []integerTestStream{{kind: streamKindData, column: 1, data: integerLiteralTestStream(1)}}}})
@@ -124,6 +244,8 @@ func TestReadRowsRejectsUnsupportedTypesAndEncodings(t *testing.T) {
 		{name: "unsupported type", kind: TypeKindString, encoding: columnEncodingDirect, wantErr: ErrUnsupportedType},
 		{name: "dictionary", kind: TypeKindLong, encoding: columnEncodingDictionary, wantErr: ErrUnsupportedEncoding},
 		{name: "BYTE with RLEv2", kind: TypeKindByte, encoding: columnEncodingDirectV2, wantErr: ErrUnsupportedEncoding},
+		{name: "BOOLEAN with RLEv2", kind: TypeKindBoolean, encoding: columnEncodingDirectV2, wantErr: ErrUnsupportedEncoding},
+		{name: "FLOAT with RLEv2", kind: TypeKindFloat, encoding: columnEncodingDirectV2, wantErr: ErrUnsupportedEncoding},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -303,6 +425,31 @@ func TestReadRowsRejectsMalformedPresentStreams(t *testing.T) {
 			}
 			if _, err := reader.ReadAll(); err == nil {
 				t.Fatal("ReadAll() succeeded for a malformed PRESENT stream")
+			}
+		})
+	}
+}
+
+func TestReadRowsRejectsMalformedBooleanAndFloatStreams(t *testing.T) {
+	testCases := []struct {
+		name    string
+		kind    TypeKind
+		streams []integerTestStream
+	}{
+		{name: "boolean truncated", kind: TypeKindBoolean, streams: []integerTestStream{{kind: streamKindData, column: 1, data: []byte{0xff}}}},
+		{name: "boolean too many packed bytes", kind: TypeKindBoolean, streams: []integerTestStream{{kind: streamKindData, column: 1, data: byteLiteralTestStream([]byte{0x80, 0x00})}}},
+		{name: "float truncated", kind: TypeKindFloat, streams: []integerTestStream{{kind: streamKindData, column: 1, data: []byte{0, 0, 0}}}},
+		{name: "double extra bytes", kind: TypeKindDouble, streams: []integerTestStream{{kind: streamKindData, column: 1, data: make([]byte, 9)}}},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := makeIntegerORCFile(t, CompressionNone, []string{"value"}, []TypeKind{tc.kind}, []integerTestStripe{{rows: 1, streams: tc.streams}})
+			reader, err := NewReader(byteReaderAt(data), int64(len(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := reader.ReadAll(); err == nil {
+				t.Fatal("ReadAll() succeeded for a malformed primitive DATA stream")
 			}
 		})
 	}
