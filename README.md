@@ -2,11 +2,32 @@
 
 A Go implementation of the Apache ORC file format.
 
-The project is being built from the published ORC format specification. The first milestone is a safe reader for file metadata; row decoding and writing will follow in separate steps.
+The implementation is being built from the published ORC format specification.
 
 ## Status
 
-Work in progress. The current API and format support are not stable yet.
+Work in progress. The current reader reads the file schema, row count, stripe directory, format version, and compression kind. Footer compression supports NONE, ZLIB, and SNAPPY. Row decoding and writing are not implemented yet, and the API is not stable.
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+
+	orc "github.com/fallintoplace/orc-go"
+)
+
+func main() {
+	reader, err := orc.Open("data.orc")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer reader.Close()
+
+	fmt.Println(reader.NumRows(), reader.NumStripes(), reader.Schema())
+}
+```
 
 ## License
 
