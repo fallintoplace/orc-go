@@ -63,6 +63,8 @@ type Writer struct {
 	rowCount       uint64
 	stripeRows     uint64
 	stripeInfos    [][]byte
+	fileStatistics []ColumnStatistics
+	stripeStats    []stripeStatistics
 	userMetadata   []UserMetadataItem
 	bodyOffset     uint64
 	headerWritten  bool
@@ -166,6 +168,10 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 	if err != nil {
 		return nil, err
 	}
+	fileStatistics := make([]ColumnStatistics, len(types))
+	for i := range fileStatistics {
+		fileStatistics[i] = newEmptyColumnStatistics()
+	}
 
 	return &Writer{
 		destination:    destination,
@@ -176,6 +182,7 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 		encryption:     encryption,
 		encryptionFor:  encryptionFor,
 		fileEncryption: fileEncryption,
+		fileStatistics: fileStatistics,
 		bodyOffset:     uint64(len(fileMagic)),
 	}, nil
 }
@@ -401,6 +408,12 @@ func (w *Writer) Close() error {
 }
 
 func (w *Writer) encodeFileTail() ([]byte, error) {
+	metadata := encodeFileMetadata(w.stripeStats)
+	encodedMetadata, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, metadata)
+	if err != nil {
+		return nil, fmt.Errorf("compress ORC metadata: %w", err)
+	}
+
 	footer := appendProtoVarintField(nil, 1, uint64(len(fileMagic)))
 	footer = appendProtoVarintField(footer, 2, w.bodyOffset)
 	for _, stripeInfo := range w.stripeInfos {
@@ -413,6 +426,9 @@ func (w *Writer) encodeFileTail() ([]byte, error) {
 		footer = appendProtoBytesField(footer, 5, encodeUserMetadataItem(item))
 	}
 	footer = appendProtoVarintField(footer, 6, w.rowCount)
+	for _, statistics := range w.fileStatistics {
+		footer = appendProtoBytesField(footer, 7, encodeColumnStatistics(statistics))
+	}
 	if len(w.encryption) != 0 {
 		footer = appendProtoBytesField(footer, 10, encodeFileEncryption(w.fileEncryption))
 	}
@@ -426,12 +442,16 @@ func (w *Writer) encodeFileTail() ([]byte, error) {
 	if w.options.Compression != CompressionNone {
 		postScript = appendProtoVarintField(postScript, 3, w.options.CompressionBlockSize)
 	}
+	if len(encodedMetadata) > 0 {
+		postScript = appendProtoVarintField(postScript, 5, uint64(len(encodedMetadata)))
+	}
 	postScript = appendProtoBytesField(postScript, 4, []byte{0, 12})
 	if len(postScript) > 255 {
 		return nil, fmt.Errorf("ORC postscript is too long: %d bytes", len(postScript))
 	}
 
-	tail := append(encodedFooter, postScript...)
+	tail := append(encodedMetadata, encodedFooter...)
+	tail = append(tail, postScript...)
 	tail = append(tail, byte(len(postScript)))
 	return tail, nil
 }
@@ -440,9 +460,17 @@ func (w *Writer) flushStripe() error {
 	if w.stripeRows == 0 {
 		return nil
 	}
-	stripeData, stripeInfo, err := w.encodeStripe(w.bodyOffset, w.stripeRows)
+	stripeData, stripeInfo, stripeStats, err := w.encodeStripe(w.bodyOffset, w.stripeRows)
 	if err != nil {
 		return err
+	}
+	fileStatistics := cloneColumnStatistics(w.fileStatistics)
+	for i, statistics := range stripeStats {
+		merged, err := mergeWriterColumnStatistics(w.types[i].Kind, fileStatistics[i], statistics)
+		if err != nil {
+			return fmt.Errorf("merge ORC statistics for column %d: %w", i, err)
+		}
+		fileStatistics[i] = merged
 	}
 	if !w.headerWritten {
 		if err := writeAll(w.destination, []byte(fileMagic)); err != nil {
@@ -454,6 +482,8 @@ func (w *Writer) flushStripe() error {
 		return fmt.Errorf("write ORC stripe: %w", err)
 	}
 	w.stripeInfos = append(w.stripeInfos, stripeInfo)
+	w.fileStatistics = fileStatistics
+	w.stripeStats = append(w.stripeStats, stripeStatistics{columns: cloneColumnStatistics(stripeStats)})
 	w.bodyOffset += uint64(len(stripeData))
 	w.stripeRows = 0
 	for i := range w.columns {
@@ -462,14 +492,15 @@ func (w *Writer) flushStripe() error {
 	return nil
 }
 
-func (w *Writer) encodeStripe(offset, rows uint64) ([]byte, []byte, error) {
+func (w *Writer) encodeStripe(offset, rows uint64) ([]byte, []byte, []ColumnStatistics, error) {
 	stripeID := uint64(len(w.stripeInfos) + 1)
 	if len(w.encryption) > 0 && stripeID > 0xffffff {
-		return nil, nil, fmt.Errorf("ORC encryption supports at most 0xffffff stripes")
+		return nil, nil, nil, fmt.Errorf("ORC encryption supports at most 0xffffff stripes")
 	}
 	var streamBytes []byte
 	var streamFooter []byte
 	encodings := make([]columnEncoding, len(w.types))
+	stripeStats := make([]ColumnStatistics, len(w.types))
 	variantStreams := make([][]writerStream, len(w.encryption))
 	variantEncodings := make([][]columnEncoding, len(w.encryption))
 	for _, column := range w.columns {
@@ -482,15 +513,20 @@ func (w *Writer) encodeStripe(offset, rows uint64) ([]byte, []byte, error) {
 				maskedColumn.values = nil
 			}
 		}
+		statistics, err := buildWriterColumnStatistics(column, maskedColumn.values, rows)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("build statistics for column %q: %w", column.name, err)
+		}
+		stripeStats[column.id] = statistics
 		maskedStreams, maskedEncoding, err := w.encodeColumn(maskedColumn)
 		if err != nil {
-			return nil, nil, fmt.Errorf("encode masked column %q: %w", column.name, err)
+			return nil, nil, nil, fmt.Errorf("encode masked column %q: %w", column.name, err)
 		}
 		encodings[column.id] = maskedEncoding
 		for _, stream := range maskedStreams {
 			encoded, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, stream.data)
 			if err != nil {
-				return nil, nil, fmt.Errorf("compress stream kind %d for column %q: %w", stream.kind, column.name, err)
+				return nil, nil, nil, fmt.Errorf("compress stream kind %d for column %q: %w", stream.kind, column.name, err)
 			}
 			streamBytes = append(streamBytes, encoded...)
 			streamFooter = appendStripeStream(streamFooter, stream, uint64(len(encoded)))
@@ -499,18 +535,18 @@ func (w *Writer) encodeStripe(offset, rows uint64) ([]byte, []byte, error) {
 		if variantIndex >= 0 {
 			columnStreams, encoding, err := w.encodeColumn(column)
 			if err != nil {
-				return nil, nil, fmt.Errorf("encode encrypted column %q: %w", column.name, err)
+				return nil, nil, nil, fmt.Errorf("encode encrypted column %q: %w", column.name, err)
 			}
 			variantEncodings[variantIndex] = append(variantEncodings[variantIndex], encoding)
 			variant := w.encryption[variantIndex]
 			for _, stream := range columnStreams {
 				encoded, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, stream.data)
 				if err != nil {
-					return nil, nil, fmt.Errorf("compress encrypted stream kind %d for column %q: %w", stream.kind, column.name, err)
+					return nil, nil, nil, fmt.Errorf("compress encrypted stream kind %d for column %q: %w", stream.kind, column.name, err)
 				}
 				encoded, err = cryptORCStream(variant.localKey, variant.rule.Algorithm, stream.column, stream.kind, stripeID, encoded)
 				if err != nil {
-					return nil, nil, fmt.Errorf("encrypt stream kind %d for column %q: %w", stream.kind, column.name, err)
+					return nil, nil, nil, fmt.Errorf("encrypt stream kind %d for column %q: %w", stream.kind, column.name, err)
 				}
 				variantStreams[variantIndex] = append(variantStreams[variantIndex], writerStream{
 					kind: stream.kind, column: stream.column, data: encoded,
@@ -549,7 +585,7 @@ func (w *Writer) encodeStripe(offset, rows uint64) ([]byte, []byte, error) {
 	}
 	stripeFooter, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, streamFooter)
 	if err != nil {
-		return nil, nil, fmt.Errorf("compress stripe footer: %w", err)
+		return nil, nil, nil, fmt.Errorf("compress stripe footer: %w", err)
 	}
 	stripeInfo := appendProtoVarintField(nil, 1, offset)
 	stripeInfo = appendProtoVarintField(stripeInfo, 2, 0)
@@ -563,7 +599,7 @@ func (w *Writer) encodeStripe(offset, rows uint64) ([]byte, []byte, error) {
 		}
 	}
 	stripe := append(streamBytes, stripeFooter...)
-	return stripe, stripeInfo, nil
+	return stripe, stripeInfo, stripeStats, nil
 }
 
 func appendStripeStream(footer []byte, stream writerStream, length uint64) []byte {
