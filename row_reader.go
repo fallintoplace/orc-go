@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"time"
 
 	"github.com/fallintoplace/orc-go/internal/rlev1"
 	"github.com/fallintoplace/orc-go/internal/rlev2"
@@ -36,9 +37,9 @@ const (
 )
 
 // Row contains one ORC root-struct row. Values use bool for BOOLEAN, the
-// matching integer width for integer columns, float32 or float64 for FLOAT or
-// DOUBLE, string for STRING, and []byte for BINARY. A nil value represents an
-// ORC null.
+// matching integer width for integer columns, time.Time for DATE, float32 or
+// float64 for FLOAT or DOUBLE, string for STRING, and []byte for BINARY. A nil
+// value represents an ORC null.
 type Row map[string]any
 
 type rowColumn struct {
@@ -149,7 +150,7 @@ func (r *Reader) rowColumns() ([]rowColumn, error) {
 		seenNames[name] = struct{}{}
 		typ := r.footer.types[subtype]
 		switch typ.Kind {
-		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary:
+		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate:
 		default:
 			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, typ.Kind)
 		}
@@ -160,7 +161,7 @@ func (r *Reader) rowColumns() ([]rowColumn, error) {
 
 func supportsRowEncoding(kind TypeKind, encoding uint32) bool {
 	switch kind {
-	case TypeKindShort, TypeKindInt, TypeKindLong:
+	case TypeKindShort, TypeKindInt, TypeKindLong, TypeKindDate:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
 	case TypeKindString:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDictionary || encoding == columnEncodingDirectV2 || encoding == columnEncodingDictionaryV2
@@ -422,7 +423,7 @@ func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byt
 			}
 		}
 		return values, nil
-	case TypeKindShort, TypeKindInt, TypeKindLong:
+	case TypeKindShort, TypeKindInt, TypeKindLong, TypeKindDate:
 		// Integer values are decoded below using the encoding selected in the stripe footer.
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedType, column.kind)
@@ -444,6 +445,13 @@ func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byt
 		}
 		value := encodedValues[valueIndex]
 		valueIndex++
+		if column.kind == TypeKindDate {
+			if value < math.MinInt32 || value > math.MaxInt32 {
+				return nil, fmt.Errorf("DATE value %d is out of range", value)
+			}
+			values[rowIndex] = time.Unix(value*86400, 0).UTC()
+			continue
+		}
 		values[rowIndex], err = narrowInteger(value, column.kind)
 		if err != nil {
 			return nil, err
