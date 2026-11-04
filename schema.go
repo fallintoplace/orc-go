@@ -100,13 +100,94 @@ func validateTypes(types []Type) error {
 				return fmt.Errorf("STRUCT type %d has %d subtypes and %d field names", i, len(typ.Subtypes), len(typ.FieldNames))
 			}
 		case TypeKindUnion:
-			if len(typ.Subtypes) == 0 || len(typ.FieldNames) != 0 {
-				return fmt.Errorf("UNION type %d must have subtypes and no field names", i)
+			if len(typ.Subtypes) == 0 || len(typ.Subtypes) > 256 || len(typ.FieldNames) != 0 {
+				return fmt.Errorf("UNION type %d must have 1 to 256 subtypes and no field names", i)
 			}
 		default:
 			if uint32(typ.Kind) < uint32(len(typeKindNames)) && (len(typ.Subtypes) != 0 || len(typ.FieldNames) != 0) {
 				return fmt.Errorf("primitive type %d cannot have subtypes or field names", i)
 			}
+		}
+	}
+
+	colors := make([]uint8, len(types))
+	for start := range types {
+		if colors[start] != 0 {
+			continue
+		}
+		stack := []typeVisit{{id: uint32(start)}}
+		colors[start] = 1
+		for len(stack) > 0 {
+			current := &stack[len(stack)-1]
+			children := types[current.id].Subtypes
+			if current.nextChild == len(children) {
+				colors[current.id] = 2
+				stack = stack[:len(stack)-1]
+				continue
+			}
+			child := children[current.nextChild]
+			current.nextChild++
+			switch colors[child] {
+			case 1:
+				return fmt.Errorf("ORC type graph has a cycle through type %d", child)
+			case 0:
+				colors[child] = 1
+				stack = append(stack, typeVisit{id: child})
+			}
+		}
+	}
+	return nil
+}
+
+type typeVisit struct {
+	id        uint32
+	nextChild int
+}
+
+func validateWriterTypes(types []Type) error {
+	parents := make([]int, len(types))
+	for typeID, typ := range types {
+		if typ.Kind == TypeKindStruct {
+			seenNames := make(map[string]struct{}, len(typ.FieldNames))
+			for _, name := range typ.FieldNames {
+				if _, exists := seenNames[name]; exists {
+					return fmt.Errorf("STRUCT type %d has duplicate field name %q", typeID, name)
+				}
+				seenNames[name] = struct{}{}
+			}
+		}
+		for _, child := range typ.Subtypes {
+			parents[child]++
+			if parents[child] > 1 {
+				return fmt.Errorf("ORC writer type %d has more than one parent", child)
+			}
+		}
+	}
+	if parents[0] != 0 {
+		return fmt.Errorf("ORC writer root type has a parent")
+	}
+	for typeID := 1; typeID < len(types); typeID++ {
+		if parents[typeID] != 1 {
+			return fmt.Errorf("ORC writer type %d has %d parents, want 1", typeID, parents[typeID])
+		}
+	}
+
+	visited := make([]bool, len(types))
+	stack := []uint32{0}
+	visited[0] = true
+	for len(stack) > 0 {
+		typeID := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, child := range types[typeID].Subtypes {
+			if !visited[child] {
+				visited[child] = true
+				stack = append(stack, child)
+			}
+		}
+	}
+	for typeID, seen := range visited {
+		if !seen {
+			return fmt.Errorf("ORC writer schema has unreachable type %d", typeID)
 		}
 	}
 	return nil

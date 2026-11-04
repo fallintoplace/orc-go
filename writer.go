@@ -33,7 +33,7 @@ type WriterOptions struct {
 	UseRLEv2 bool
 }
 
-// Writer writes ORC files for flat schemas made from primitive columns.
+// Writer writes ORC files for root STRUCT schemas with primitive or nested columns.
 // It writes one stripe, buffers rows until Close, and does not close the
 // destination writer.
 type Writer struct {
@@ -63,9 +63,9 @@ type writerStream struct {
 	data   []byte
 }
 
-// NewWriter creates a writer for a flat root STRUCT whose fields are
+// NewWriter creates a writer for a root STRUCT whose fields are
 // BOOLEAN, BYTE, SHORT, INT, LONG, DATE, TIMESTAMP, TIMESTAMP_INSTANT, DECIMAL,
-// FLOAT, DOUBLE, STRING, CHAR, VARCHAR, or BINARY.
+// FLOAT, DOUBLE, STRING, CHAR, VARCHAR, BINARY, STRUCT, LIST, MAP, or UNION.
 func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Writer, error) {
 	if destination == nil {
 		return nil, errors.New("ORC writer destination is nil")
@@ -74,13 +74,17 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 	if err := validateTypes(types); err != nil {
 		return nil, fmt.Errorf("invalid ORC writer schema: %w", err)
 	}
-	root := types[0]
-	if len(types) != len(root.Subtypes)+1 {
-		return nil, fmt.Errorf("%w: writer requires a flat root STRUCT", ErrUnsupportedType)
+	if err := validateWriterTypes(types); err != nil {
+		return nil, fmt.Errorf("invalid ORC writer schema: %w", err)
 	}
-	for _, name := range root.FieldNames {
-		if !utf8.ValidString(name) {
-			return nil, fmt.Errorf("ORC field name %q is not valid UTF-8", name)
+	root := types[0]
+	for typeID, typ := range types {
+		if typ.Kind == TypeKindStruct {
+			for _, name := range typ.FieldNames {
+				if !utf8.ValidString(name) {
+					return nil, fmt.Errorf("ORC field name %q in type %d is not valid UTF-8", name, typeID)
+				}
+			}
 		}
 	}
 
@@ -98,34 +102,41 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 		}
 	}
 
-	columns := make([]writerColumn, len(root.Subtypes))
+	columns := make([]writerColumn, len(types))
+	for id, typ := range types {
+		name := fmt.Sprintf("column %d", id)
+		if id == 0 {
+			name = "root"
+		}
+		if !supportsWriterType(typ.Kind) {
+			return nil, fmt.Errorf("%w: column %d has type %s", ErrUnsupportedType, id, typ.Kind)
+		}
+		if typ.Kind == TypeKindDecimal {
+			if typ.Precision < 1 || typ.Precision > 38 {
+				return nil, fmt.Errorf("ORC column %d DECIMAL precision must be between 1 and 38, got %d", id, typ.Precision)
+			}
+			if typ.Scale > typ.Precision {
+				return nil, fmt.Errorf("ORC column %d DECIMAL scale %d exceeds precision %d", id, typ.Scale, typ.Precision)
+			}
+		}
+		columns[id] = writerColumn{
+			id:        uint32(id),
+			name:      name,
+			kind:      typ.Kind,
+			precision: typ.Precision,
+			scale:     typ.Scale,
+			maxLength: effectiveStringTypeLength(typ.Kind, typ.MaxLength),
+		}
+	}
+
 	columnByName := make(map[string]int, len(root.Subtypes))
 	for i, subtype := range root.Subtypes {
-		if subtype != uint32(i+1) {
-			return nil, fmt.Errorf("%w: writer schema must use pre-order type IDs", ErrUnsupportedType)
-		}
 		name := root.FieldNames[i]
 		if _, exists := columnByName[name]; exists {
 			return nil, fmt.Errorf("%w: duplicate root field name %q", ErrUnsupportedType, name)
 		}
-		typ := types[subtype]
-		kind := typ.Kind
-		switch kind {
-		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal, TypeKindChar, TypeKindVarchar:
-		default:
-			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, kind)
-		}
-		if kind == TypeKindDecimal {
-			if typ.Precision < 1 || typ.Precision > 38 {
-				return nil, fmt.Errorf("ORC field %q DECIMAL precision must be between 1 and 38, got %d", name, typ.Precision)
-			}
-			if typ.Scale > typ.Precision {
-				return nil, fmt.Errorf("ORC field %q DECIMAL scale %d exceeds precision %d", name, typ.Scale, typ.Precision)
-			}
-		}
-		maxLength := effectiveStringTypeLength(kind, typ.MaxLength)
-		columns[i] = writerColumn{id: subtype, name: name, kind: kind, precision: typ.Precision, scale: typ.Scale, maxLength: maxLength}
-		columnByName[name] = i
+		columns[subtype].name = name
+		columnByName[name] = int(subtype)
 	}
 
 	return &Writer{
@@ -152,62 +163,149 @@ func (w *Writer) WriteRow(row Row) error {
 		}
 	}
 
-	values := make([]any, len(w.columns))
-	for i, column := range w.columns {
-		value := row[column.name]
-		if value == nil {
-			continue
+	pending := make([][]any, len(w.columns))
+	root := w.types[0]
+	for i, subtype := range root.Subtypes {
+		name := root.FieldNames[i]
+		if err := w.collectValue(subtype, row[name], name, pending); err != nil {
+			return err
 		}
-		if !matchesType(column.kind, value) {
-			return fmt.Errorf("ORC field %q expects %s, got %T", column.name, column.kind, value)
+	}
+	for id := 1; id < len(w.columns); id++ {
+		w.columns[id].values = append(w.columns[id].values, pending[id]...)
+	}
+	w.rowCount++
+	return nil
+}
+
+func supportsWriterType(kind TypeKind) bool {
+	switch kind {
+	case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong,
+		TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary,
+		TypeKindTimestamp, TypeKindList, TypeKindMap, TypeKindStruct, TypeKindUnion,
+		TypeKindDecimal, TypeKindDate, TypeKindVarchar, TypeKindChar, TypeKindTimestampInstant:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *Writer) collectValue(id uint32, value any, path string, pending [][]any) error {
+	typ := w.types[id]
+	if isNilValue(value) {
+		pending[id] = append(pending[id], nil)
+		return nil
+	}
+
+	switch typ.Kind {
+	case TypeKindStruct:
+		fields, ok := structValues(value)
+		if !ok {
+			return fmt.Errorf("ORC field %q expects STRUCT, got %T", path, value)
 		}
-		if column.kind == TypeKindString || column.kind == TypeKindChar || column.kind == TypeKindVarchar {
+		childByName := make(map[string]int, len(typ.FieldNames))
+		for i, name := range typ.FieldNames {
+			childByName[name] = i
+		}
+		for name := range fields {
+			if _, exists := childByName[name]; !exists {
+				return fmt.Errorf("unknown ORC field %q.%s", path, name)
+			}
+		}
+		pending[id] = append(pending[id], struct{}{})
+		for i, subtype := range typ.Subtypes {
+			name := typ.FieldNames[i]
+			if err := w.collectValue(subtype, fields[name], path+"."+name, pending); err != nil {
+				return err
+			}
+		}
+		return nil
+	case TypeKindList:
+		items, ok := listValues(value)
+		if !ok {
+			return fmt.Errorf("ORC field %q expects LIST, got %T", path, value)
+		}
+		pending[id] = append(pending[id], uint64(len(items)))
+		for i, item := range items {
+			if err := w.collectValue(typ.Subtypes[0], item, fmt.Sprintf("%s[%d]", path, i), pending); err != nil {
+				return err
+			}
+		}
+		return nil
+	case TypeKindMap:
+		entries, ok := value.([]MapEntry)
+		if !ok {
+			return fmt.Errorf("ORC field %q expects []MapEntry, got %T", path, value)
+		}
+		pending[id] = append(pending[id], uint64(len(entries)))
+		for i, entry := range entries {
+			entryPath := fmt.Sprintf("%s[%d]", path, i)
+			if err := w.collectValue(typ.Subtypes[0], entry.Key, entryPath+".key", pending); err != nil {
+				return err
+			}
+			if err := w.collectValue(typ.Subtypes[1], entry.Value, entryPath+".value", pending); err != nil {
+				return err
+			}
+		}
+		return nil
+	case TypeKindUnion:
+		union, ok := value.(UnionValue)
+		if !ok {
+			return fmt.Errorf("ORC field %q expects UNION, got %T", path, value)
+		}
+		if int(union.Tag) >= len(typ.Subtypes) {
+			return fmt.Errorf("ORC field %q has union tag %d, want less than %d", path, union.Tag, len(typ.Subtypes))
+		}
+		pending[id] = append(pending[id], union.Tag)
+		return w.collectValue(typ.Subtypes[union.Tag], union.Value, fmt.Sprintf("%s<%d>", path, union.Tag), pending)
+	default:
+		column := w.columns[id]
+		if !matchesType(typ.Kind, value) {
+			return fmt.Errorf("ORC field %q expects %s, got %T", path, typ.Kind, value)
+		}
+		if typ.Kind == TypeKindString || typ.Kind == TypeKindChar || typ.Kind == TypeKindVarchar {
 			stringValue := value.(string)
 			if !utf8.ValidString(stringValue) {
-				return fmt.Errorf("ORC field %q string is not valid UTF-8", column.name)
+				return fmt.Errorf("ORC field %q string is not valid UTF-8", path)
 			}
-			if column.kind == TypeKindChar || column.kind == TypeKindVarchar {
-				prepared, err := prepareStringTypeValue(stringValue, column.kind, column.maxLength)
+			if typ.Kind == TypeKindChar || typ.Kind == TypeKindVarchar {
+				prepared, err := prepareStringTypeValue(stringValue, typ.Kind, column.maxLength)
 				if err != nil {
-					return fmt.Errorf("ORC field %q: %w", column.name, err)
+					return fmt.Errorf("ORC field %q: %w", path, err)
 				}
 				value = prepared
 			}
 		}
-		if column.kind == TypeKindDate {
+		if typ.Kind == TypeKindDate {
 			days, err := dateDays(value.(time.Time))
 			if err != nil {
-				return fmt.Errorf("ORC field %q: %w", column.name, err)
+				return fmt.Errorf("ORC field %q: %w", path, err)
 			}
 			value = days
 		}
-		if column.kind == TypeKindTimestamp || column.kind == TypeKindTimestampInstant {
-			timestamp, err := timestampForWriter(value.(time.Time), column.kind)
+		if typ.Kind == TypeKindTimestamp || typ.Kind == TypeKindTimestampInstant {
+			timestamp, err := timestampForWriter(value.(time.Time), typ.Kind)
 			if err != nil {
-				return fmt.Errorf("ORC field %q: %w", column.name, err)
+				return fmt.Errorf("ORC field %q: %w", path, err)
 			}
 			value = timestamp
 		}
-		if column.kind == TypeKindDecimal {
+		if typ.Kind == TypeKindDecimal {
 			decimal, err := decimalForType(value.(Decimal), column.precision, column.scale)
 			if err != nil {
-				return fmt.Errorf("ORC field %q: %w", column.name, err)
+				return fmt.Errorf("ORC field %q: %w", path, err)
 			}
 			value = decimal
 		}
-		if column.kind == TypeKindBinary {
+		if typ.Kind == TypeKindBinary {
 			data := value.([]byte)
 			copied := make([]byte, len(data))
 			copy(copied, data)
 			value = copied
 		}
-		values[i] = value
+		pending[id] = append(pending[id], value)
+		return nil
 	}
-	for i, value := range values {
-		w.columns[i].values = append(w.columns[i].values, value)
-	}
-	w.rowCount++
-	return nil
 }
 
 // Close serializes the buffered rows and writes the ORC file. Calling Close
@@ -332,7 +430,7 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 	}
 
 	encoding := columnEncodingDirect
-	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindDate || column.kind == TypeKindTimestamp || column.kind == TypeKindTimestampInstant || column.kind == TypeKindDecimal || column.kind == TypeKindString || column.kind == TypeKindBinary || column.kind == TypeKindChar || column.kind == TypeKindVarchar) {
+	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindDate || column.kind == TypeKindTimestamp || column.kind == TypeKindTimestampInstant || column.kind == TypeKindDecimal || column.kind == TypeKindString || column.kind == TypeKindBinary || column.kind == TypeKindChar || column.kind == TypeKindVarchar || column.kind == TypeKindList || column.kind == TypeKindMap) {
 		encoding = columnEncodingDirectV2
 	}
 	if len(values) == 0 {
@@ -342,6 +440,21 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 	var data []byte
 	var lengths []uint64
 	switch column.kind {
+	case TypeKindStruct:
+		return streams, encoding, nil
+	case TypeKindList, TypeKindMap:
+		lengths = make([]uint64, len(values))
+		for i, value := range values {
+			lengths[i] = value.(uint64)
+		}
+	case TypeKindUnion:
+		tags := make([]byte, len(values))
+		for i, value := range values {
+			tags[i] = value.(uint8)
+		}
+		data = encodeByteRLE(tags)
+		streams = append(streams, writerStream{kind: streamKindData, column: column.id, data: data})
+		return streams, encoding, nil
 	case TypeKindBoolean:
 		booleanValues := make([]bool, len(values))
 		for i, value := range values {

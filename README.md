@@ -6,9 +6,9 @@ The implementation is being built from the published ORC format specification.
 
 ## Status
 
-Work in progress. The reader supports BOOLEAN, BYTE, SHORT, INT, LONG, DATE, TIMESTAMP, TIMESTAMP_INSTANT, DECIMAL, FLOAT, DOUBLE, STRING, CHAR, VARCHAR, and BINARY root fields, including nulls and multiple stripes. DATE and timestamp values use UTC `time.Time`. TIMESTAMP preserves wall-clock fields using the stripe writer timezone; files without that metadata use the process timezone. TIMESTAMP_INSTANT preserves the instant. DECIMAL values use the exact `orc.Decimal` string type. CHAR values have trailing spaces removed; CHAR and VARCHAR values are limited to their declared number of Unicode code points. It supports NONE, ZLIB, and SNAPPY compression. It reads integer, DATE, timestamp, and DECIMAL DIRECT (RLEv1) and DIRECT_V2 (RLEv2), string-like direct and dictionary encodings, and binary direct encodings. `ReadRows` buffers one stripe at a time; `ReadAll` collects the whole file in memory.
+Work in progress. The reader supports primitive and nested fields, including STRUCT, LIST, MAP, and UNION values, nulls, and multiple stripes. STRUCT values are `orc.Row`, LIST values are `[]any`, MAP values are `[]orc.MapEntry`, and UNION values are `orc.UnionValue`. DATE and timestamp values use UTC `time.Time`. TIMESTAMP preserves wall-clock fields using the stripe writer timezone; files without that metadata use the process timezone. TIMESTAMP_INSTANT preserves the instant. DECIMAL values use the exact `orc.Decimal` string type. CHAR values have trailing spaces removed; CHAR and VARCHAR values are limited to their declared number of Unicode code points. It supports NONE, ZLIB, and SNAPPY compression. It reads integer, DATE, timestamp, and DECIMAL DIRECT (RLEv1) and DIRECT_V2 (RLEv2), string-like direct and dictionary encodings, and binary direct encodings. `ReadRows` buffers one stripe at a time; `ReadAll` collects the whole file in memory.
 
-The writer supports flat schemas with those primitive types, DECIMAL, CHAR, and VARCHAR. DATE values use `time.Time`; the calendar date is taken from the value's location. TIMESTAMP keeps the value's calendar and clock fields and writes a UTC writer timezone, while TIMESTAMP_INSTANT keeps its instant. DECIMAL schemas require precision from 1 to 38 and a scale no greater than the precision; values are rescaled exactly and never rounded. CHAR values are truncated to their maximum length and padded with spaces. VARCHAR values are truncated to their maximum length. Length is counted in Unicode code points. It writes one stripe, buffers rows until `Close`, and supports NONE, ZLIB, and SNAPPY compression. `UseRLEv2` selects DIRECT_V2 for integer, DATE, timestamp, DECIMAL, and variable-length columns. Nested types and dictionary writing are not implemented yet, and the API is not stable.
+The writer supports the same primitive and nested types. Use `orc.Row` or `map[string]any` for STRUCT values, slices for LIST values, `[]orc.MapEntry` for MAP values, and `orc.UnionValue` for UNION values. Missing STRUCT fields and nil values are written as nulls. DATE values use `time.Time`; the calendar date is taken from the value's location. TIMESTAMP keeps the value's calendar and clock fields and writes a UTC writer timezone, while TIMESTAMP_INSTANT keeps its instant. DECIMAL schemas require precision from 1 to 38 and a scale no greater than the precision; values are rescaled exactly and never rounded. CHAR values are truncated to their maximum length and padded with spaces. VARCHAR values are truncated to their maximum length. Length is counted in Unicode code points. It writes one stripe, buffers rows until `Close`, and supports NONE, ZLIB, and SNAPPY compression. `UseRLEv2` selects DIRECT_V2 for integer, DATE, timestamp, DECIMAL, variable-length, and collection length columns. Dictionary writing and encrypted files are not implemented yet, and the API is not stable.
 
 ```go
 package main
@@ -80,6 +80,16 @@ func main() {
 	if err := writer.Close(); err != nil {
 		log.Fatal(err)
 	}
+}
+```
+
+Nested values use explicit Go shapes so field names and arbitrary map key types are preserved:
+
+```go
+row := orc.Row{
+	"profile": orc.Row{"name": "Ada", "scores": []any{int32(3), int32(8)}},
+	"labels": []orc.MapEntry{{Key: "city", Value: "Paris"}},
+	"choice": orc.UnionValue{Tag: 0, Value: "text alternative"},
 }
 ```
 

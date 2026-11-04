@@ -244,10 +244,9 @@ func TestNewWriterRejectsUnsupportedSchemasAndOptions(t *testing.T) {
 	}{
 		{name: "empty schema", schema: nil},
 		{name: "invalid UTF-8 name", schema: []Type{{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{string([]byte{0xff})}}, {Kind: TypeKindLong}}},
-		{name: "nested field", schema: []Type{
-			{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"items"}},
-			{Kind: TypeKindList, Subtypes: []uint32{2}},
-			{Kind: TypeKindLong},
+		{name: "unsupported type", schema: []Type{
+			{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"value"}},
+			{Kind: TypeKind(99)},
 		}},
 		{name: "unsupported compression", schema: valid, options: WriterOptions{Compression: CompressionLZO}},
 		{name: "oversized block", schema: valid, options: WriterOptions{Compression: CompressionSnappy, CompressionBlockSize: maxEncodedChunkLength + 1}},
