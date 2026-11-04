@@ -93,6 +93,16 @@ type stripeEncryptionVariant struct {
 // values for one stripe in memory at a time. Returning an error from yield
 // stops the read and returns that error.
 func (r *Reader) ReadRows(yield func(Row) error) error {
+	return r.readRows(nil, false, yield)
+}
+
+// ReadRowsWithColumns calls yield with only the named root fields. Selecting a
+// nested field's root returns the full nested value for that field.
+func (r *Reader) ReadRowsWithColumns(names []string, yield func(Row) error) error {
+	return r.readRows(names, true, yield)
+}
+
+func (r *Reader) readRows(names []string, projected bool, yield func(Row) error) error {
 	if yield == nil {
 		return errors.New("ORC row callback is nil")
 	}
@@ -100,11 +110,15 @@ func (r *Reader) ReadRows(yield func(Row) error) error {
 	if err != nil {
 		return err
 	}
-	wanted := make(map[streamKey]bool, len(r.footer.types)*5)
-	for id := range r.footer.types {
-		for _, kind := range []uint32{streamKindPresent, streamKindData, streamKindLength, streamKindDictionaryData, streamKindSecondary} {
-			wanted[streamKey{kind: kind, column: uint32(id)}] = true
+	if projected {
+		columns, err = selectRootColumns(columns, names)
+		if err != nil {
+			return err
 		}
+	}
+	wanted := make(map[streamKey]bool, len(r.footer.types)*5)
+	for _, column := range columns {
+		addSubtreeStreams(r.footer.types, column.id, wanted)
 	}
 
 	var previousEncryptionStripeID uint64
@@ -166,6 +180,59 @@ func (r *Reader) ReadAll() ([]Row, error) {
 		return nil, err
 	}
 	return rows, nil
+}
+
+// ReadAllWithColumns reads all rows with only the named root fields. Use
+// ReadRowsWithColumns for large files.
+func (r *Reader) ReadAllWithColumns(names []string) ([]Row, error) {
+	rows := make([]Row, 0)
+	err := r.ReadRowsWithColumns(names, func(row Row) error {
+		rows = append(rows, row)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func selectRootColumns(columns []rowColumn, names []string) ([]rowColumn, error) {
+	byName := make(map[string]rowColumn, len(columns))
+	for _, column := range columns {
+		byName[column.name] = column
+	}
+	selected := make([]rowColumn, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, exists := seen[name]; exists {
+			return nil, fmt.Errorf("ORC projection repeats root field %q", name)
+		}
+		seen[name] = struct{}{}
+		column, exists := byName[name]
+		if !exists {
+			return nil, fmt.Errorf("ORC projection has no root field %q", name)
+		}
+		selected = append(selected, column)
+	}
+	return selected, nil
+}
+
+func addSubtreeStreams(types []Type, root uint32, wanted map[streamKey]bool) {
+	streamKinds := [...]uint32{streamKindPresent, streamKindData, streamKindLength, streamKindDictionaryData, streamKindSecondary}
+	stack := []uint32{root}
+	seen := make(map[uint32]struct{})
+	for len(stack) > 0 {
+		column := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, exists := seen[column]; exists {
+			continue
+		}
+		seen[column] = struct{}{}
+		for _, kind := range streamKinds {
+			wanted[streamKey{kind: kind, column: column}] = true
+		}
+		stack = append(stack, types[column].Subtypes...)
+	}
 }
 
 func (r *Reader) rowColumns() ([]rowColumn, error) {
@@ -331,9 +398,6 @@ func (r *Reader) decryptStripeVariants(streams map[streamKey][]byte, footer *str
 	if r.options.KeyProvider == nil {
 		return nil
 	}
-	if r.footer.encryption.keyProvider != 1 {
-		return fmt.Errorf("%w: key provider kind %d", ErrUnsupportedEncryption, r.footer.encryption.keyProvider)
-	}
 	if len(encryptedLocalKeys) != len(r.footer.encryption.variants) {
 		return fmt.Errorf("stripe %d has %d encrypted local keys, want %d", stripeIndex, len(encryptedLocalKeys), len(r.footer.encryption.variants))
 	}
@@ -348,6 +412,20 @@ func (r *Reader) decryptStripeVariants(streams map[streamKey][]byte, footer *str
 	selectedRoots := make(map[uint32]bool)
 	for variantIndex, variantFooter := range footer.encryption {
 		fileVariant := r.footer.encryption.variants[variantIndex]
+		last, err := contiguousEncryptionSubtreeLastColumn(r.footer.types, fileVariant.root)
+		if err != nil {
+			return fmt.Errorf("ORC encryption variant %d: %w", variantIndex, err)
+		}
+		if !subtreeStreamsWanted(wanted, fileVariant.root, last) {
+			for _, stream := range variantFooter.streams {
+				if isIndexStreamKind(stream.kind) {
+					indexPosition += stream.length
+				} else {
+					dataPosition += stream.length
+				}
+			}
+			continue
+		}
 		if selectedRoots[fileVariant.root] {
 			for _, stream := range variantFooter.streams {
 				if isIndexStreamKind(stream.kind) {
@@ -357,6 +435,9 @@ func (r *Reader) decryptStripeVariants(streams map[streamKey][]byte, footer *str
 				}
 			}
 			continue
+		}
+		if r.footer.encryption.keyProvider != 1 {
+			return fmt.Errorf("%w: key provider kind %d", ErrUnsupportedEncryption, r.footer.encryption.keyProvider)
 		}
 		keyDescription := r.footer.encryption.keys[fileVariant.key]
 		masterKey, err := r.options.KeyProvider.GetKey(keyDescription.name, keyDescription.version)
@@ -376,10 +457,6 @@ func (r *Reader) decryptStripeVariants(streams map[streamKey][]byte, footer *str
 		localKey, err := unwrapLocalKey(masterKey, keyDescription.algorithm, encryptedLocalKeys[variantIndex])
 		if err != nil {
 			return fmt.Errorf("unwrap ORC local key for column %d: %w", fileVariant.root, err)
-		}
-		last, err := contiguousEncryptionSubtreeLastColumn(r.footer.types, fileVariant.root)
-		if err != nil {
-			return fmt.Errorf("ORC encryption variant %d: %w", variantIndex, err)
 		}
 		if int(last-fileVariant.root)+1 != len(variantFooter.encodings) {
 			return fmt.Errorf("encrypted variant for column %d has %d encodings, want %d", fileVariant.root, len(variantFooter.encodings), last-fileVariant.root+1)
@@ -442,6 +519,19 @@ func (r *Reader) decryptStripeVariants(streams map[streamKey][]byte, footer *str
 
 func isIndexStreamKind(kind uint32) bool {
 	return kind == streamKindRowIndex || kind == streamKindBloomFilter || kind == streamKindBloomFilterUTF8
+}
+
+func subtreeStreamsWanted(wanted map[streamKey]bool, root, last uint32) bool {
+	for column := root; ; column++ {
+		for _, kind := range []uint32{streamKindPresent, streamKindData, streamKindLength, streamKindDictionaryData, streamKindSecondary} {
+			if wanted[streamKey{kind: kind, column: column}] {
+				return true
+			}
+		}
+		if column == last {
+			return false
+		}
+	}
 }
 
 func parseStripeFooter(data []byte) (stripeFooter, error) {
