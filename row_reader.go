@@ -96,15 +96,59 @@ func (r *Reader) ReadRows(yield func(Row) error) error {
 	return r.readRows(nil, false, yield)
 }
 
+// ReadRowsRange calls yield for the rows in [start, end), using zero-based
+// file row numbers. Stripes outside the range are not read.
+func (r *Reader) ReadRowsRange(start, end uint64, yield func(Row) error) error {
+	return r.readRowsRange(start, end, nil, false, yield)
+}
+
 // ReadRowsWithColumns calls yield with only the named root fields. Selecting a
 // nested field's root returns the full nested value for that field.
 func (r *Reader) ReadRowsWithColumns(names []string, yield func(Row) error) error {
 	return r.readRows(names, true, yield)
 }
 
+// ReadRowsRangeWithColumns reads [start, end) and calls yield with only the
+// named root fields. Selecting a nested field's root returns its full value.
+func (r *Reader) ReadRowsRangeWithColumns(start, end uint64, names []string, yield func(Row) error) error {
+	return r.readRowsRange(start, end, names, true, yield)
+}
+
+// ReadAllRange reads the rows in [start, end) into memory.
+func (r *Reader) ReadAllRange(start, end uint64) ([]Row, error) {
+	return r.readAllRange(start, end, nil, false)
+}
+
+// ReadAllRangeWithColumns reads [start, end) with only the named root fields.
+func (r *Reader) ReadAllRangeWithColumns(start, end uint64, names []string) ([]Row, error) {
+	return r.readAllRange(start, end, names, true)
+}
+
+func (r *Reader) readAllRange(start, end uint64, names []string, projected bool) ([]Row, error) {
+	rows := make([]Row, 0)
+	err := r.readRowsRange(start, end, names, projected, func(row Row) error {
+		rows = append(rows, row)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
 func (r *Reader) readRows(names []string, projected bool, yield func(Row) error) error {
+	return r.readRowsRange(0, r.NumRows(), names, projected, yield)
+}
+
+func (r *Reader) readRowsRange(start, end uint64, names []string, projected bool, yield func(Row) error) error {
 	if yield == nil {
 		return errors.New("ORC row callback is nil")
+	}
+	if start > end {
+		return fmt.Errorf("ORC row range start %d exceeds end %d", start, end)
+	}
+	if end > r.footer.numberOfRows {
+		return fmt.Errorf("ORC row range end %d exceeds file row count %d", end, r.footer.numberOfRows)
 	}
 	columns, err := r.rowColumns()
 	if err != nil {
@@ -123,10 +167,14 @@ func (r *Reader) readRows(names []string, projected bool, yield func(Row) error)
 
 	var previousEncryptionStripeID uint64
 	var encryptedLocalKeys [][]byte
+	var stripeRowStart uint64
 	for stripeIndex, stripe := range r.footer.stripes {
-		rowCount, err := checkedSliceLength(stripe.NumberOfRows)
-		if err != nil {
-			return fmt.Errorf("stripe %d row count: %w", stripeIndex, err)
+		if math.MaxUint64-stripeRowStart < stripe.NumberOfRows {
+			return fmt.Errorf("stripe %d row range overflows uint64", stripeIndex)
+		}
+		stripeRowEnd := stripeRowStart + stripe.NumberOfRows
+		if stripeRowStart >= end {
+			break
 		}
 		var encryptionStripeID uint64
 		if r.footer.encryption != nil {
@@ -143,6 +191,14 @@ func (r *Reader) readRows(names []string, projected bool, yield func(Row) error)
 				return fmt.Errorf("stripe %d has no complete encrypted local keys", stripeIndex)
 			}
 		}
+		if stripeRowEnd <= start {
+			stripeRowStart = stripeRowEnd
+			continue
+		}
+		rowCount, err := checkedSliceLength(stripe.NumberOfRows)
+		if err != nil {
+			return fmt.Errorf("stripe %d row count: %w", stripeIndex, err)
+		}
 		streams, footer, err := r.readStripeStreamsAt(stripe, wanted, stripeIndex, encryptionStripeID, encryptedLocalKeys)
 		if err != nil {
 			return fmt.Errorf("read stripe %d: %w", stripeIndex, err)
@@ -156,7 +212,15 @@ func (r *Reader) readRows(names []string, projected bool, yield func(Row) error)
 			}
 		}
 
-		for rowIndex := 0; rowIndex < rowCount; rowIndex++ {
+		rowStart := 0
+		if start > stripeRowStart {
+			rowStart = int(start - stripeRowStart)
+		}
+		rowEnd := rowCount
+		if end < stripeRowEnd {
+			rowEnd = int(end - stripeRowStart)
+		}
+		for rowIndex := rowStart; rowIndex < rowEnd; rowIndex++ {
 			row := make(Row, len(columns))
 			for columnIndex, column := range columns {
 				row[column.name] = values[columnIndex][rowIndex]
@@ -165,6 +229,7 @@ func (r *Reader) readRows(names []string, projected bool, yield func(Row) error)
 				return err
 			}
 		}
+		stripeRowStart = stripeRowEnd
 	}
 	return nil
 }

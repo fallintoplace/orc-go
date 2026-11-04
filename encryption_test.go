@@ -125,6 +125,16 @@ func TestEncryptedColumnRoundTrip(t *testing.T) {
 			if !reflect.DeepEqual(got, rows) {
 				t.Fatalf("ReadAll() = %#v, want %#v", got, rows)
 			}
+			var ranged []Row
+			if err := reader.ReadRowsRange(2, 3, func(row Row) error {
+				ranged = append(ranged, row)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(ranged, rows[2:3]) {
+				t.Fatalf("ReadRowsRange(2, 3) = %#v, want %#v", ranged, rows[2:3])
+			}
 			indexes, err := reader.RowIndexes()
 			if err != nil {
 				t.Fatal(err)
@@ -169,6 +179,13 @@ func TestEncryptedColumnRoundTrip(t *testing.T) {
 			}
 			if !reflect.DeepEqual(masked, wantMasked) {
 				t.Fatalf("keyless ReadAll() = %#v, want %#v", masked, wantMasked)
+			}
+			maskedRange, err := keyless.ReadAllRange(2, 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(maskedRange, wantMasked[2:3]) {
+				t.Fatalf("keyless ReadAllRange(2, 3) = %#v, want %#v", maskedRange, wantMasked[2:3])
 			}
 			maskedIndexes, err := keyless.RowIndexes()
 			if err != nil {
