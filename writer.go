@@ -47,6 +47,15 @@ type WriterOptions struct {
 	RowIndexStride uint64
 	// DisableRowIndexes omits row-index streams and sets the stride to zero.
 	DisableRowIndexes bool
+	// BloomFilterColumns enables row-group bloom filters for the named root
+	// columns. Supported types are integer, floating-point, string, and binary.
+	BloomFilterColumns []string
+	// BloomFilterFPP sets the requested false-positive probability. Zero uses
+	// the ORC default of 0.01.
+	BloomFilterFPP float64
+	// LegacyBloomFilterEncoding writes the original fixed64 bitset format for
+	// older ORC readers. The default uses the UTF-8 byte bitset format.
+	LegacyBloomFilterEncoding bool
 	// EncryptColumns encrypts each named root field and its type subtree.
 	EncryptColumns []EncryptionRule
 	// KeyProvider supplies the master keys named by EncryptColumns.
@@ -57,28 +66,30 @@ type WriterOptions struct {
 // It buffers rows for the current stripe and writes completed stripes to the
 // destination. Close writes the file footer and does not close the destination.
 type Writer struct {
-	destination    io.Writer
-	types          []Type
-	columns        []writerColumn
-	columnByName   map[string]int
-	options        WriterOptions
-	encryption     []writerEncryptionVariant
-	encryptionFor  []int
-	fileEncryption fileEncryption
-	rowCount       uint64
-	stripeRows     uint64
-	rowIndexStride uint64
-	rowsInRowGroup uint64
-	rowGroupRows   []uint64
-	stripeInfos    [][]byte
-	fileStatistics []ColumnStatistics
-	stripeStats    []stripeStatistics
-	userMetadata   []UserMetadataItem
-	bodyOffset     uint64
-	headerWritten  bool
-	writeErr       error
-	closed         bool
-	closeErr       error
+	destination        io.Writer
+	types              []Type
+	columns            []writerColumn
+	columnByName       map[string]int
+	options            WriterOptions
+	bloomFilterColumns map[uint32]bool
+	bloomFilterFPP     float64
+	encryption         []writerEncryptionVariant
+	encryptionFor      []int
+	fileEncryption     fileEncryption
+	rowCount           uint64
+	stripeRows         uint64
+	rowIndexStride     uint64
+	rowsInRowGroup     uint64
+	rowGroupRows       []uint64
+	stripeInfos        [][]byte
+	fileStatistics     []ColumnStatistics
+	stripeStats        []stripeStatistics
+	userMetadata       []UserMetadataItem
+	bodyOffset         uint64
+	headerWritten      bool
+	writeErr           error
+	closed             bool
+	closeErr           error
 }
 
 type writerColumn struct {
@@ -109,6 +120,9 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 		return nil, errors.New("ORC writer destination is nil")
 	}
 	if options.DisableRowIndexes {
+		if len(options.BloomFilterColumns) != 0 {
+			return nil, errors.New("ORC bloom filters require row indexes")
+		}
 		if options.RowIndexStride != 0 {
 			return nil, errors.New("ORC row-index stride cannot be set when row indexes are disabled")
 		}
@@ -188,6 +202,33 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 		columns[subtype].name = name
 		columnByName[name] = int(subtype)
 	}
+	bloomFilterColumns := make(map[uint32]bool, len(options.BloomFilterColumns))
+	if len(options.BloomFilterColumns) != 0 {
+		if options.BloomFilterFPP == 0 {
+			options.BloomFilterFPP = defaultBloomFilterFPP
+		}
+		if math.IsNaN(options.BloomFilterFPP) || math.IsInf(options.BloomFilterFPP, 0) || options.BloomFilterFPP <= 0 || options.BloomFilterFPP >= 1 {
+			return nil, fmt.Errorf("ORC bloom-filter false-positive probability must be between 0 and 1, got %g", options.BloomFilterFPP)
+		}
+		if _, _, err := bloomFilterShape(options.RowIndexStride, options.BloomFilterFPP); err != nil {
+			return nil, err
+		}
+		for _, name := range options.BloomFilterColumns {
+			columnID, exists := columnByName[name]
+			if !exists {
+				return nil, fmt.Errorf("ORC bloom-filter column %q is not a root field", name)
+			}
+			if bloomFilterColumns[uint32(columnID)] {
+				return nil, fmt.Errorf("ORC bloom-filter column %q is configured more than once", name)
+			}
+			if !supportsWriterBloomFilter(types[columnID].Kind) {
+				return nil, fmt.Errorf("ORC bloom filters do not support column %q with type %s", name, types[columnID].Kind)
+			}
+			bloomFilterColumns[uint32(columnID)] = true
+		}
+	} else if options.BloomFilterFPP != 0 {
+		return nil, errors.New("ORC bloom-filter false-positive probability requires at least one bloom-filter column")
+	}
 	encryption, encryptionFor, fileEncryption, err := prepareWriterEncryption(types, columnByName, options.EncryptColumns, options.KeyProvider)
 	if err != nil {
 		return nil, err
@@ -198,17 +239,19 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 	}
 
 	return &Writer{
-		destination:    destination,
-		types:          types,
-		columns:        columns,
-		columnByName:   columnByName,
-		options:        options,
-		rowIndexStride: options.RowIndexStride,
-		encryption:     encryption,
-		encryptionFor:  encryptionFor,
-		fileEncryption: fileEncryption,
-		fileStatistics: fileStatistics,
-		bodyOffset:     uint64(len(fileMagic)),
+		destination:        destination,
+		types:              types,
+		columns:            columns,
+		columnByName:       columnByName,
+		options:            options,
+		bloomFilterColumns: bloomFilterColumns,
+		bloomFilterFPP:     options.BloomFilterFPP,
+		rowIndexStride:     options.RowIndexStride,
+		encryption:         encryption,
+		encryptionFor:      encryptionFor,
+		fileEncryption:     fileEncryption,
+		fileStatistics:     fileStatistics,
+		bodyOffset:         uint64(len(fileMagic)),
 	}, nil
 }
 
