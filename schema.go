@@ -46,9 +46,10 @@ type Type struct {
 	Kind       TypeKind
 	Subtypes   []uint32
 	FieldNames []string
-	MaxLength  uint32
-	Precision  uint32
-	Scale      uint32
+	// MaxLength limits CHAR and VARCHAR values in Unicode code points.
+	MaxLength uint32
+	Precision uint32
+	Scale     uint32
 }
 
 // StripeInfo contains the byte ranges and row count for one stripe.

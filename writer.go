@@ -53,6 +53,7 @@ type writerColumn struct {
 	kind      TypeKind
 	precision uint32
 	scale     uint32
+	maxLength uint32
 	values    []any
 }
 
@@ -64,7 +65,7 @@ type writerStream struct {
 
 // NewWriter creates a writer for a flat root STRUCT whose fields are
 // BOOLEAN, BYTE, SHORT, INT, LONG, DATE, TIMESTAMP, TIMESTAMP_INSTANT, DECIMAL,
-// FLOAT, DOUBLE, STRING, or BINARY.
+// FLOAT, DOUBLE, STRING, CHAR, VARCHAR, or BINARY.
 func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Writer, error) {
 	if destination == nil {
 		return nil, errors.New("ORC writer destination is nil")
@@ -110,7 +111,7 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 		typ := types[subtype]
 		kind := typ.Kind
 		switch kind {
-		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal:
+		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal, TypeKindChar, TypeKindVarchar:
 		default:
 			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, kind)
 		}
@@ -122,7 +123,8 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 				return nil, fmt.Errorf("ORC field %q DECIMAL scale %d exceeds precision %d", name, typ.Scale, typ.Precision)
 			}
 		}
-		columns[i] = writerColumn{id: subtype, name: name, kind: kind, precision: typ.Precision, scale: typ.Scale}
+		maxLength := effectiveStringTypeLength(kind, typ.MaxLength)
+		columns[i] = writerColumn{id: subtype, name: name, kind: kind, precision: typ.Precision, scale: typ.Scale, maxLength: maxLength}
 		columnByName[name] = i
 	}
 
@@ -159,8 +161,18 @@ func (w *Writer) WriteRow(row Row) error {
 		if !matchesType(column.kind, value) {
 			return fmt.Errorf("ORC field %q expects %s, got %T", column.name, column.kind, value)
 		}
-		if column.kind == TypeKindString && !utf8.ValidString(value.(string)) {
-			return fmt.Errorf("ORC field %q string is not valid UTF-8", column.name)
+		if column.kind == TypeKindString || column.kind == TypeKindChar || column.kind == TypeKindVarchar {
+			stringValue := value.(string)
+			if !utf8.ValidString(stringValue) {
+				return fmt.Errorf("ORC field %q string is not valid UTF-8", column.name)
+			}
+			if column.kind == TypeKindChar || column.kind == TypeKindVarchar {
+				prepared, err := prepareStringTypeValue(stringValue, column.kind, column.maxLength)
+				if err != nil {
+					return fmt.Errorf("ORC field %q: %w", column.name, err)
+				}
+				value = prepared
+			}
 		}
 		if column.kind == TypeKindDate {
 			days, err := dateDays(value.(time.Time))
@@ -320,7 +332,7 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 	}
 
 	encoding := columnEncodingDirect
-	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindDate || column.kind == TypeKindTimestamp || column.kind == TypeKindTimestampInstant || column.kind == TypeKindDecimal || column.kind == TypeKindString || column.kind == TypeKindBinary) {
+	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindDate || column.kind == TypeKindTimestamp || column.kind == TypeKindTimestampInstant || column.kind == TypeKindDecimal || column.kind == TypeKindString || column.kind == TypeKindBinary || column.kind == TypeKindChar || column.kind == TypeKindVarchar) {
 		encoding = columnEncodingDirectV2
 	}
 	if len(values) == 0 {
@@ -409,7 +421,7 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 		for i, value := range values {
 			binary.LittleEndian.PutUint64(data[i*8:], math.Float64bits(value.(float64)))
 		}
-	case TypeKindString:
+	case TypeKindString, TypeKindChar, TypeKindVarchar:
 		data, lengths = flattenVariableValues(values, func(value any) []byte { return []byte(value.(string)) })
 	case TypeKindBinary:
 		data, lengths = flattenVariableValues(values, func(value any) []byte { return value.([]byte) })
@@ -459,7 +471,7 @@ func matchesType(kind TypeKind, value any) bool {
 	case TypeKindDouble:
 		_, ok := value.(float64)
 		return ok
-	case TypeKindString:
+	case TypeKindString, TypeKindChar, TypeKindVarchar:
 		_, ok := value.(string)
 		return ok
 	case TypeKindBinary:

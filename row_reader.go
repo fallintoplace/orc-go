@@ -40,7 +40,7 @@ const (
 // Row contains one ORC root-struct row. Values use bool for BOOLEAN, the
 // matching integer width for integer columns, time.Time for DATE and
 // timestamps, Decimal for DECIMAL, float32 or float64 for FLOAT or DOUBLE,
-// string for STRING, and []byte for BINARY. Timestamp values use UTC;
+// string for STRING, CHAR, or VARCHAR, and []byte for BINARY. Timestamp values use UTC;
 // TIMESTAMP preserves wall-clock fields while TIMESTAMP_INSTANT preserves the
 // instant. A nil value represents an ORC null.
 type Row map[string]any
@@ -51,6 +51,7 @@ type rowColumn struct {
 	kind      TypeKind
 	precision uint32
 	scale     uint32
+	maxLength uint32
 }
 
 type streamKey struct {
@@ -156,11 +157,11 @@ func (r *Reader) rowColumns() ([]rowColumn, error) {
 		seenNames[name] = struct{}{}
 		typ := r.footer.types[subtype]
 		switch typ.Kind {
-		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal:
+		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal, TypeKindChar, TypeKindVarchar:
 		default:
 			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, typ.Kind)
 		}
-		columns[i] = rowColumn{id: subtype, name: name, kind: typ.Kind, precision: typ.Precision, scale: typ.Scale}
+		columns[i] = rowColumn{id: subtype, name: name, kind: typ.Kind, precision: typ.Precision, scale: typ.Scale, maxLength: typ.MaxLength}
 	}
 	return columns, nil
 }
@@ -169,7 +170,7 @@ func supportsRowEncoding(kind TypeKind, encoding uint32) bool {
 	switch kind {
 	case TypeKindShort, TypeKindInt, TypeKindLong, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
-	case TypeKindString:
+	case TypeKindString, TypeKindChar, TypeKindVarchar:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDictionary || encoding == columnEncodingDirectV2 || encoding == columnEncodingDictionaryV2
 	case TypeKindBinary:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
@@ -420,7 +421,7 @@ func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byt
 			valueIndex++
 		}
 		return values, nil
-	case TypeKindString, TypeKindBinary:
+	case TypeKindString, TypeKindBinary, TypeKindChar, TypeKindVarchar:
 		return decodeVariableLengthColumn(present, valueCount, column, streams, dataStream, encoding)
 	case TypeKindTimestamp, TypeKindTimestampInstant:
 		return decodeTimestampColumn(present, valueCount, column, streams, encoding, writerTimezone)
@@ -562,7 +563,7 @@ func decodeVariableLengthColumn(present []bool, valueCount int, column rowColumn
 			if index >= uint64(len(dictionary)) {
 				return nil, fmt.Errorf("dictionary index %d exceeds dictionary size %d", index, len(dictionary))
 			}
-			values[rowIndex] = variableValue(column.kind, dictionary[index])
+			values[rowIndex] = variableColumnValue(column, dictionary[index])
 			valueIndex++
 		}
 		return values, nil
@@ -585,7 +586,7 @@ func decodeVariableLengthColumn(present []bool, valueCount int, column rowColumn
 		if !isPresent {
 			continue
 		}
-		values[rowIndex] = variableValue(column.kind, valuesData[valueIndex])
+		values[rowIndex] = variableColumnValue(column, valuesData[valueIndex])
 		valueIndex++
 	}
 	return values, nil
@@ -622,6 +623,14 @@ func variableValue(kind TypeKind, data []byte) any {
 		return value
 	}
 	return string(data)
+}
+
+func variableColumnValue(column rowColumn, data []byte) any {
+	value := variableValue(column.kind, data)
+	if column.kind == TypeKindChar || column.kind == TypeKindVarchar {
+		return normalizeReadStringTypeValue(value.(string), column.kind, column.maxLength)
+	}
+	return value
 }
 
 func decodePresent(data []byte, rowCount int) ([]bool, error) {
