@@ -38,20 +38,28 @@ type WriterOptions struct {
 	UseRLEv2 bool
 	// UseDictionary writes STRING, CHAR, and VARCHAR values using a per-stripe dictionary.
 	UseDictionary bool
+	// MaxRowsPerStripe flushes a stripe after this many rows. Zero writes all rows
+	// as one stripe when Close is called.
+	MaxRowsPerStripe uint64
 }
 
 // Writer writes ORC files for root STRUCT schemas with primitive or nested columns.
-// It writes one stripe, buffers rows until Close, and does not close the
-// destination writer.
+// It buffers rows for the current stripe and writes completed stripes to the
+// destination. Close writes the file footer and does not close the destination.
 type Writer struct {
-	destination  io.Writer
-	types        []Type
-	columns      []writerColumn
-	columnByName map[string]int
-	options      WriterOptions
-	rowCount     uint64
-	closed       bool
-	closeErr     error
+	destination   io.Writer
+	types         []Type
+	columns       []writerColumn
+	columnByName  map[string]int
+	options       WriterOptions
+	rowCount      uint64
+	stripeRows    uint64
+	stripeInfos   [][]byte
+	bodyOffset    uint64
+	headerWritten bool
+	writeErr      error
+	closed        bool
+	closeErr      error
 }
 
 type writerColumn struct {
@@ -152,6 +160,7 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 		columns:      columns,
 		columnByName: columnByName,
 		options:      options,
+		bodyOffset:   uint64(len(fileMagic)),
 	}, nil
 }
 
@@ -160,6 +169,9 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 func (w *Writer) WriteRow(row Row) error {
 	if w.closed {
 		return ErrWriterClosed
+	}
+	if w.writeErr != nil {
+		return w.writeErr
 	}
 	if w.rowCount == math.MaxUint64 {
 		return fmt.Errorf("ORC row count overflows uint64")
@@ -182,6 +194,13 @@ func (w *Writer) WriteRow(row Row) error {
 		w.columns[id].values = append(w.columns[id].values, pending[id]...)
 	}
 	w.rowCount++
+	w.stripeRows++
+	if w.options.MaxRowsPerStripe > 0 && w.stripeRows >= w.options.MaxRowsPerStripe {
+		if err := w.flushStripe(); err != nil {
+			w.writeErr = err
+			return err
+		}
+	}
 	return nil
 }
 
@@ -315,36 +334,40 @@ func (w *Writer) collectValue(id uint32, value any, path string, pending [][]any
 	}
 }
 
-// Close serializes the buffered rows and writes the ORC file. Calling Close
-// again returns the result of the first call.
+// Close writes the final stripe and ORC file footer. Calling Close again
+// returns the result of the first call.
 func (w *Writer) Close() error {
 	if w.closed {
 		return w.closeErr
 	}
 	w.closed = true
-	data, err := w.encodeFile()
+	if w.writeErr != nil {
+		w.closeErr = w.writeErr
+		return w.closeErr
+	}
+	if err := w.flushStripe(); err != nil {
+		w.closeErr = err
+		return err
+	}
+	if !w.headerWritten {
+		if err := writeAll(w.destination, []byte(fileMagic)); err != nil {
+			w.closeErr = err
+			return err
+		}
+		w.headerWritten = true
+	}
+	tail, err := w.encodeFileTail()
 	if err == nil {
-		err = writeAll(w.destination, data)
+		err = writeAll(w.destination, tail)
 	}
 	w.closeErr = err
 	return err
 }
 
-func (w *Writer) encodeFile() ([]byte, error) {
-	body := []byte(fileMagic)
-	var stripeInfos [][]byte
-	if w.rowCount > 0 {
-		stripeData, stripeInfo, err := w.encodeStripe(uint64(len(body)))
-		if err != nil {
-			return nil, err
-		}
-		stripeInfos = append(stripeInfos, stripeInfo)
-		body = append(body, stripeData...)
-	}
-
+func (w *Writer) encodeFileTail() ([]byte, error) {
 	footer := appendProtoVarintField(nil, 1, uint64(len(fileMagic)))
-	footer = appendProtoVarintField(footer, 2, uint64(len(body)))
-	for _, stripeInfo := range stripeInfos {
+	footer = appendProtoVarintField(footer, 2, w.bodyOffset)
+	for _, stripeInfo := range w.stripeInfos {
 		footer = appendProtoBytesField(footer, 3, stripeInfo)
 	}
 	for _, typ := range w.types {
@@ -366,13 +389,38 @@ func (w *Writer) encodeFile() ([]byte, error) {
 		return nil, fmt.Errorf("ORC postscript is too long: %d bytes", len(postScript))
 	}
 
-	file := append(body, encodedFooter...)
-	file = append(file, postScript...)
-	file = append(file, byte(len(postScript)))
-	return file, nil
+	tail := append(encodedFooter, postScript...)
+	tail = append(tail, byte(len(postScript)))
+	return tail, nil
 }
 
-func (w *Writer) encodeStripe(offset uint64) ([]byte, []byte, error) {
+func (w *Writer) flushStripe() error {
+	if w.stripeRows == 0 {
+		return nil
+	}
+	stripeData, stripeInfo, err := w.encodeStripe(w.bodyOffset, w.stripeRows)
+	if err != nil {
+		return err
+	}
+	if !w.headerWritten {
+		if err := writeAll(w.destination, []byte(fileMagic)); err != nil {
+			return err
+		}
+		w.headerWritten = true
+	}
+	if err := writeAll(w.destination, stripeData); err != nil {
+		return fmt.Errorf("write ORC stripe: %w", err)
+	}
+	w.stripeInfos = append(w.stripeInfos, stripeInfo)
+	w.bodyOffset += uint64(len(stripeData))
+	w.stripeRows = 0
+	for i := range w.columns {
+		w.columns[i].values = nil
+	}
+	return nil
+}
+
+func (w *Writer) encodeStripe(offset, rows uint64) ([]byte, []byte, error) {
 	var streamBytes []byte
 	var streamFooter []byte
 	encodings := make([]columnEncoding, len(w.types))
@@ -416,7 +464,7 @@ func (w *Writer) encodeStripe(offset uint64) ([]byte, []byte, error) {
 	stripeInfo = appendProtoVarintField(stripeInfo, 2, 0)
 	stripeInfo = appendProtoVarintField(stripeInfo, 3, uint64(len(streamBytes)))
 	stripeInfo = appendProtoVarintField(stripeInfo, 4, uint64(len(stripeFooter)))
-	stripeInfo = appendProtoVarintField(stripeInfo, 5, w.rowCount)
+	stripeInfo = appendProtoVarintField(stripeInfo, 5, rows)
 	stripe := append(streamBytes, stripeFooter...)
 	return stripe, stripeInfo, nil
 }

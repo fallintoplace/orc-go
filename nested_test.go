@@ -15,7 +15,8 @@ func TestWriterRoundTripsNestedRows(t *testing.T) {
 				t.Run(compression.String()+"/rlev2="+boolString(useRLEv2)+"/dictionary="+boolString(useDictionary), func(t *testing.T) {
 					var output bytes.Buffer
 					writer, err := NewWriter(&output, nestedWriterSchema(), WriterOptions{
-						Compression: compression, CompressionBlockSize: 32, UseRLEv2: useRLEv2, UseDictionary: useDictionary,
+						Compression: compression, CompressionBlockSize: 32, UseRLEv2: useRLEv2,
+						UseDictionary: useDictionary, MaxRowsPerStripe: 2,
 					})
 					if err != nil {
 						t.Fatal(err)
@@ -34,6 +35,9 @@ func TestWriterRoundTripsNestedRows(t *testing.T) {
 						t.Fatal(err)
 					}
 					defer reader.Close()
+					if got := reader.NumStripes(); got != 2 {
+						t.Fatalf("NumStripes() = %d, want 2", got)
+					}
 					rows, err := reader.ReadAll()
 					if err != nil {
 						t.Fatal(err)
