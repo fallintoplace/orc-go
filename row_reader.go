@@ -39,16 +39,18 @@ const (
 
 // Row contains one ORC root-struct row. Values use bool for BOOLEAN, the
 // matching integer width for integer columns, time.Time for DATE and
-// timestamps, float32 or float64 for FLOAT or DOUBLE, string for STRING, and
-// []byte for BINARY. Timestamp values use UTC; TIMESTAMP preserves wall-clock
-// fields while TIMESTAMP_INSTANT preserves the instant. A nil value represents
-// an ORC null.
+// timestamps, Decimal for DECIMAL, float32 or float64 for FLOAT or DOUBLE,
+// string for STRING, and []byte for BINARY. Timestamp values use UTC;
+// TIMESTAMP preserves wall-clock fields while TIMESTAMP_INSTANT preserves the
+// instant. A nil value represents an ORC null.
 type Row map[string]any
 
 type rowColumn struct {
-	id   uint32
-	name string
-	kind TypeKind
+	id        uint32
+	name      string
+	kind      TypeKind
+	precision uint32
+	scale     uint32
 }
 
 type streamKey struct {
@@ -154,18 +156,18 @@ func (r *Reader) rowColumns() ([]rowColumn, error) {
 		seenNames[name] = struct{}{}
 		typ := r.footer.types[subtype]
 		switch typ.Kind {
-		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant:
+		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal:
 		default:
 			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, typ.Kind)
 		}
-		columns[i] = rowColumn{id: subtype, name: name, kind: typ.Kind}
+		columns[i] = rowColumn{id: subtype, name: name, kind: typ.Kind, precision: typ.Precision, scale: typ.Scale}
 	}
 	return columns, nil
 }
 
 func supportsRowEncoding(kind TypeKind, encoding uint32) bool {
 	switch kind {
-	case TypeKindShort, TypeKindInt, TypeKindLong, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant:
+	case TypeKindShort, TypeKindInt, TypeKindLong, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
 	case TypeKindString:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDictionary || encoding == columnEncodingDirectV2 || encoding == columnEncodingDictionaryV2
@@ -422,6 +424,8 @@ func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byt
 		return decodeVariableLengthColumn(present, valueCount, column, streams, dataStream, encoding)
 	case TypeKindTimestamp, TypeKindTimestampInstant:
 		return decodeTimestampColumn(present, valueCount, column, streams, encoding, writerTimezone)
+	case TypeKindDecimal:
+		return decodeDecimalColumn(present, valueCount, column, streams, encoding)
 	case TypeKindByte:
 		encodedValues, err := decodeByteRLE(dataStream, valueCount)
 		if err != nil {
@@ -468,6 +472,46 @@ func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byt
 		if err != nil {
 			return nil, err
 		}
+	}
+	return values, nil
+}
+
+func decodeDecimalColumn(present []bool, valueCount int, column rowColumn, streams map[streamKey][]byte, encoding columnEncoding) ([]any, error) {
+	data := streams[streamKey{kind: streamKindData, column: column.id}]
+	coefficients, err := decodeBigIntegerStream(data, valueCount)
+	if err != nil {
+		return nil, err
+	}
+	secondary, ok := streams[streamKey{kind: streamKindSecondary, column: column.id}]
+	if valueCount > 0 && !ok {
+		return nil, fmt.Errorf("missing SECONDARY stream for %d decimal values", valueCount)
+	}
+	var scales []int64
+	if encoding.kind == columnEncodingDirectV2 {
+		scales, err = rlev2.DecodeSigned(secondary, valueCount)
+	} else {
+		scales, err = rlev1.DecodeSigned(secondary, valueCount)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("decode decimal SECONDARY stream: %w", err)
+	}
+
+	values := make([]any, len(present))
+	valueIndex := 0
+	for rowIndex, isPresent := range present {
+		if !isPresent {
+			continue
+		}
+		coefficient := coefficients[valueIndex]
+		if column.precision > 0 && decimalPrecision(coefficient) > int(column.precision) {
+			return nil, fmt.Errorf("decimal DATA value %d exceeds precision %d", valueIndex, column.precision)
+		}
+		text, err := formatDecimal(coefficient, scales[valueIndex])
+		if err != nil {
+			return nil, fmt.Errorf("decimal value %d: %w", valueIndex, err)
+		}
+		values[rowIndex] = Decimal(text)
+		valueIndex++
 	}
 	return values, nil
 }
