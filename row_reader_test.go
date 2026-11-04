@@ -19,9 +19,10 @@ type integerTestStream struct {
 }
 
 type integerTestStripe struct {
-	rows     uint64
-	streams  []integerTestStream
-	encoding []uint32
+	rows           uint64
+	streams        []integerTestStream
+	encoding       []uint32
+	dictionarySize []uint32
 }
 
 func TestReadAllReadsIntegerRowsAcrossStripesAndCodecs(t *testing.T) {
@@ -223,6 +224,160 @@ func TestReadAllReadsBooleanByteRLERuns(t *testing.T) {
 	}
 }
 
+func TestReadAllReadsDirectStringColumns(t *testing.T) {
+	testCases := []struct {
+		name     string
+		encoding uint32
+		lengths  []byte
+	}{
+		{name: "DIRECT", encoding: columnEncodingDirect, lengths: rlev1.EncodeUnsigned([]uint64{0, 3, 6})},
+		{name: "DIRECT_V2", encoding: columnEncodingDirectV2, lengths: rlev2.EncodeUnsigned([]uint64{0, 3, 6})},
+	}
+	want := []Row{{"label": ""}, {"label": "cat"}, {"label": nil}, {"label": "東京"}}
+	for _, encoding := range testCases {
+		for _, compression := range []CompressionKind{CompressionNone, CompressionZlib, CompressionSnappy} {
+			t.Run(encoding.name+"/"+compression.String(), func(t *testing.T) {
+				data := makeIntegerORCFile(t, compression, []string{"label"}, []TypeKind{TypeKindString}, []integerTestStripe{{
+					rows:     4,
+					encoding: []uint32{columnEncodingDirect, encoding.encoding},
+					streams: []integerTestStream{
+						{kind: streamKindLength, column: 1, data: encoding.lengths},
+						{kind: streamKindData, column: 1, data: []byte("cat東京")},
+						{kind: streamKindPresent, column: 1, data: byteLiteralTestStream([]byte{0xd0})},
+					},
+				}})
+				reader, err := NewReader(byteReaderAt(data), int64(len(data)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := reader.ReadAll()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestReadAllReadsDictionaryStringColumns(t *testing.T) {
+	testCases := []struct {
+		name        string
+		encoding    uint32
+		lengths     []byte
+		dataIndices []byte
+	}{
+		{
+			name:        "DICTIONARY",
+			encoding:    columnEncodingDictionary,
+			lengths:     rlev1.EncodeUnsigned([]uint64{0, 4, 3}),
+			dataIndices: rlev1.EncodeUnsigned([]uint64{1, 2, 1, 0}),
+		},
+		{
+			name:        "DICTIONARY_V2",
+			encoding:    columnEncodingDictionaryV2,
+			lengths:     rlev2.EncodeUnsigned([]uint64{0, 4, 3}),
+			dataIndices: rlev2.EncodeUnsigned([]uint64{1, 2, 1, 0}),
+		},
+	}
+	want := []Row{{"label": "blue"}, {"label": "red"}, {"label": nil}, {"label": "blue"}, {"label": ""}}
+	for _, encoding := range testCases {
+		t.Run(encoding.name, func(t *testing.T) {
+			data := makeIntegerORCFile(t, CompressionNone, []string{"label"}, []TypeKind{TypeKindString}, []integerTestStripe{{
+				rows:           5,
+				encoding:       []uint32{columnEncodingDirect, encoding.encoding},
+				dictionarySize: []uint32{0, 3},
+				streams: []integerTestStream{
+					{kind: streamKindDictionaryData, column: 1, data: []byte("bluered")},
+					{kind: streamKindPresent, column: 1, data: byteLiteralTestStream([]byte{0xd8})},
+					{kind: streamKindLength, column: 1, data: encoding.lengths},
+					{kind: streamKindData, column: 1, data: encoding.dataIndices},
+				},
+			}})
+			reader, err := NewReader(byteReaderAt(data), int64(len(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := reader.ReadAll()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestReadAllReadsDirectBinaryColumns(t *testing.T) {
+	data := makeIntegerORCFile(t, CompressionNone, []string{"payload"}, []TypeKind{TypeKindBinary}, []integerTestStripe{{
+		rows:     3,
+		encoding: []uint32{columnEncodingDirect, columnEncodingDirectV2},
+		streams: []integerTestStream{
+			{kind: streamKindData, column: 1, data: []byte{0x00, 0xff}},
+			{kind: streamKindLength, column: 1, data: rlev2.EncodeUnsigned([]uint64{2, 0})},
+			{kind: streamKindPresent, column: 1, data: byteLiteralTestStream([]byte{0xc0})},
+		},
+	}})
+	reader, err := NewReader(byteReaderAt(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Row{{"payload": []byte{0x00, 0xff}}, {"payload": []byte{}}, {"payload": nil}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+	}
+}
+
+func TestReadAllReadsEmptyStringsWithoutDataStream(t *testing.T) {
+	data := makeIntegerORCFile(t, CompressionNone, []string{"label"}, []TypeKind{TypeKindString}, []integerTestStripe{{
+		rows:    2,
+		streams: []integerTestStream{{kind: streamKindLength, column: 1, data: rlev1.EncodeUnsigned([]uint64{0, 0})}},
+	}})
+	reader, err := NewReader(byteReaderAt(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Row{{"label": ""}, {"label": ""}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+	}
+}
+
+func TestReadAllReadsAllNullVariableLengthRowsWithoutDataStreams(t *testing.T) {
+	data := makeIntegerORCFile(t, CompressionNone,
+		[]string{"label", "payload"}, []TypeKind{TypeKindString, TypeKindBinary},
+		[]integerTestStripe{{rows: 2, streams: []integerTestStream{
+			{kind: streamKindPresent, column: 1, data: byteLiteralTestStream([]byte{0x00})},
+			{kind: streamKindPresent, column: 2, data: byteLiteralTestStream([]byte{0x00})},
+		}}})
+	reader, err := NewReader(byteReaderAt(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Row{
+		{"label": nil, "payload": nil},
+		{"label": nil, "payload": nil},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+	}
+}
+
 func TestReadRowsPropagatesCallbackError(t *testing.T) {
 	wantErr := errors.New("stop here")
 	data := makeIntegerORCFile(t, CompressionNone, []string{"id"}, []TypeKind{TypeKindLong}, []integerTestStripe{{rows: 1, streams: []integerTestStream{{kind: streamKindData, column: 1, data: integerLiteralTestStream(1)}}}})
@@ -242,11 +397,12 @@ func TestReadRowsRejectsUnsupportedTypesAndEncodings(t *testing.T) {
 		encoding uint32
 		wantErr  error
 	}{
-		{name: "unsupported type", kind: TypeKindString, encoding: columnEncodingDirect, wantErr: ErrUnsupportedType},
+		{name: "unsupported type", kind: TypeKindTimestamp, encoding: columnEncodingDirect, wantErr: ErrUnsupportedType},
 		{name: "dictionary", kind: TypeKindLong, encoding: columnEncodingDictionary, wantErr: ErrUnsupportedEncoding},
 		{name: "BYTE with RLEv2", kind: TypeKindByte, encoding: columnEncodingDirectV2, wantErr: ErrUnsupportedEncoding},
 		{name: "BOOLEAN with RLEv2", kind: TypeKindBoolean, encoding: columnEncodingDirectV2, wantErr: ErrUnsupportedEncoding},
 		{name: "FLOAT with RLEv2", kind: TypeKindFloat, encoding: columnEncodingDirectV2, wantErr: ErrUnsupportedEncoding},
+		{name: "BINARY with dictionary encoding", kind: TypeKindBinary, encoding: columnEncodingDictionary, wantErr: ErrUnsupportedEncoding},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -456,6 +612,75 @@ func TestReadRowsRejectsMalformedBooleanAndFloatStreams(t *testing.T) {
 	}
 }
 
+func TestReadRowsRejectsMalformedVariableLengthStreams(t *testing.T) {
+	testCases := []struct {
+		name           string
+		encoding       uint32
+		dictionarySize []uint32
+		streams        []integerTestStream
+	}{
+		{
+			name:    "direct missing lengths",
+			streams: []integerTestStream{{kind: streamKindData, column: 1, data: []byte("x")}},
+		},
+		{
+			name: "direct length exceeds data",
+			streams: []integerTestStream{
+				{kind: streamKindData, column: 1, data: []byte("x")},
+				{kind: streamKindLength, column: 1, data: rlev1.EncodeUnsigned([]uint64{2})},
+			},
+		},
+		{
+			name: "direct has unreferenced data",
+			streams: []integerTestStream{
+				{kind: streamKindData, column: 1, data: []byte("xy")},
+				{kind: streamKindLength, column: 1, data: rlev1.EncodeUnsigned([]uint64{1})},
+			},
+		},
+		{
+			name:           "dictionary index exceeds dictionary size",
+			encoding:       columnEncodingDictionary,
+			dictionarySize: []uint32{0, 1},
+			streams: []integerTestStream{
+				{kind: streamKindData, column: 1, data: rlev1.EncodeUnsigned([]uint64{1})},
+				{kind: streamKindLength, column: 1, data: rlev1.EncodeUnsigned([]uint64{1})},
+				{kind: streamKindDictionaryData, column: 1, data: []byte("x")},
+			},
+		},
+		{
+			name:           "dictionary length exceeds data",
+			encoding:       columnEncodingDictionary,
+			dictionarySize: []uint32{0, 1},
+			streams: []integerTestStream{
+				{kind: streamKindData, column: 1, data: rlev1.EncodeUnsigned([]uint64{0})},
+				{kind: streamKindLength, column: 1, data: rlev1.EncodeUnsigned([]uint64{2})},
+				{kind: streamKindDictionaryData, column: 1, data: []byte("x")},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			encoding := tc.encoding
+			if encoding == 0 {
+				encoding = columnEncodingDirect
+			}
+			data := makeIntegerORCFile(t, CompressionNone, []string{"label"}, []TypeKind{TypeKindString}, []integerTestStripe{{
+				rows:           1,
+				encoding:       []uint32{columnEncodingDirect, encoding},
+				dictionarySize: tc.dictionarySize,
+				streams:        tc.streams,
+			}})
+			reader, err := NewReader(byteReaderAt(data), int64(len(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := reader.ReadAll(); err == nil {
+				t.Fatal("ReadAll() succeeded for a malformed variable-length stream")
+			}
+		})
+	}
+}
+
 func makeIntegerORCFile(t *testing.T, compression CompressionKind, names []string, kinds []TypeKind, stripes []integerTestStripe) []byte {
 	t.Helper()
 	if len(names) != len(kinds) {
@@ -487,7 +712,11 @@ func makeIntegerORCFile(t *testing.T, compression CompressionKind, names []strin
 			if column < len(stripe.encoding) {
 				kind = stripe.encoding[column]
 			}
-			stripeFooter = appendBytesField(stripeFooter, 2, appendVarintField(nil, 1, uint64(kind)))
+			encoding := appendVarintField(nil, 1, uint64(kind))
+			if column < len(stripe.dictionarySize) && stripe.dictionarySize[column] != 0 {
+				encoding = appendVarintField(encoding, 2, uint64(stripe.dictionarySize[column]))
+			}
+			stripeFooter = appendBytesField(stripeFooter, 2, encoding)
 		}
 		encodedStripeFooter := encodeTestSection(t, compression, stripeFooter)
 		body = append(body, encodedStripeFooter...)
