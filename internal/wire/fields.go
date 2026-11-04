@@ -12,10 +12,12 @@ const maxFieldNumber = (1 << 29) - 1
 
 // Field is one Protocol Buffers field. Bytes aliases the input passed to Fields.
 type Field struct {
-	Number int
-	Type   uint8
-	Varint uint64
-	Bytes  []byte
+	Number  int
+	Type    uint8
+	Varint  uint64
+	Fixed32 uint32
+	Fixed64 uint64
+	Bytes   []byte
 }
 
 // Fields decodes protobuf wire fields and skips unknown fixed-width values.
@@ -46,6 +48,14 @@ func Fields(data []byte) ([]Field, error) {
 			if len(data) < 8 {
 				return nil, io.ErrUnexpectedEOF
 			}
+			field.Fixed64 = uint64(data[0]) |
+				uint64(data[1])<<8 |
+				uint64(data[2])<<16 |
+				uint64(data[3])<<24 |
+				uint64(data[4])<<32 |
+				uint64(data[5])<<40 |
+				uint64(data[6])<<48 |
+				uint64(data[7])<<56
 			data = data[8:]
 		case 2:
 			length, n, err := readVarint(data)
@@ -62,6 +72,10 @@ func Fields(data []byte) ([]Field, error) {
 			if len(data) < 4 {
 				return nil, io.ErrUnexpectedEOF
 			}
+			field.Fixed32 = uint32(data[0]) |
+				uint32(data[1])<<8 |
+				uint32(data[2])<<16 |
+				uint32(data[3])<<24
 			data = data[4:]
 		default:
 			return nil, fmt.Errorf("unsupported protobuf wire type %d", wireType)
