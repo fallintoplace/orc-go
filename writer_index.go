@@ -347,9 +347,16 @@ func (w *Writer) encodeStripeWithIndexes(offset, rows uint64) ([]byte, []byte, [
 			return nil, nil, nil, fmt.Errorf("compress masked row index for column %q: %w", column.name, err)
 		}
 		maskedStreams = append(maskedStreams, writerStream{kind: streamKindRowIndex, column: column.id, data: maskedIndex})
+		if w.bloomFilterColumns[column.id] {
+			bloomFilter, err := w.encodeBloomFilterStream(maskedColumn, maskedRanges)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("build masked bloom filter for column %q: %w", column.name, err)
+			}
+			maskedStreams = append(maskedStreams, bloomFilter)
+		}
 		encodings[column.id] = maskedEncoding
 		for _, stream := range maskedStreams {
-			if stream.kind == streamKindRowIndex {
+			if isIndexStreamKind(stream.kind) {
 				unencryptedIndexes = append(unencryptedIndexes, stream)
 			} else {
 				unencryptedData = append(unencryptedData, stream)
@@ -375,6 +382,13 @@ func (w *Writer) encodeStripeWithIndexes(offset, rows uint64) ([]byte, []byte, [
 				return nil, nil, nil, fmt.Errorf("compress encrypted row index for column %q: %w", column.name, err)
 			}
 			actualStreams = append(actualStreams, writerStream{kind: streamKindRowIndex, column: column.id, data: actualIndex})
+			if w.bloomFilterColumns[column.id] {
+				bloomFilter, err := w.encodeBloomFilterStream(column, actualRanges)
+				if err != nil {
+					return nil, nil, nil, fmt.Errorf("build encrypted bloom filter for column %q: %w", column.name, err)
+				}
+				actualStreams = append(actualStreams, bloomFilter)
+			}
 			variant := w.encryption[variantIndex]
 			for i := range actualStreams {
 				actualStreams[i].data, err = cryptORCStream(variant.localKey, variant.rule.Algorithm, actualStreams[i].column, actualStreams[i].kind, stripeID, actualStreams[i].data)
@@ -468,6 +482,27 @@ func (w *Writer) encodeStripeWithIndexes(offset, rows uint64) ([]byte, []byte, [
 	stripe = append(stripe, dataBytes...)
 	stripe = append(stripe, stripeFooter...)
 	return stripe, stripeInfo, stripeStats, nil
+}
+
+func (w *Writer) encodeBloomFilterStream(column writerColumn, ranges []writerValueRange) (writerStream, error) {
+	legacy := w.options.LegacyBloomFilterEncoding
+	kind := utf8BloomFilterStream
+	if legacy {
+		kind = legacyBloomFilterStream
+	}
+	var data []byte
+	for _, valueRange := range ranges {
+		encoded, err := buildBloomFilterIndex(column.values[valueRange.start:valueRange.end], column.kind, w.bloomFilterFPP, legacy, w.rowIndexStride)
+		if err != nil {
+			return writerStream{}, err
+		}
+		data = append(data, encoded...)
+	}
+	data, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, data)
+	if err != nil {
+		return writerStream{}, err
+	}
+	return writerStream{kind: kind, column: column.id, data: data}, nil
 }
 
 func writerColumnRanges(column writerColumn, ends []int, groups int) []writerValueRange {
