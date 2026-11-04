@@ -8,10 +8,11 @@ import (
 	"testing"
 )
 
-func TestFieldsReadsKnownWireTypesAndSkipsFixedValues(t *testing.T) {
+func TestFieldsReadsKnownWireTypesAndPreservesFixedValues(t *testing.T) {
 	data := []byte{0x08, 0x96, 0x01, 0x12, 0x03, 'o', 'r', 'c', 0x19}
-	data = append(data, make([]byte, 8)...)
-	data = append(data, 0x25, 1, 2, 3, 4)
+	data = binary.LittleEndian.AppendUint64(data, 0x8877665544332211)
+	data = append(data, 0x25)
+	data = binary.LittleEndian.AppendUint32(data, 0x44332211)
 
 	fields, err := Fields(data)
 	if err != nil {
@@ -26,10 +27,10 @@ func TestFieldsReadsKnownWireTypesAndSkipsFixedValues(t *testing.T) {
 	if fields[1].Number != 2 || fields[1].Type != 2 || string(fields[1].Bytes) != "orc" {
 		t.Fatalf("unexpected bytes field: %+v", fields[1])
 	}
-	if fields[2].Number != 3 || fields[2].Type != 1 {
+	if fields[2].Number != 3 || fields[2].Type != 1 || fields[2].Fixed64 != 0x8877665544332211 {
 		t.Fatalf("unexpected fixed64 field: %+v", fields[2])
 	}
-	if fields[3].Number != 4 || fields[3].Type != 5 {
+	if fields[3].Number != 4 || fields[3].Type != 5 || fields[3].Fixed32 != 0x44332211 {
 		t.Fatalf("unexpected fixed32 field: %+v", fields[3])
 	}
 }

@@ -15,6 +15,7 @@ type fileFooter struct {
 	stripes          []StripeInfo
 	stripeEncryption []stripeEncryptionInfo
 	types            []Type
+	statistics       []ColumnStatistics
 	userMetadata     []UserMetadataItem
 	encryption       *fileEncryption
 }
@@ -66,6 +67,16 @@ func parseFooter(data []byte) (fileFooter, error) {
 		case 6:
 			result.numberOfRows, err = fieldVarint(field)
 			result.hasNumberOfRows = err == nil
+		case 7:
+			var data []byte
+			data, err = fieldBytes(field)
+			if err == nil {
+				var statistics ColumnStatistics
+				statistics, err = parseColumnStatistics(data)
+				if err == nil {
+					result.statistics = append(result.statistics, statistics)
+				}
+			}
 		case 8:
 			result.rowIndexStride, err = fieldVarint(field)
 		case 10:

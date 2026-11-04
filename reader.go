@@ -29,17 +29,17 @@ var (
 	ErrUnsupportedCompression = errors.New("unsupported ORC compression")
 )
 
-// Reader reads ORC file metadata. Row decoding is added separately from file
-// tail parsing so each format layer can be validated independently.
+// Reader reads ORC file metadata and decodes rows from its stripes.
 type Reader struct {
-	source     io.ReaderAt
-	size       int64
-	closer     io.Closer
-	options    ReaderOptions
-	postScript postScript
-	footer     fileFooter
-	metadataAt int64
-	footerAt   int64
+	source           io.ReaderAt
+	size             int64
+	closer           io.Closer
+	options          ReaderOptions
+	postScript       postScript
+	footer           fileFooter
+	stripeStatistics []stripeStatistics
+	metadataAt       int64
+	footerAt         int64
 }
 
 // Open opens an ORC file from disk.
@@ -131,6 +131,22 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidFile, err)
 	}
+	var stripeStatistics []stripeStatistics
+	if postScript.metadataLength > 0 {
+		metadataBytes, err := readSection(source, metadataAt, postScript.metadataLength)
+		if err != nil {
+			return nil, fmt.Errorf("read ORC metadata: %w", err)
+		}
+		metadataBytes, err = decodeSection(postScript.compression, postScript.compressionBlockSize, metadataBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode ORC metadata: %w", err)
+		}
+		metadata, err := parseFileMetadata(metadataBytes)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidFile, err)
+		}
+		stripeStatistics = metadata.stripes
+	}
 	if err := validateFooter(footer, metadataAt); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidFile, err)
 	}
@@ -139,13 +155,14 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 	}
 
 	return &Reader{
-		source:     source,
-		size:       size,
-		options:    options,
-		postScript: postScript,
-		footer:     footer,
-		metadataAt: metadataAt,
-		footerAt:   footerAt,
+		source:           source,
+		size:             size,
+		options:          options,
+		postScript:       postScript,
+		footer:           footer,
+		stripeStatistics: stripeStatistics,
+		metadataAt:       metadataAt,
+		footerAt:         footerAt,
 	}, nil
 }
 
@@ -182,6 +199,19 @@ func (r *Reader) FormatVersion() []uint32 {
 // RowIndexStride returns the row group size declared by the file footer.
 func (r *Reader) RowIndexStride() uint64 {
 	return r.footer.rowIndexStride
+}
+
+// FileStatistics returns the statistics for each column in type-id order.
+// Values in encrypted columns use the unencrypted masked statistics, when
+// present. Encrypted statistics are not exposed by this API.
+func (r *Reader) FileStatistics() []ColumnStatistics {
+	return cloneColumnStatistics(r.footer.statistics)
+}
+
+// StripeStatistics returns the statistics for each stripe, with columns in
+// type-id order. The returned nested slices do not alias reader state.
+func (r *Reader) StripeStatistics() [][]ColumnStatistics {
+	return cloneStripeStatistics(r.stripeStatistics)
 }
 
 // UserMetadata returns the application-defined key/value pairs in the file
