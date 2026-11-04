@@ -63,6 +63,7 @@ type Writer struct {
 	rowCount       uint64
 	stripeRows     uint64
 	stripeInfos    [][]byte
+	userMetadata   []UserMetadataItem
 	bodyOffset     uint64
 	headerWritten  bool
 	writeErr       error
@@ -216,6 +217,26 @@ func (w *Writer) WriteRow(row Row) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// AddUserMetadata appends an application-defined key/value pair to the file
+// footer. Both the name and value are copied before the call returns. Column
+// encryption does not encrypt user metadata.
+func (w *Writer) AddUserMetadata(name string, value []byte) error {
+	if w.closed {
+		return ErrWriterClosed
+	}
+	if w.writeErr != nil {
+		return w.writeErr
+	}
+	if !utf8.ValidString(name) {
+		return fmt.Errorf("ORC user metadata name is not valid UTF-8")
+	}
+	w.userMetadata = append(w.userMetadata, UserMetadataItem{
+		Name:  name,
+		Value: append([]byte(nil), value...),
+	})
 	return nil
 }
 
@@ -387,6 +408,9 @@ func (w *Writer) encodeFileTail() ([]byte, error) {
 	}
 	for _, typ := range w.types {
 		footer = appendProtoBytesField(footer, 4, encodeType(typ))
+	}
+	for _, item := range w.userMetadata {
+		footer = appendProtoBytesField(footer, 5, encodeUserMetadataItem(item))
 	}
 	footer = appendProtoVarintField(footer, 6, w.rowCount)
 	if len(w.encryption) != 0 {
