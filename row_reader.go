@@ -37,12 +37,14 @@ const (
 	columnEncodingDictionaryV2 uint32 = 3
 )
 
-// Row contains one ORC root-struct row. Values use bool for BOOLEAN, the
-// matching integer width for integer columns, time.Time for DATE and
-// timestamps, Decimal for DECIMAL, float32 or float64 for FLOAT or DOUBLE,
-// string for STRING, CHAR, or VARCHAR, and []byte for BINARY. Timestamp values use UTC;
-// TIMESTAMP preserves wall-clock fields while TIMESTAMP_INSTANT preserves the
-// instant. A nil value represents an ORC null.
+// Row contains one ORC root-struct row. Nested STRUCT values also use Row,
+// LIST values use slices, MAP values use []MapEntry, and UNION values use
+// UnionValue. Primitive values use bool for BOOLEAN, the matching integer
+// width for integer columns, time.Time for DATE and timestamps, Decimal for
+// DECIMAL, float32 or float64 for FLOAT or DOUBLE, string for STRING, CHAR, or
+// VARCHAR, and []byte for BINARY. Timestamp values use UTC; TIMESTAMP preserves
+// wall-clock fields while TIMESTAMP_INSTANT preserves the instant. A nil value
+// represents an ORC null.
 type Row map[string]any
 
 type rowColumn struct {
@@ -87,10 +89,10 @@ func (r *Reader) ReadRows(yield func(Row) error) error {
 	if err != nil {
 		return err
 	}
-	wanted := make(map[streamKey]bool, len(columns)*4)
-	for _, column := range columns {
+	wanted := make(map[streamKey]bool, len(r.footer.types)*5)
+	for id := range r.footer.types {
 		for _, kind := range []uint32{streamKindPresent, streamKindData, streamKindLength, streamKindDictionaryData, streamKindSecondary} {
-			wanted[streamKey{kind: kind, column: column.id}] = true
+			wanted[streamKey{kind: kind, column: uint32(id)}] = true
 		}
 	}
 
@@ -106,14 +108,7 @@ func (r *Reader) ReadRows(yield func(Row) error) error {
 
 		values := make([][]any, len(columns))
 		for i, column := range columns {
-			if uint64(column.id) >= uint64(len(footer.encodings)) {
-				return fmt.Errorf("stripe %d column %q (id %d): missing column encoding", stripeIndex, column.name, column.id)
-			}
-			encoding := footer.encodings[column.id]
-			if !supportsRowEncoding(column.kind, encoding.kind) {
-				return fmt.Errorf("stripe %d column %q (id %d): %w: kind %d", stripeIndex, column.name, column.id, ErrUnsupportedEncoding, encoding.kind)
-			}
-			values[i], err = decodeColumn(stripe.NumberOfRows, column, streams, encoding, footer.writerTimezone)
+			values[i], err = decodeColumn(stripe.NumberOfRows, column, r.footer.types, footer.encodings, streams, footer.writerTimezone)
 			if err != nil {
 				return fmt.Errorf("stripe %d column %q (id %d): %w", stripeIndex, column.name, column.id, err)
 			}
@@ -147,6 +142,18 @@ func (r *Reader) ReadAll() ([]Row, error) {
 
 func (r *Reader) rowColumns() ([]rowColumn, error) {
 	root := r.footer.types[0]
+	for typeID, typ := range r.footer.types {
+		if typ.Kind != TypeKindStruct || typeID == 0 {
+			continue
+		}
+		seen := make(map[string]struct{}, len(typ.FieldNames))
+		for _, name := range typ.FieldNames {
+			if _, exists := seen[name]; exists {
+				return nil, fmt.Errorf("%w: duplicate field name %q in STRUCT type %d cannot be represented in Row", ErrUnsupportedType, name, typeID)
+			}
+			seen[name] = struct{}{}
+		}
+	}
 	columns := make([]rowColumn, len(root.Subtypes))
 	seenNames := make(map[string]struct{}, len(root.FieldNames))
 	for i, subtype := range root.Subtypes {
@@ -157,7 +164,7 @@ func (r *Reader) rowColumns() ([]rowColumn, error) {
 		seenNames[name] = struct{}{}
 		typ := r.footer.types[subtype]
 		switch typ.Kind {
-		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal, TypeKindChar, TypeKindVarchar:
+		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal, TypeKindChar, TypeKindVarchar, TypeKindStruct, TypeKindList, TypeKindMap, TypeKindUnion:
 		default:
 			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, typ.Kind)
 		}
@@ -176,6 +183,10 @@ func supportsRowEncoding(kind TypeKind, encoding uint32) bool {
 		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
 	case TypeKindBoolean, TypeKindByte, TypeKindFloat, TypeKindDouble:
 		return encoding == columnEncodingDirect
+	case TypeKindStruct, TypeKindUnion:
+		return encoding == columnEncodingDirect
+	case TypeKindList, TypeKindMap:
+		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
 	default:
 		return false
 	}
@@ -346,7 +357,22 @@ func parseColumnEncoding(data []byte) (columnEncoding, error) {
 	return result, nil
 }
 
-func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byte, encoding columnEncoding, writerTimezone string) ([]any, error) {
+func decodeColumn(rowCount uint64, column rowColumn, types []Type, encodings []columnEncoding, streams map[streamKey][]byte, writerTimezone string) ([]any, error) {
+	if uint64(column.id) >= uint64(len(types)) {
+		return nil, fmt.Errorf("column %d has no schema type", column.id)
+	}
+	if uint64(column.id) >= uint64(len(encodings)) {
+		return nil, fmt.Errorf("column %d has no stripe encoding", column.id)
+	}
+	typ := types[column.id]
+	column.kind = typ.Kind
+	column.precision = typ.Precision
+	column.scale = typ.Scale
+	column.maxLength = typ.MaxLength
+	encoding := encodings[column.id]
+	if !supportsRowEncoding(column.kind, encoding.kind) {
+		return nil, fmt.Errorf("%w: column %d type %s encoding %d", ErrUnsupportedEncoding, column.id, column.kind, encoding.kind)
+	}
 	rows, err := checkedSliceLength(rowCount)
 	if err != nil {
 		return nil, err
@@ -427,6 +453,14 @@ func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byt
 		return decodeTimestampColumn(present, valueCount, column, streams, encoding, writerTimezone)
 	case TypeKindDecimal:
 		return decodeDecimalColumn(present, valueCount, column, streams, encoding)
+	case TypeKindStruct:
+		return decodeStructColumn(present, valueCount, column, typ, types, encodings, streams, writerTimezone)
+	case TypeKindList:
+		return decodeListColumn(present, valueCount, column, typ, types, encodings, streams, encoding, writerTimezone)
+	case TypeKindMap:
+		return decodeMapColumn(present, valueCount, column, typ, types, encodings, streams, encoding, writerTimezone)
+	case TypeKindUnion:
+		return decodeUnionColumn(present, valueCount, column, typ, types, encodings, streams, writerTimezone)
 	case TypeKindByte:
 		encodedValues, err := decodeByteRLE(dataStream, valueCount)
 		if err != nil {
@@ -475,6 +509,186 @@ func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byt
 		}
 	}
 	return values, nil
+}
+
+func decodeStructColumn(present []bool, valueCount int, column rowColumn, typ Type, types []Type, encodings []columnEncoding, streams map[streamKey][]byte, writerTimezone string) ([]any, error) {
+	children := make([][]any, len(typ.Subtypes))
+	for i, subtype := range typ.Subtypes {
+		child, err := decodeColumn(uint64(valueCount), rowColumn{id: subtype}, types, encodings, streams, writerTimezone)
+		if err != nil {
+			return nil, fmt.Errorf("decode STRUCT field %q (column %d): %w", typ.FieldNames[i], subtype, err)
+		}
+		if len(child) != valueCount {
+			return nil, fmt.Errorf("STRUCT field %q decoded %d values, want %d", typ.FieldNames[i], len(child), valueCount)
+		}
+		children[i] = child
+	}
+
+	values := make([]any, len(present))
+	valueIndex := 0
+	for rowIndex, isPresent := range present {
+		if !isPresent {
+			continue
+		}
+		row := make(Row, len(children))
+		for childIndex, name := range typ.FieldNames {
+			row[name] = children[childIndex][valueIndex]
+		}
+		values[rowIndex] = row
+		valueIndex++
+	}
+	if valueIndex != valueCount {
+		return nil, fmt.Errorf("STRUCT has %d present values, want %d", valueIndex, valueCount)
+	}
+	return values, nil
+}
+
+func decodeListColumn(present []bool, valueCount int, column rowColumn, typ Type, types []Type, encodings []columnEncoding, streams map[streamKey][]byte, encoding columnEncoding, writerTimezone string) ([]any, error) {
+	lengths, err := decodeCollectionLengths(valueCount, column, streams, encoding)
+	if err != nil {
+		return nil, err
+	}
+	childCount, err := sumCollectionLengths(lengths)
+	if err != nil {
+		return nil, err
+	}
+	childValues, err := decodeColumn(childCount, rowColumn{id: typ.Subtypes[0]}, types, encodings, streams, writerTimezone)
+	if err != nil {
+		return nil, fmt.Errorf("decode LIST elements (column %d): %w", typ.Subtypes[0], err)
+	}
+
+	values := make([]any, len(present))
+	rowOffset := 0
+	lengthIndex := 0
+	for rowIndex, isPresent := range present {
+		if !isPresent {
+			continue
+		}
+		length, err := checkedSliceLength(lengths[lengthIndex])
+		if err != nil {
+			return nil, fmt.Errorf("LIST value %d length: %w", lengthIndex, err)
+		}
+		if length > len(childValues)-rowOffset {
+			return nil, fmt.Errorf("LIST value %d length %d exceeds remaining child values %d", lengthIndex, length, len(childValues)-rowOffset)
+		}
+		items := make([]any, length)
+		copy(items, childValues[rowOffset:rowOffset+length])
+		values[rowIndex] = items
+		rowOffset += length
+		lengthIndex++
+	}
+	if rowOffset != len(childValues) {
+		return nil, fmt.Errorf("LIST has %d unreferenced child values", len(childValues)-rowOffset)
+	}
+	return values, nil
+}
+
+func decodeMapColumn(present []bool, valueCount int, column rowColumn, typ Type, types []Type, encodings []columnEncoding, streams map[streamKey][]byte, encoding columnEncoding, writerTimezone string) ([]any, error) {
+	lengths, err := decodeCollectionLengths(valueCount, column, streams, encoding)
+	if err != nil {
+		return nil, err
+	}
+	childCount, err := sumCollectionLengths(lengths)
+	if err != nil {
+		return nil, err
+	}
+	keys, err := decodeColumn(childCount, rowColumn{id: typ.Subtypes[0]}, types, encodings, streams, writerTimezone)
+	if err != nil {
+		return nil, fmt.Errorf("decode MAP keys (column %d): %w", typ.Subtypes[0], err)
+	}
+	mapValues, err := decodeColumn(childCount, rowColumn{id: typ.Subtypes[1]}, types, encodings, streams, writerTimezone)
+	if err != nil {
+		return nil, fmt.Errorf("decode MAP values (column %d): %w", typ.Subtypes[1], err)
+	}
+
+	values := make([]any, len(present))
+	entryOffset := 0
+	lengthIndex := 0
+	for rowIndex, isPresent := range present {
+		if !isPresent {
+			continue
+		}
+		length, err := checkedSliceLength(lengths[lengthIndex])
+		if err != nil {
+			return nil, fmt.Errorf("MAP value %d length: %w", lengthIndex, err)
+		}
+		if length > len(keys)-entryOffset || length > len(mapValues)-entryOffset {
+			return nil, fmt.Errorf("MAP value %d length %d exceeds remaining key/value entries", lengthIndex, length)
+		}
+		entries := make([]MapEntry, length)
+		for i := range entries {
+			entries[i] = MapEntry{Key: keys[entryOffset+i], Value: mapValues[entryOffset+i]}
+		}
+		values[rowIndex] = entries
+		entryOffset += length
+		lengthIndex++
+	}
+	if entryOffset != len(keys) || entryOffset != len(mapValues) {
+		return nil, fmt.Errorf("MAP has unreferenced key/value entries")
+	}
+	return values, nil
+}
+
+func decodeUnionColumn(present []bool, valueCount int, column rowColumn, typ Type, types []Type, encodings []columnEncoding, streams map[streamKey][]byte, writerTimezone string) ([]any, error) {
+	data := streams[streamKey{kind: streamKindData, column: column.id}]
+	tags, err := decodeByteRLE(data, valueCount)
+	if err != nil {
+		return nil, fmt.Errorf("decode UNION tag DATA stream: %w", err)
+	}
+	counts := make([]uint64, len(typ.Subtypes))
+	for valueIndex, tag := range tags {
+		if int(tag) >= len(typ.Subtypes) {
+			return nil, fmt.Errorf("UNION value %d has tag %d, want less than %d", valueIndex, tag, len(typ.Subtypes))
+		}
+		counts[tag]++
+	}
+	variants := make([][]any, len(typ.Subtypes))
+	for tag, subtype := range typ.Subtypes {
+		variants[tag], err = decodeColumn(counts[tag], rowColumn{id: subtype}, types, encodings, streams, writerTimezone)
+		if err != nil {
+			return nil, fmt.Errorf("decode UNION variant %d (column %d): %w", tag, subtype, err)
+		}
+	}
+
+	values := make([]any, len(present))
+	variantOffsets := make([]int, len(typ.Subtypes))
+	valueIndex := 0
+	for rowIndex, isPresent := range present {
+		if !isPresent {
+			continue
+		}
+		tag := tags[valueIndex]
+		values[rowIndex] = UnionValue{Tag: tag, Value: variants[tag][variantOffsets[tag]]}
+		variantOffsets[tag]++
+		valueIndex++
+	}
+	return values, nil
+}
+
+func decodeCollectionLengths(valueCount int, column rowColumn, streams map[streamKey][]byte, encoding columnEncoding) ([]uint64, error) {
+	data, ok := streams[streamKey{kind: streamKindLength, column: column.id}]
+	if valueCount > 0 && !ok {
+		return nil, fmt.Errorf("missing LENGTH stream for %d collection values", valueCount)
+	}
+	lengths, err := decodeUnsignedIntegerStream(data, valueCount, encoding.kind == columnEncodingDirectV2)
+	if err != nil {
+		return nil, fmt.Errorf("decode collection LENGTH stream: %w", err)
+	}
+	return lengths, nil
+}
+
+func sumCollectionLengths(lengths []uint64) (uint64, error) {
+	var total uint64
+	for i, length := range lengths {
+		if length > math.MaxUint64-total {
+			return 0, fmt.Errorf("collection value %d makes child count overflow uint64", i)
+		}
+		total += length
+	}
+	if _, err := checkedSliceLength(total); err != nil {
+		return 0, fmt.Errorf("collection child count: %w", err)
+	}
+	return total, nil
 }
 
 func decodeDecimalColumn(present []bool, valueCount int, column rowColumn, streams map[streamKey][]byte, encoding columnEncoding) ([]any, error) {
