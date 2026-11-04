@@ -10,3 +10,10 @@ The following small compatibility fixtures come from the Apache ORC repository a
 - `apache-stripe-stats.orc`: `examples/TestOrcFile.testStripeLevelStats.orc`; three stripes with file and stripe statistics.
 
 Source: <https://github.com/apache/orc/tree/main/examples>
+
+The following interoperability fixtures were generated with PyArrow 24.0's Apache ORC C++ writer. They use synthetic values and the Apache ORC 0.11 or 0.12 file version:
+
+- `apache-pyarrow-v0-zlib.orc`: ORC 0.11 with nullable scalar and nested values.
+- `apache-pyarrow-v1-uncompressed.orc`, `apache-pyarrow-v1-zlib.orc`, `apache-pyarrow-v1-snappy.orc`, `apache-pyarrow-v1-lz4.orc`, and `apache-pyarrow-v1-zstd.orc`: ORC 0.12 with all Arrow-supported ORC scalar and nested types, RLEv2, string dictionaries, and nullable values.
+
+PyArrow and Apache ORC are licensed under Apache License 2.0.

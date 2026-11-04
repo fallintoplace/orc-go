@@ -3,9 +3,11 @@ package orc
 import (
 	"bytes"
 	"math"
+	"math/big"
 	"os"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestReadsApacheORCNestedFixture(t *testing.T) {
@@ -33,6 +35,152 @@ func TestReadsApacheORCNestedFixture(t *testing.T) {
 	}) {
 		t.Fatalf("second map = %#v", got)
 	}
+}
+
+func TestReadsPyArrowORCV0Fixture(t *testing.T) {
+	reader := openApacheFixture(t, "apache-pyarrow-v0-zlib.orc")
+	if got := reader.FormatVersion(); !reflect.DeepEqual(got, []uint32{0, 11}) {
+		t.Fatalf("FormatVersion() = %v, want [0 11]", got)
+	}
+	if got := reader.Compression(); got != CompressionZlib {
+		t.Fatalf("Compression() = %s, want ZLIB", got)
+	}
+	rows, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Row{
+		{
+			"flag": true, "count": int64(-100), "text": "alpha", "payload": []byte{0, 'a'},
+			"amount": Decimal("12.34"), "day": dateFromDays(-1),
+			"stamp":  time.Date(2015, time.January, 1, 0, 0, 0, 0, time.UTC),
+			"items":  []any{int32(1), int32(2)},
+			"attrs":  []MapEntry{{Key: "x", Value: int32(1)}, {Key: "é", Value: int32(2)}},
+			"record": Row{"score": int16(3), "label": "nested"},
+		},
+		{
+			"flag": false, "count": int64(0), "text": "éclair", "payload": []byte{},
+			"amount": Decimal("-0.05"), "day": dateFromDays(0),
+			"stamp": time.Date(2024, time.February, 29, 12, 34, 56, 123456000, time.UTC),
+			"items": []any{}, "attrs": []MapEntry{}, "record": nil,
+		},
+		{
+			"flag": nil, "count": int64(200), "text": nil, "payload": nil,
+			"amount": nil, "day": nil, "stamp": nil, "items": nil, "attrs": nil,
+			"record": Row{"score": nil, "label": "empty"},
+		},
+	}
+	if !reflect.DeepEqual(rows, want) {
+		t.Fatalf("ReadAll() = %#v, want %#v", rows, want)
+	}
+}
+
+func TestReadsPyArrowORCV1FixturesAcrossCodecs(t *testing.T) {
+	testCases := []struct {
+		name        string
+		compression CompressionKind
+	}{
+		{name: "uncompressed", compression: CompressionNone},
+		{name: "zlib", compression: CompressionZlib},
+		{name: "snappy", compression: CompressionSnappy},
+		{name: "lz4", compression: CompressionLZ4},
+		{name: "zstd", compression: CompressionZstd},
+	}
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			reader := openApacheFixture(t, "apache-pyarrow-v1-"+test.name+".orc")
+			if got := reader.FormatVersion(); !reflect.DeepEqual(got, []uint32{0, 12}) {
+				t.Fatalf("FormatVersion() = %v, want [0 12]", got)
+			}
+			if got := reader.Compression(); got != test.compression {
+				t.Fatalf("Compression() = %s, want %s", got, test.compression)
+			}
+			rows, err := reader.ReadAll()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 1024 {
+				t.Fatalf("ReadAll() returned %d rows, want 1024", len(rows))
+			}
+			for i, row := range rows {
+				want := pyArrowV1FixtureRow(i)
+				if !reflect.DeepEqual(row, want) {
+					t.Fatalf("row %d = %#v, want %#v", i, row, want)
+				}
+			}
+		})
+	}
+}
+
+func pyArrowV1FixtureRow(index int) Row {
+	row := Row{
+		"flag": nil, "byte": nil, "short": nil, "integer": nil, "long": nil,
+		"float": nil, "double": nil, "text": nil, "payload": nil, "amount": nil,
+		"day": nil, "instant": nil, "items": nil, "attrs": nil, "record": nil,
+	}
+	if index%11 != 0 {
+		row["flag"] = index%2 == 0
+	}
+	if index%19 != 0 {
+		row["byte"] = int8(index%255 - 127)
+	}
+	if index%23 != 0 {
+		row["short"] = int16(index%65535 - 32767)
+	}
+	if index%29 != 0 {
+		row["integer"] = int32(index*7919%200000 - 100000)
+	}
+	if index%31 != 0 {
+		row["long"] = int64(index - 512)
+	}
+	if index%13 != 0 {
+		row["float"] = float32(index%17)/4 - 2
+	}
+	if index%17 != 0 {
+		row["double"] = float64(index%101)/7 - 6
+	}
+	if index%37 != 0 {
+		row["text"] = []string{"north", "south", "west", "éclair"}[index%4]
+	}
+	if index%41 != 0 {
+		row["payload"] = []byte{byte(index & 255), 0, byte(index >> 8 & 255)}
+	}
+	if index%43 != 0 {
+		coefficient := big.NewInt(int64(index-512) * 1_000_000)
+		amount, _ := formatDecimal(coefficient, 12)
+		row["amount"] = Decimal(amount)
+	}
+	if index%47 != 0 {
+		row["day"] = time.Date(1969, time.December, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, index)
+	}
+	if index%53 != 0 {
+		row["instant"] = time.Unix(orcTimestampEpoch+int64(index*61), int64(index%1_000_000)*1_000).UTC()
+	}
+	if index%59 != 0 {
+		switch index % 3 {
+		case 0:
+			row["items"] = []any{}
+		case 1:
+			row["items"] = []any{int32(index), int32(-index)}
+		default:
+			row["items"] = []any{int32(index)}
+		}
+	}
+	if index%61 != 0 {
+		if index%3 == 0 {
+			row["attrs"] = []MapEntry{}
+		} else {
+			row["attrs"] = []MapEntry{{Key: "x", Value: int32(index)}, {Key: "é", Value: int32(-index)}}
+		}
+	}
+	if index%67 != 0 {
+		var score any = int16(index % 32767)
+		if index%5 == 0 {
+			score = nil
+		}
+		row["record"] = Row{"score": score, "label": []string{"north", "south"}[index%2]}
+	}
+	return row
 }
 
 func TestReadsApacheORCFileAndStripeStatistics(t *testing.T) {
