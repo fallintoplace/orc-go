@@ -6,7 +6,7 @@ The implementation is being built from the published ORC format specification.
 
 ## Status
 
-Work in progress. The current reader reads the file schema, row count, stripe directory, format version, and compression kind. Footer compression supports NONE, ZLIB, and SNAPPY. Row decoding and writing are not implemented yet, and the API is not stable.
+Work in progress. The reader reads file metadata and rows when every root field is BYTE, SHORT, INT, or LONG. It supports optional null streams, multiple stripes, and NONE, ZLIB, and SNAPPY compression. `ReadRows` passes rows to a callback and buffers one stripe at a time; `ReadAll` collects the whole file in memory. Other types, column encodings, and writing are not implemented yet, and the API is not stable.
 
 ```go
 package main
@@ -26,6 +26,12 @@ func main() {
 	defer reader.Close()
 
 	fmt.Println(reader.NumRows(), reader.NumStripes(), reader.Schema())
+	if err := reader.ReadRows(func(row orc.Row) error {
+		fmt.Println(row)
+		return nil
+	}); err != nil {
+		log.Fatal(err)
+	}
 }
 ```
 
