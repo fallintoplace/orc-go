@@ -482,11 +482,11 @@ func (r *Reader) decryptStripeVariants(streams map[streamKey][]byte, footer *str
 			if *position > math.MaxInt64 || stream.length > math.MaxInt64-*position {
 				return fmt.Errorf("encrypted stream offset overflows int64")
 			}
-			if !isIndexStreamKind(stream.kind) && wanted[streamKey{kind: stream.kind, column: stream.column}] {
+			key := streamKey{kind: stream.kind, column: stream.column}
+			if wanted[key] {
 				if stream.column < fileVariant.root || stream.column > last {
 					return fmt.Errorf("encrypted stream for column %d is outside variant subtree %d..%d", stream.column, fileVariant.root, last)
 				}
-				key := streamKey{kind: stream.kind, column: stream.column}
 				if seen[key] {
 					return fmt.Errorf("duplicate encrypted stream kind %d for column %d", stream.kind, stream.column)
 				}
@@ -523,7 +523,10 @@ func isIndexStreamKind(kind uint32) bool {
 
 func subtreeStreamsWanted(wanted map[streamKey]bool, root, last uint32) bool {
 	for column := root; ; column++ {
-		for _, kind := range []uint32{streamKindPresent, streamKindData, streamKindLength, streamKindDictionaryData, streamKindSecondary} {
+		for _, kind := range []uint32{
+			streamKindPresent, streamKindData, streamKindLength, streamKindDictionaryData, streamKindSecondary,
+			streamKindRowIndex, streamKindBloomFilter, streamKindBloomFilterUTF8,
+		} {
 			if wanted[streamKey{kind: kind, column: column}] {
 				return true
 			}
