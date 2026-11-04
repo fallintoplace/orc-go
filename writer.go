@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"time"
 	"unicode/utf8"
 
 	"github.com/fallintoplace/orc-go/internal/rlev1"
@@ -105,7 +106,7 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 		}
 		kind := types[subtype].Kind
 		switch kind {
-		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary:
+		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate:
 		default:
 			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, kind)
 		}
@@ -148,6 +149,13 @@ func (w *Writer) WriteRow(row Row) error {
 		}
 		if column.kind == TypeKindString && !utf8.ValidString(value.(string)) {
 			return fmt.Errorf("ORC field %q string is not valid UTF-8", column.name)
+		}
+		if column.kind == TypeKindDate {
+			days, err := dateDays(value.(time.Time))
+			if err != nil {
+				return fmt.Errorf("ORC field %q: %w", column.name, err)
+			}
+			value = days
 		}
 		if column.kind == TypeKindBinary {
 			data := value.([]byte)
@@ -280,7 +288,7 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 	}
 
 	encoding := columnEncodingDirect
-	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindString || column.kind == TypeKindBinary) {
+	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindDate || column.kind == TypeKindString || column.kind == TypeKindBinary) {
 		encoding = columnEncodingDirectV2
 	}
 	if len(values) == 0 {
@@ -302,16 +310,16 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 			byteValues[i] = byte(value.(int8))
 		}
 		data = encodeByteRLE(byteValues)
-	case TypeKindShort, TypeKindInt, TypeKindLong:
+	case TypeKindShort, TypeKindInt, TypeKindLong, TypeKindDate:
 		integerValues := make([]int64, len(values))
 		for i, value := range values {
 			switch typed := value.(type) {
+			case int64:
+				integerValues[i] = typed
 			case int16:
 				integerValues[i] = int64(typed)
 			case int32:
 				integerValues[i] = int64(typed)
-			case int64:
-				integerValues[i] = typed
 			}
 		}
 		if encoding == columnEncodingDirectV2 {
@@ -367,6 +375,9 @@ func matchesType(kind TypeKind, value any) bool {
 	case TypeKindLong:
 		_, ok := value.(int64)
 		return ok
+	case TypeKindDate:
+		_, ok := value.(time.Time)
+		return ok
 	case TypeKindFloat:
 		_, ok := value.(float32)
 		return ok
@@ -382,6 +393,19 @@ func matchesType(kind TypeKind, value any) bool {
 	default:
 		return false
 	}
+}
+
+func dateDays(value time.Time) (int64, error) {
+	year, month, day := value.Date()
+	if year < -6000000 || year > 6000000 {
+		return 0, fmt.Errorf("DATE value is outside the ORC day range")
+	}
+	date := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+	days := date.Unix() / 86400
+	if days < math.MinInt32 || days > math.MaxInt32 {
+		return 0, fmt.Errorf("DATE value is outside the ORC day range")
+	}
+	return days, nil
 }
 
 func flattenVariableValues(values []any, bytesOf func(any) []byte) ([]byte, []uint64) {
