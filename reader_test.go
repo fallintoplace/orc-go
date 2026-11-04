@@ -142,7 +142,7 @@ func TestValidateFooterRejectsTruncatedContentLength(t *testing.T) {
 }
 
 func TestNewReaderRejectsUnsupportedCompression(t *testing.T) {
-	data := makeORCFileWithPostScript(t, 4, uint64(len(simpleFooter())), 0, simpleFooter())
+	data := makeORCFileWithPostScript(t, 99, uint64(len(simpleFooter())), 0, simpleFooter())
 	if _, err := NewReader(byteReaderAt(data), int64(len(data))); !errors.Is(err, ErrUnsupportedCompression) {
 		t.Fatalf("got %v, want unsupported compression error", err)
 	}

@@ -11,9 +11,13 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/andybalholm/brotli"
 	"github.com/fallintoplace/orc-go/internal/rlev1"
 	"github.com/fallintoplace/orc-go/internal/rlev2"
 	"github.com/golang/snappy"
+	"github.com/klauspost/compress/zstd"
+	"github.com/pierrec/lz4/v4"
+	"github.com/woozymasta/lzo"
 )
 
 const maxEncodedChunkLength = (1 << 23) - 1
@@ -25,7 +29,7 @@ var ErrWriterClosed = errors.New("ORC writer is closed")
 // selects RLEv2 streams. UseDictionary selects dictionary encoding for
 // STRING, CHAR, and VARCHAR columns.
 type WriterOptions struct {
-	// Compression selects NONE, ZLIB, or SNAPPY.
+	// Compression selects NONE, ZLIB, SNAPPY, LZO, LZ4, ZSTD, or BROTLI.
 	Compression CompressionKind
 	// CompressionBlockSize sets the maximum uncompressed chunk size. Zero uses
 	// the ORC default.
@@ -92,7 +96,7 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 	}
 
 	switch options.Compression {
-	case CompressionNone, CompressionZlib, CompressionSnappy:
+	case CompressionNone, CompressionZlib, CompressionSnappy, CompressionLZO, CompressionLZ4, CompressionZstd, CompressionBrotli:
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedCompression, options.Compression)
 	}
@@ -770,6 +774,47 @@ func compressChunk(kind CompressionKind, data []byte) ([]byte, error) {
 		return compressed.Bytes(), nil
 	case CompressionSnappy:
 		return snappy.Encode(nil, data), nil
+	case CompressionLZO:
+		return lzo.Compress(data, nil)
+	case CompressionLZ4:
+		// ORC uses raw LZ4 blocks and its codec leaves very short chunks raw.
+		if len(data) < 10 {
+			return data, nil
+		}
+		compressed := make([]byte, lz4.CompressBlockBound(len(data)))
+		length, err := lz4.CompressBlock(data, compressed, nil)
+		if err != nil {
+			return nil, err
+		}
+		if length == 0 {
+			return data, nil
+		}
+		return compressed[:length], nil
+	case CompressionZstd:
+		// Keep ORC's chunk boundaries and frame format independent of CPU count.
+		if len(data) < 10 {
+			return data, nil
+		}
+		writer, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1), zstd.WithEncoderCRC(false))
+		if err != nil {
+			return nil, err
+		}
+		compressed := writer.EncodeAll(data, nil)
+		if err := writer.Close(); err != nil {
+			return nil, err
+		}
+		return compressed, nil
+	case CompressionBrotli:
+		var compressed bytes.Buffer
+		writer := brotli.NewWriterLevel(&compressed, brotli.DefaultCompression)
+		if _, err := writer.Write(data); err != nil {
+			_ = writer.Close()
+			return nil, err
+		}
+		if err := writer.Close(); err != nil {
+			return nil, err
+		}
+		return compressed.Bytes(), nil
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedCompression, kind)
 	}
