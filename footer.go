@@ -15,6 +15,7 @@ type fileFooter struct {
 	stripes          []StripeInfo
 	stripeEncryption []stripeEncryptionInfo
 	types            []Type
+	userMetadata     []UserMetadataItem
 	encryption       *fileEncryption
 }
 
@@ -50,6 +51,16 @@ func parseFooter(data []byte) (fileFooter, error) {
 				typ, err = parseType(data)
 				if err == nil {
 					result.types = append(result.types, typ)
+				}
+			}
+		case 5:
+			var data []byte
+			data, err = fieldBytes(field)
+			if err == nil {
+				var item UserMetadataItem
+				item, err = parseUserMetadataItem(data)
+				if err == nil {
+					result.userMetadata = append(result.userMetadata, item)
 				}
 			}
 		case 6:

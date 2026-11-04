@@ -184,6 +184,12 @@ func (r *Reader) RowIndexStride() uint64 {
 	return r.footer.rowIndexStride
 }
 
+// UserMetadata returns the application-defined key/value pairs in the file
+// footer. The returned values do not alias the reader's metadata.
+func (r *Reader) UserMetadata() []UserMetadataItem {
+	return cloneUserMetadata(r.footer.userMetadata)
+}
+
 // Close closes the file when the Reader was created with Open.
 func (r *Reader) Close() error {
 	if r.closer == nil {
