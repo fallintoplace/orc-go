@@ -7,13 +7,15 @@ import (
 )
 
 type fileFooter struct {
-	headerLength    uint64
-	contentLength   uint64
-	numberOfRows    uint64
-	hasNumberOfRows bool
-	rowIndexStride  uint64
-	stripes         []StripeInfo
-	types           []Type
+	headerLength     uint64
+	contentLength    uint64
+	numberOfRows     uint64
+	hasNumberOfRows  bool
+	rowIndexStride   uint64
+	stripes          []StripeInfo
+	stripeEncryption []stripeEncryptionInfo
+	types            []Type
+	encryption       *fileEncryption
 }
 
 func parseFooter(data []byte) (fileFooter, error) {
@@ -33,9 +35,11 @@ func parseFooter(data []byte) (fileFooter, error) {
 			data, err = fieldBytes(field)
 			if err == nil {
 				var stripe StripeInfo
-				stripe, err = parseStripeInfo(data)
+				var encryption stripeEncryptionInfo
+				stripe, encryption, err = parseStripeInfo(data)
 				if err == nil {
 					result.stripes = append(result.stripes, stripe)
+					result.stripeEncryption = append(result.stripeEncryption, encryption)
 				}
 			}
 		case 4:
@@ -53,6 +57,16 @@ func parseFooter(data []byte) (fileFooter, error) {
 			result.hasNumberOfRows = err == nil
 		case 8:
 			result.rowIndexStride, err = fieldVarint(field)
+		case 10:
+			var data []byte
+			data, err = fieldBytes(field)
+			if err == nil {
+				var encryption fileEncryption
+				encryption, err = parseFileEncryption(data)
+				if err == nil {
+					result.encryption = &encryption
+				}
+			}
 		}
 		if err != nil {
 			return fileFooter{}, err
@@ -108,12 +122,13 @@ func parseType(data []byte) (Type, error) {
 	return result, nil
 }
 
-func parseStripeInfo(data []byte) (StripeInfo, error) {
+func parseStripeInfo(data []byte) (StripeInfo, stripeEncryptionInfo, error) {
 	fields, err := wire.Fields(data)
 	if err != nil {
-		return StripeInfo{}, fmt.Errorf("decode ORC stripe information: %w", err)
+		return StripeInfo{}, stripeEncryptionInfo{}, fmt.Errorf("decode ORC stripe information: %w", err)
 	}
 	var result StripeInfo
+	var encryption stripeEncryptionInfo
 	for _, field := range fields {
 		switch field.Number {
 		case 1:
@@ -126,12 +141,21 @@ func parseStripeInfo(data []byte) (StripeInfo, error) {
 			result.FooterLength, err = fieldVarint(field)
 		case 5:
 			result.NumberOfRows, err = fieldVarint(field)
+		case 6:
+			encryption.stripeID, err = fieldVarint(field)
+			encryption.hasStripeID = err == nil
+		case 7:
+			var key []byte
+			key, err = fieldBytes(field)
+			if err == nil {
+				encryption.localKeys = append(encryption.localKeys, append([]byte(nil), key...))
+			}
 		}
 		if err != nil {
-			return StripeInfo{}, err
+			return StripeInfo{}, stripeEncryptionInfo{}, err
 		}
 	}
-	return result, nil
+	return result, encryption, nil
 }
 
 func readUint32Field(field wire.Field) (uint32, error) {

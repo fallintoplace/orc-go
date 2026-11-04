@@ -8,9 +8,39 @@ The implementation is being built from the published ORC format specification.
 
 ## Status
 
-Work in progress. The reader supports primitive and nested fields, including STRUCT, LIST, MAP, and UNION values, nulls, and multiple stripes. STRUCT values are `orc.Row`, LIST values are `[]any`, MAP values are `[]orc.MapEntry`, and UNION values are `orc.UnionValue`. DATE and timestamp values use UTC `time.Time`. TIMESTAMP preserves wall-clock fields using the stripe writer timezone; files without that metadata use the process timezone. TIMESTAMP_INSTANT preserves the instant. DECIMAL values use the exact `orc.Decimal` string type. CHAR values have trailing spaces removed; CHAR and VARCHAR values are limited to their declared number of Unicode code points. It supports NONE, ZLIB, SNAPPY, LZO, LZ4, ZSTD, and BROTLI compression for unencrypted files. It reads integer, DATE, timestamp, and DECIMAL DIRECT (RLEv1) and DIRECT_V2 (RLEv2), string-like direct and dictionary encodings, and binary direct encodings. `ReadRows` buffers one stripe at a time; `ReadAll` collects the whole file in memory.
+Work in progress. The reader supports primitive and nested fields, including STRUCT, LIST, MAP, and UNION values, nulls, and multiple stripes. STRUCT values are `orc.Row`, LIST values are `[]any`, MAP values are `[]orc.MapEntry`, and UNION values are `orc.UnionValue`. DATE and timestamp values use UTC `time.Time`. TIMESTAMP preserves wall-clock fields using the stripe writer timezone; files without that metadata use the process timezone. TIMESTAMP_INSTANT preserves the instant. DECIMAL values use the exact `orc.Decimal` string type. CHAR values have trailing spaces removed; CHAR and VARCHAR values are limited to their declared number of Unicode code points. It supports NONE, ZLIB, SNAPPY, LZO, LZ4, ZSTD, and BROTLI compression, plus ORC AES-CTR column encryption. Without a key, encrypted columns use the masked fallback values stored in the file. It reads integer, DATE, timestamp, and DECIMAL DIRECT (RLEv1) and DIRECT_V2 (RLEv2), string-like direct and dictionary encodings, and binary direct encodings. `ReadRows` buffers one stripe at a time; `ReadAll` collects the whole file in memory.
 
-The writer supports the same primitive and nested types. Use `orc.Row` or `map[string]any` for STRUCT values, slices for LIST values, `[]orc.MapEntry` for MAP values, and `orc.UnionValue` for UNION values. Missing STRUCT fields and nil values are written as nulls. DATE values use `time.Time`; the calendar date is taken from the value's location. TIMESTAMP keeps the value's calendar and clock fields and writes a UTC writer timezone, while TIMESTAMP_INSTANT keeps its instant. DECIMAL schemas require precision from 1 to 38 and a scale no greater than the precision; values are rescaled exactly and never rounded. CHAR values are truncated to their maximum length and padded with spaces. VARCHAR values are truncated to their maximum length. Length is counted in Unicode code points. It supports NONE, ZLIB, SNAPPY, LZO, LZ4, ZSTD, and BROTLI compression. `MaxRowsPerStripe` flushes a stripe after the configured number of rows; zero keeps all rows in one stripe until `Close`. Completed stripes are written to the destination, and `Close` writes the file footer. `UseRLEv2` selects RLEv2 for integer, DATE, timestamp, DECIMAL, variable-length, and collection length columns. `UseDictionary` selects dictionary encoding for STRING, CHAR, and VARCHAR columns. Encrypted files are not implemented yet, and the API is not stable.
+The writer supports the same primitive and nested types. Use `orc.Row` or `map[string]any` for STRUCT values, slices for LIST values, `[]orc.MapEntry` for MAP values, and `orc.UnionValue` for UNION values. Missing STRUCT fields and nil values are written as nulls. DATE values use `time.Time`; the calendar date is taken from the value's location. TIMESTAMP keeps the value's calendar and clock fields and writes a UTC writer timezone, while TIMESTAMP_INSTANT keeps its instant. DECIMAL schemas require precision from 1 to 38 and a scale no greater than the precision; values are rescaled exactly and never rounded. CHAR values are truncated to their maximum length and padded with spaces. VARCHAR values are truncated to their maximum length. Length is counted in Unicode code points. It supports NONE, ZLIB, SNAPPY, LZO, LZ4, ZSTD, and BROTLI compression. `MaxRowsPerStripe` flushes a stripe after the configured number of rows; zero keeps all rows in one stripe until `Close`. Completed stripes are written to the destination, and `Close` writes the file footer. `UseRLEv2` selects RLEv2 for integer, DATE, timestamp, DECIMAL, variable-length, and collection length columns. `UseDictionary` selects dictionary encoding for STRING, CHAR, and VARCHAR columns. `EncryptColumns` encrypts selected root fields and their complete type subtrees with AES-CTR 128 or 256. The API is not stable.
+
+## Column encryption
+
+Use a key provider to look up the named master key. The file stores wrapped random local keys. Files written by this package use a nullified fallback, so readers without a key see nulls for encrypted columns.
+
+```go
+masterKey := []byte("0123456789abcdef") // 16 bytes for AES-CTR 128
+keys := orc.KeyProviderFunc(func(name string, version uint32) ([]byte, error) {
+	if name != "customer-data" || version != 1 {
+		return nil, orc.ErrKeyUnavailable
+	}
+	return masterKey, nil
+})
+
+writer, err := orc.NewWriter(file, schema, orc.WriterOptions{
+	EncryptColumns: []orc.EncryptionRule{{
+		Column: "email", KeyName: "customer-data", KeyVersion: 1,
+		Algorithm: orc.EncryptionAESCTR128,
+	}},
+	KeyProvider: keys,
+})
+```
+
+Pass the same provider when opening the file to read the encrypted values:
+
+```go
+reader, err := orc.OpenWithOptions("rows.orc", orc.ReaderOptions{KeyProvider: keys})
+```
+
+ORC uses AES-CTR for column encryption. AES-CTR does not detect modified ciphertext, so applications that need tamper detection should verify file integrity separately.
 
 ```go
 package main
