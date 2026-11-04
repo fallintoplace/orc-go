@@ -1,6 +1,7 @@
 package orc
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -31,12 +32,12 @@ const (
 	columnEncodingDictionaryV2 uint32 = 3
 )
 
-// Row contains one ORC root-struct row. Values use the matching Go integer
-// type: int8 for BYTE, int16 for SHORT, int32 for INT, and int64 for LONG.
-// A nil value represents an ORC null.
+// Row contains one ORC root-struct row. Values use bool for BOOLEAN, the
+// matching integer width for integer columns, and float32 or float64 for FLOAT
+// or DOUBLE. A nil value represents an ORC null.
 type Row map[string]any
 
-type integerColumn struct {
+type rowColumn struct {
 	id   uint32
 	name string
 	kind TypeKind
@@ -69,7 +70,7 @@ func (r *Reader) ReadRows(yield func(Row) error) error {
 	if yield == nil {
 		return errors.New("ORC row callback is nil")
 	}
-	columns, err := r.integerColumns()
+	columns, err := r.rowColumns()
 	if err != nil {
 		return err
 	}
@@ -95,13 +96,10 @@ func (r *Reader) ReadRows(yield func(Row) error) error {
 				return fmt.Errorf("stripe %d column %q (id %d): missing column encoding", stripeIndex, column.name, column.id)
 			}
 			encoding := footer.encodings[column.id].kind
-			if encoding != columnEncodingDirect && encoding != columnEncodingDirectV2 {
+			if !supportsRowEncoding(column.kind, encoding) {
 				return fmt.Errorf("stripe %d column %q (id %d): %w: kind %d", stripeIndex, column.name, column.id, ErrUnsupportedEncoding, encoding)
 			}
-			if column.kind == TypeKindByte && encoding != columnEncodingDirect {
-				return fmt.Errorf("stripe %d column %q (id %d): %w: BYTE requires DIRECT encoding", stripeIndex, column.name, column.id, ErrUnsupportedEncoding)
-			}
-			values[i], err = decodeIntegerColumn(stripe.NumberOfRows, column, streams, encoding)
+			values[i], err = decodeColumn(stripe.NumberOfRows, column, streams, encoding)
 			if err != nil {
 				return fmt.Errorf("stripe %d column %q (id %d): %w", stripeIndex, column.name, column.id, err)
 			}
@@ -133,9 +131,9 @@ func (r *Reader) ReadAll() ([]Row, error) {
 	return rows, nil
 }
 
-func (r *Reader) integerColumns() ([]integerColumn, error) {
+func (r *Reader) rowColumns() ([]rowColumn, error) {
 	root := r.footer.types[0]
-	columns := make([]integerColumn, len(root.Subtypes))
+	columns := make([]rowColumn, len(root.Subtypes))
 	seenNames := make(map[string]struct{}, len(root.FieldNames))
 	for i, subtype := range root.Subtypes {
 		name := root.FieldNames[i]
@@ -145,13 +143,24 @@ func (r *Reader) integerColumns() ([]integerColumn, error) {
 		seenNames[name] = struct{}{}
 		typ := r.footer.types[subtype]
 		switch typ.Kind {
-		case TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong:
+		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble:
 		default:
 			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, typ.Kind)
 		}
-		columns[i] = integerColumn{id: subtype, name: name, kind: typ.Kind}
+		columns[i] = rowColumn{id: subtype, name: name, kind: typ.Kind}
 	}
 	return columns, nil
+}
+
+func supportsRowEncoding(kind TypeKind, encoding uint32) bool {
+	switch kind {
+	case TypeKindShort, TypeKindInt, TypeKindLong:
+		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
+	case TypeKindBoolean, TypeKindByte, TypeKindFloat, TypeKindDouble:
+		return encoding == columnEncodingDirect
+	default:
+		return false
+	}
 }
 
 func (r *Reader) readStripeStreams(stripe StripeInfo, wanted map[streamKey]bool) (map[streamKey][]byte, stripeFooter, error) {
@@ -304,7 +313,7 @@ func parseColumnEncoding(data []byte) (columnEncoding, error) {
 	return result, nil
 }
 
-func decodeIntegerColumn(rowCount uint64, column integerColumn, streams map[streamKey][]byte, encoding uint32) ([]any, error) {
+func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byte, encoding uint32) ([]any, error) {
 	rows, err := checkedSliceLength(rowCount)
 	if err != nil {
 		return nil, err
@@ -335,7 +344,54 @@ func decodeIntegerColumn(rowCount uint64, column integerColumn, streams map[stre
 	}
 
 	values := make([]any, rows)
-	if column.kind == TypeKindByte {
+	switch column.kind {
+	case TypeKindBoolean:
+		byteCount := valueCount / 8
+		if valueCount%8 != 0 {
+			byteCount++
+		}
+		encodedValues, err := decodeByteRLE(dataStream, byteCount)
+		if err != nil {
+			return nil, fmt.Errorf("decode DATA boolean RLE: %w", err)
+		}
+		valueIndex := 0
+		for rowIndex, isPresent := range present {
+			if !isPresent {
+				continue
+			}
+			values[rowIndex] = encodedValues[valueIndex/8]&(1<<uint(7-valueIndex%8)) != 0
+			valueIndex++
+		}
+		return values, nil
+	case TypeKindFloat:
+		if err := checkRawDataLength(dataStream, valueCount, 4); err != nil {
+			return nil, fmt.Errorf("decode DATA float stream: %w", err)
+		}
+		valueIndex := 0
+		for rowIndex, isPresent := range present {
+			if !isPresent {
+				continue
+			}
+			offset := valueIndex * 4
+			values[rowIndex] = math.Float32frombits(binary.LittleEndian.Uint32(dataStream[offset : offset+4]))
+			valueIndex++
+		}
+		return values, nil
+	case TypeKindDouble:
+		if err := checkRawDataLength(dataStream, valueCount, 8); err != nil {
+			return nil, fmt.Errorf("decode DATA double stream: %w", err)
+		}
+		valueIndex := 0
+		for rowIndex, isPresent := range present {
+			if !isPresent {
+				continue
+			}
+			offset := valueIndex * 8
+			values[rowIndex] = math.Float64frombits(binary.LittleEndian.Uint64(dataStream[offset : offset+8]))
+			valueIndex++
+		}
+		return values, nil
+	case TypeKindByte:
 		encodedValues, err := decodeByteRLE(dataStream, valueCount)
 		if err != nil {
 			return nil, fmt.Errorf("decode DATA byte RLE: %w", err)
@@ -348,6 +404,10 @@ func decodeIntegerColumn(rowCount uint64, column integerColumn, streams map[stre
 			}
 		}
 		return values, nil
+	case TypeKindShort, TypeKindInt, TypeKindLong:
+		// Integer values are decoded below using the encoding selected in the stripe footer.
+	default:
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedType, column.kind)
 	}
 
 	var encodedValues []int64
@@ -372,6 +432,18 @@ func decodeIntegerColumn(rowCount uint64, column integerColumn, streams map[stre
 		}
 	}
 	return values, nil
+}
+
+func checkRawDataLength(data []byte, valueCount, width int) error {
+	maxInt := int(^uint(0) >> 1)
+	if valueCount > maxInt/width {
+		return fmt.Errorf("raw DATA size overflows int")
+	}
+	want := valueCount * width
+	if len(data) != want {
+		return fmt.Errorf("raw DATA stream has %d bytes, want %d", len(data), want)
+	}
+	return nil
 }
 
 func decodePresent(data []byte, rowCount int) ([]bool, error) {
