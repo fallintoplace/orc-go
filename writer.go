@@ -21,16 +21,19 @@ const maxEncodedChunkLength = (1 << 23) - 1
 // ErrWriterClosed is returned when WriteRow is called after Close.
 var ErrWriterClosed = errors.New("ORC writer is closed")
 
-// WriterOptions controls file compression and integer encoding. UseRLEv2
-// selects DIRECT_V2 for integer, timestamp, decimal, and variable-length columns.
+// WriterOptions controls file compression and column encodings. UseRLEv2
+// selects RLEv2 streams. UseDictionary selects dictionary encoding for
+// STRING, CHAR, and VARCHAR columns.
 type WriterOptions struct {
 	// Compression selects NONE, ZLIB, or SNAPPY.
 	Compression CompressionKind
 	// CompressionBlockSize sets the maximum uncompressed chunk size. Zero uses
 	// the ORC default.
 	CompressionBlockSize uint64
-	// UseRLEv2 selects DIRECT_V2 for integer, timestamp, decimal, and variable-length columns.
+	// UseRLEv2 selects RLEv2 for integer, timestamp, decimal, and length streams.
 	UseRLEv2 bool
+	// UseDictionary writes STRING, CHAR, and VARCHAR values using a per-stripe dictionary.
+	UseDictionary bool
 }
 
 // Writer writes ORC files for root STRUCT schemas with primitive or nested columns.
@@ -368,7 +371,7 @@ func (w *Writer) encodeFile() ([]byte, error) {
 func (w *Writer) encodeStripe(offset uint64) ([]byte, []byte, error) {
 	var streamBytes []byte
 	var streamFooter []byte
-	encodings := make([]uint32, len(w.types))
+	encodings := make([]columnEncoding, len(w.types))
 	for _, column := range w.columns {
 		columnStreams, encoding, err := w.encodeColumn(column)
 		if err != nil {
@@ -389,7 +392,10 @@ func (w *Writer) encodeStripe(offset uint64) ([]byte, []byte, error) {
 	}
 
 	for _, encoding := range encodings {
-		message := appendProtoVarintField(nil, 1, uint64(encoding))
+		message := appendProtoVarintField(nil, 1, uint64(encoding.kind))
+		if encoding.dictionarySize > 0 {
+			message = appendProtoVarintField(message, 2, uint64(encoding.dictionarySize))
+		}
 		streamFooter = appendProtoBytesField(streamFooter, 2, message)
 	}
 	for _, column := range w.columns {
@@ -411,7 +417,7 @@ func (w *Writer) encodeStripe(offset uint64) ([]byte, []byte, error) {
 	return stripe, stripeInfo, nil
 }
 
-func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, error) {
+func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, columnEncoding, error) {
 	var streams []writerStream
 	present := make([]bool, len(column.values))
 	values := make([]any, 0, len(column.values))
@@ -429,12 +435,15 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 		streams = append(streams, writerStream{kind: streamKindPresent, column: column.id, data: encodeByteRLE(packed)})
 	}
 
-	encoding := columnEncodingDirect
+	encoding := columnEncoding{kind: columnEncodingDirect}
 	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindDate || column.kind == TypeKindTimestamp || column.kind == TypeKindTimestampInstant || column.kind == TypeKindDecimal || column.kind == TypeKindString || column.kind == TypeKindBinary || column.kind == TypeKindChar || column.kind == TypeKindVarchar || column.kind == TypeKindList || column.kind == TypeKindMap) {
-		encoding = columnEncodingDirectV2
+		encoding.kind = columnEncodingDirectV2
 	}
 	if len(values) == 0 {
 		return streams, encoding, nil
+	}
+	if w.options.UseDictionary && (column.kind == TypeKindString || column.kind == TypeKindChar || column.kind == TypeKindVarchar) {
+		return encodeStringDictionary(column, values, streams, w.options.UseRLEv2)
 	}
 
 	var data []byte
@@ -479,7 +488,7 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 				integerValues[i] = int64(typed)
 			}
 		}
-		if encoding == columnEncodingDirectV2 {
+		if encoding.kind == columnEncodingDirectV2 {
 			data = rlev2.EncodeSigned(integerValues)
 		} else {
 			data = rlev1.EncodeSigned(integerValues)
@@ -493,7 +502,7 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 			nanos[i] = timestamp.nanos
 		}
 		var secondary []byte
-		if encoding == columnEncodingDirectV2 {
+		if encoding.kind == columnEncodingDirectV2 {
 			data = rlev2.EncodeSigned(seconds)
 			secondary = rlev2.EncodeUnsigned(nanos)
 		} else {
@@ -514,7 +523,7 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 		}
 		data = encodeBigIntegerStream(decimals)
 		var secondary []byte
-		if encoding == columnEncodingDirectV2 {
+		if encoding.kind == columnEncodingDirectV2 {
 			secondary = rlev2.EncodeSigned(scales)
 		} else {
 			secondary = rlev1.EncodeSigned(scales)
@@ -539,19 +548,57 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 	case TypeKindBinary:
 		data, lengths = flattenVariableValues(values, func(value any) []byte { return value.([]byte) })
 	default:
-		return nil, 0, fmt.Errorf("%w: %s", ErrUnsupportedType, column.kind)
+		return nil, columnEncoding{}, fmt.Errorf("%w: %s", ErrUnsupportedType, column.kind)
 	}
 	if len(data) > 0 {
 		streams = append(streams, writerStream{kind: streamKindData, column: column.id, data: data})
 	}
 	if lengths != nil {
-		if encoding == columnEncodingDirectV2 {
+		if encoding.kind == columnEncodingDirectV2 {
 			data = rlev2.EncodeUnsigned(lengths)
 		} else {
 			data = rlev1.EncodeUnsigned(lengths)
 		}
 		streams = append(streams, writerStream{kind: streamKindLength, column: column.id, data: data})
 	}
+	return streams, encoding, nil
+}
+
+func encodeStringDictionary(column writerColumn, values []any, streams []writerStream, useRLEv2 bool) ([]writerStream, columnEncoding, error) {
+	indices := make([]uint64, len(values))
+	dictionaryIndexes := make(map[string]uint64, len(values))
+	dictionaryLengths := make([]uint64, 0, len(values))
+	var dictionaryData []byte
+	var dictionarySize uint64
+	for valueIndex, value := range values {
+		text := value.(string)
+		if index, exists := dictionaryIndexes[text]; exists {
+			indices[valueIndex] = index
+			continue
+		}
+		if dictionarySize >= math.MaxUint32 {
+			return nil, columnEncoding{}, fmt.Errorf("STRING dictionary has more than %d entries", uint64(math.MaxUint32))
+		}
+		index := dictionarySize
+		data := []byte(text)
+		dictionaryIndexes[text] = index
+		indices[valueIndex] = index
+		dictionarySize++
+		dictionaryLengths = append(dictionaryLengths, uint64(len(data)))
+		dictionaryData = append(dictionaryData, data...)
+	}
+
+	encoding := columnEncoding{kind: columnEncodingDictionary, dictionarySize: uint32(dictionarySize)}
+	encodeUnsigned := rlev1.EncodeUnsigned
+	if useRLEv2 {
+		encoding.kind = columnEncodingDictionaryV2
+		encodeUnsigned = rlev2.EncodeUnsigned
+	}
+	streams = append(streams,
+		writerStream{kind: streamKindData, column: column.id, data: encodeUnsigned(indices)},
+		writerStream{kind: streamKindLength, column: column.id, data: encodeUnsigned(dictionaryLengths)},
+		writerStream{kind: streamKindDictionaryData, column: column.id, data: dictionaryData},
+	)
 	return streams, encoding, nil
 }
 

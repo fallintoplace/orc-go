@@ -11,37 +11,120 @@ func TestWriterRoundTripsNestedRows(t *testing.T) {
 	compressions := []CompressionKind{CompressionNone, CompressionZlib, CompressionSnappy}
 	for _, compression := range compressions {
 		for _, useRLEv2 := range []bool{false, true} {
-			t.Run(compression.String()+"/rlev2="+boolString(useRLEv2), func(t *testing.T) {
-				var output bytes.Buffer
-				writer, err := NewWriter(&output, nestedWriterSchema(), WriterOptions{
-					Compression: compression, CompressionBlockSize: 32, UseRLEv2: useRLEv2,
-				})
-				if err != nil {
-					t.Fatal(err)
-				}
-				for _, row := range nestedWriterRows() {
-					if err := writer.WriteRow(row); err != nil {
-						t.Fatalf("WriteRow() error = %v", err)
+			for _, useDictionary := range []bool{false, true} {
+				t.Run(compression.String()+"/rlev2="+boolString(useRLEv2)+"/dictionary="+boolString(useDictionary), func(t *testing.T) {
+					var output bytes.Buffer
+					writer, err := NewWriter(&output, nestedWriterSchema(), WriterOptions{
+						Compression: compression, CompressionBlockSize: 32, UseRLEv2: useRLEv2, UseDictionary: useDictionary,
+					})
+					if err != nil {
+						t.Fatal(err)
 					}
-				}
-				if err := writer.Close(); err != nil {
-					t.Fatal(err)
-				}
+					for _, row := range nestedWriterRows() {
+						if err := writer.WriteRow(row); err != nil {
+							t.Fatalf("WriteRow() error = %v", err)
+						}
+					}
+					if err := writer.Close(); err != nil {
+						t.Fatal(err)
+					}
 
-				reader, err := NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer reader.Close()
-				rows, err := reader.ReadAll()
-				if err != nil {
-					t.Fatal(err)
-				}
-				if !reflect.DeepEqual(rows, nestedWriterExpectedRows()) {
-					t.Fatalf("ReadAll() = %#v, want %#v", rows, nestedWriterExpectedRows())
-				}
-			})
+					reader, err := NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer reader.Close()
+					rows, err := reader.ReadAll()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(rows, nestedWriterExpectedRows()) {
+						t.Fatalf("ReadAll() = %#v, want %#v", rows, nestedWriterExpectedRows())
+					}
+				})
+			}
 		}
+	}
+}
+
+func TestWriterWritesStringDictionaries(t *testing.T) {
+	schema := []Type{
+		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"text"}},
+		{Kind: TypeKindString},
+	}
+	rows := []Row{{"text": "repeat"}, {"text": "repeat"}, {"text": ""}, {"text": nil}, {"text": "other"}}
+	for _, useRLEv2 := range []bool{false, true} {
+		t.Run("rlev2="+boolString(useRLEv2), func(t *testing.T) {
+			var output bytes.Buffer
+			writer, err := NewWriter(&output, schema, WriterOptions{UseDictionary: true, UseRLEv2: useRLEv2})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range rows {
+				if err := writer.WriteRow(row); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			reader, err := NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			_, stripeFooter, err := reader.readStripeStreams(reader.footer.stripes[0], nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoding := stripeFooter.encodings[1]
+			wantKind := uint32(columnEncodingDictionary)
+			if useRLEv2 {
+				wantKind = columnEncodingDictionaryV2
+			}
+			if encoding.kind != wantKind || encoding.dictionarySize != 3 {
+				t.Fatalf("string encoding = %+v, want kind %d and dictionary size 3", encoding, wantKind)
+			}
+			got, err := reader.ReadAll()
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []Row{{"text": "repeat"}, {"text": "repeat"}, {"text": ""}, {"text": nil}, {"text": "other"}}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestWriterDoesNotDictionaryEncodeBinary(t *testing.T) {
+	schema := []Type{
+		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"payload"}},
+		{Kind: TypeKindBinary},
+	}
+	var output bytes.Buffer
+	writer, err := NewWriter(&output, schema, WriterOptions{UseDictionary: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteRow(Row{"payload": []byte("data")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	_, stripeFooter, err := reader.readStripeStreams(reader.footer.stripes[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stripeFooter.encodings[1].kind; got != columnEncodingDirect {
+		t.Fatalf("BINARY encoding = %d, want DIRECT", got)
 	}
 }
 
