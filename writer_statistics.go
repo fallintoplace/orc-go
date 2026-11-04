@@ -203,6 +203,43 @@ func buildWriterColumnStatistics(column writerColumn, values []any, rows uint64)
 	return stats, nil
 }
 
+func (w *Writer) buildEncryptionStatistics(rows uint64) ([][]ColumnStatistics, [][]ColumnStatistics, error) {
+	if len(w.encryption) == 0 {
+		return nil, nil, nil
+	}
+	stripeStatistics := make([][]ColumnStatistics, len(w.encryption))
+	fileStatistics := make([][]ColumnStatistics, len(w.encryption))
+	for variantIndex, variant := range w.encryption {
+		columnCount := int(variant.last-variant.root) + 1
+		if len(variant.fileStatistics) != columnCount || len(variant.stripeStatistics) != columnCount {
+			return nil, nil, fmt.Errorf("ORC encryption variant for column %q has invalid statistics storage", variant.rule.Column)
+		}
+		stripeStatistics[variantIndex] = make([]ColumnStatistics, columnCount)
+		fileStatistics[variantIndex] = cloneColumnStatistics(variant.fileStatistics)
+	}
+
+	for columnID := 1; columnID < len(w.columns); columnID++ {
+		variantIndex := w.encryptionFor[columnID]
+		if variantIndex < 0 {
+			continue
+		}
+		column := w.columns[columnID]
+		statistics, err := buildWriterColumnStatistics(column, column.values, rows)
+		if err != nil {
+			return nil, nil, fmt.Errorf("build encrypted statistics for column %q: %w", column.name, err)
+		}
+		variant := w.encryption[variantIndex]
+		columnIndex := int(column.id - variant.root)
+		stripeStatistics[variantIndex][columnIndex] = statistics
+		merged, err := mergeWriterColumnStatistics(column.kind, fileStatistics[variantIndex][columnIndex], statistics)
+		if err != nil {
+			return nil, nil, fmt.Errorf("merge encrypted statistics for column %q: %w", column.name, err)
+		}
+		fileStatistics[variantIndex][columnIndex] = merged
+	}
+	return stripeStatistics, fileStatistics, nil
+}
+
 func writerIntegerValue(kind TypeKind, value any) int64 {
 	switch kind {
 	case TypeKindByte:
@@ -624,6 +661,22 @@ func encodeColumnStatistics(statistics ColumnStatistics) []byte {
 			value = 1
 		}
 		result = appendProtoVarintField(result, 10, value)
+	}
+	return result
+}
+
+func encodeFileStatistics(statistics []ColumnStatistics) []byte {
+	return encodeColumnStatisticsList(statistics)
+}
+
+func encodeColumnarStripeStatistics(statistics []ColumnStatistics) []byte {
+	return encodeColumnStatisticsList(statistics)
+}
+
+func encodeColumnStatisticsList(statistics []ColumnStatistics) []byte {
+	var result []byte
+	for _, column := range statistics {
+		result = appendProtoBytesField(result, 1, encodeColumnStatistics(column))
 	}
 	return result
 }

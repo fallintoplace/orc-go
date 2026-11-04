@@ -182,7 +182,7 @@ if err != nil {
 defer reader.Close()
 ```
 
-Without a key, the reader returns the unencrypted fallback values stored in the file. Files written by this package use nulls as the fallback. `FileStatistics` and `StripeStatistics` also return statistics for the fallback values. With a key, the reader decodes encrypted row indexes and bloom filters; without one, it uses their fallback values. User metadata is not encrypted. AES-CTR does not detect tampering, so verify file integrity separately if needed.
+Without a key, the reader returns the unencrypted fallback values stored in the file. Files written by this package use nulls as the fallback. `FileStatistics` and `StripeStatistics` report those fallback values. With a key, call `EncryptionStatistics("email")` to get file and per-stripe statistics for an encrypted field and its nested fields. The reader also uses encrypted row indexes and bloom filters when a key is available. User metadata is not encrypted. AES-CTR does not detect tampering, so verify file integrity separately if needed.
 
 ## License
 

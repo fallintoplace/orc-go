@@ -39,6 +39,7 @@ type Reader struct {
 	footer           fileFooter
 	stripeStatistics []stripeStatistics
 	metadataAt       int64
+	stripeStatsAt    int64
 	footerAt         int64
 }
 
@@ -118,6 +119,10 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 		return nil, fmt.Errorf("%w: metadata exceeds available file bytes", ErrInvalidFile)
 	}
 	metadataAt := footerAt - int64(postScript.metadataLength)
+	if postScript.stripeStatisticsLength > uint64(metadataAt) {
+		return nil, fmt.Errorf("%w: encrypted stripe statistics exceed available file bytes", ErrInvalidFile)
+	}
+	stripeStatsAt := metadataAt - int64(postScript.stripeStatisticsLength)
 
 	footerBytes, err := readSection(source, footerAt, postScript.footerLength)
 	if err != nil {
@@ -147,10 +152,13 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 		}
 		stripeStatistics = metadata.stripes
 	}
-	if err := validateFooter(footer, metadataAt); err != nil {
+	if err := validateFooter(footer, stripeStatsAt); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidFile, err)
 	}
 	if err := validateFileEncryption(footer.encryption, footer.types, footer.stripes, footer.stripeEncryption); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidFile, err)
+	}
+	if err := validateEncryptionStatistics(footer.encryption, footer.types, len(footer.stripes), postScript.stripeStatisticsLength); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidFile, err)
 	}
 
@@ -162,6 +170,7 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 		footer:           footer,
 		stripeStatistics: stripeStatistics,
 		metadataAt:       metadataAt,
+		stripeStatsAt:    stripeStatsAt,
 		footerAt:         footerAt,
 	}, nil
 }

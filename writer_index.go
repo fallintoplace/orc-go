@@ -289,8 +289,10 @@ func (w *Writer) buildRowIndexStream(column writerColumn, ranges []writerValueRa
 
 func (w *Writer) encodeStripeWithIndexes(offset, rows uint64) ([]byte, []byte, []ColumnStatistics, error) {
 	stripeID := uint64(len(w.stripeInfos) + 1)
-	if len(w.encryption) > 0 && stripeID > 0xffffff {
-		return nil, nil, nil, fmt.Errorf("ORC encryption supports at most 0xffffff stripes")
+	if len(w.encryption) > 0 {
+		if err := validateEncryptedDataStripeID(stripeID); err != nil {
+			return nil, nil, nil, err
+		}
 	}
 	if len(w.rowGroupRows) == 0 {
 		return nil, nil, nil, fmt.Errorf("ORC stripe has rows but no row-index groups")

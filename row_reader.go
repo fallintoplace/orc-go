@@ -33,6 +33,8 @@ const (
 	streamKindBloomFilterUTF8 uint32 = 8
 	streamKindEncryptedIndex  uint32 = 9
 	streamKindEncryptedData   uint32 = 10
+	streamKindStripeStatistics uint32 = 100
+	streamKindFileStatistics  uint32 = 101
 )
 
 const (
@@ -67,9 +69,10 @@ type streamKey struct {
 }
 
 type stripeStream struct {
-	kind   uint32
-	column uint32
-	length uint64
+	kind      uint32
+	column    uint32
+	hasColumn bool
+	length    uint64
 }
 
 type columnEncoding struct {
@@ -709,6 +712,7 @@ func parseStripeStream(data []byte) (stripeStream, error) {
 				return stripeStream{}, err
 			}
 			result.column = value
+			result.hasColumn = true
 		case 3:
 			result.length, err = fieldVarint(field)
 			if err != nil {

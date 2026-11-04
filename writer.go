@@ -482,6 +482,10 @@ func (w *Writer) Close() error {
 }
 
 func (w *Writer) encodeFileTail() ([]byte, error) {
+	encryptedStripeStatistics, err := w.encodeEncryptedStatistics()
+	if err != nil {
+		return nil, err
+	}
 	metadata := encodeFileMetadata(w.stripeStats)
 	encodedMetadata, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, metadata)
 	if err != nil {
@@ -520,15 +524,68 @@ func (w *Writer) encodeFileTail() ([]byte, error) {
 	if len(encodedMetadata) > 0 {
 		postScript = appendProtoVarintField(postScript, 5, uint64(len(encodedMetadata)))
 	}
+	if len(w.encryption) > 0 {
+		postScript = appendProtoVarintField(postScript, 7, uint64(len(encryptedStripeStatistics)))
+	}
 	postScript = appendProtoBytesField(postScript, 4, []byte{0, 12})
 	if len(postScript) > 255 {
 		return nil, fmt.Errorf("ORC postscript is too long: %d bytes", len(postScript))
 	}
 
-	tail := append(encodedMetadata, encodedFooter...)
+	tail := append(encryptedStripeStatistics, encodedMetadata...)
+	tail = append(tail, encodedFooter...)
 	tail = append(tail, postScript...)
 	tail = append(tail, byte(len(postScript)))
 	return tail, nil
+}
+
+func (w *Writer) encodeEncryptedStatistics() ([]byte, error) {
+	if len(w.encryption) == 0 {
+		return nil, nil
+	}
+	if len(w.fileEncryption.variants) != len(w.encryption) {
+		return nil, fmt.Errorf("ORC encryption metadata has %d variants, writer has %d", len(w.fileEncryption.variants), len(w.encryption))
+	}
+	stripeID := uint64(len(w.stripeInfos) + 1)
+	var stripeData []byte
+	for variantIndex, variant := range w.encryption {
+		columnCount := int(variant.last-variant.root) + 1
+		if len(variant.fileStatistics) != columnCount || len(variant.stripeStatistics) != columnCount {
+			return nil, fmt.Errorf("ORC encryption variant for column %q has invalid statistics storage", variant.rule.Column)
+		}
+
+		fileData, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, encodeFileStatistics(variant.fileStatistics))
+		if err != nil {
+			return nil, fmt.Errorf("compress encrypted file statistics for column %q: %w", variant.rule.Column, err)
+		}
+		fileData, err = cryptORCStream(variant.localKey, variant.rule.Algorithm, variant.root, streamKindFileStatistics, stripeID, fileData)
+		if err != nil {
+			return nil, fmt.Errorf("encrypt file statistics for column %q: %w", variant.rule.Column, err)
+		}
+		w.fileEncryption.variants[variantIndex].fileStatistics = fileData
+
+		descriptors := make([]stripeStream, 0, columnCount)
+		for columnIndex, statistics := range variant.stripeStatistics {
+			if len(statistics) != len(w.stripeInfos) {
+				return nil, fmt.Errorf("ORC encrypted statistics for column %q contain %d stripes, want %d", variant.rule.Column, len(statistics), len(w.stripeInfos))
+			}
+			columnID := variant.root + uint32(columnIndex)
+			data, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, encodeColumnarStripeStatistics(statistics))
+			if err != nil {
+				return nil, fmt.Errorf("compress encrypted stripe statistics for column %d: %w", columnID, err)
+			}
+			data, err = cryptORCStream(variant.localKey, variant.rule.Algorithm, columnID, streamKindStripeStatistics, stripeID, data)
+			if err != nil {
+				return nil, fmt.Errorf("encrypt stripe statistics for column %d: %w", columnID, err)
+			}
+			stripeData = append(stripeData, data...)
+			descriptors = append(descriptors, stripeStream{
+				kind: streamKindStripeStatistics, column: columnID, hasColumn: true, length: uint64(len(data)),
+			})
+		}
+		w.fileEncryption.variants[variantIndex].stripeStatistics = descriptors
+	}
+	return stripeData, nil
 }
 
 func (w *Writer) flushStripe() error {
@@ -537,6 +594,10 @@ func (w *Writer) flushStripe() error {
 	}
 	if w.rowIndexStride > 0 && w.rowsInRowGroup > 0 {
 		w.recordRowGroupEnd()
+	}
+	encryptedStripeStatistics, encryptedFileStatistics, err := w.buildEncryptionStatistics(w.stripeRows)
+	if err != nil {
+		return err
 	}
 	stripeData, stripeInfo, stripeStats, err := w.encodeStripe(w.bodyOffset, w.stripeRows)
 	if err != nil {
@@ -562,6 +623,13 @@ func (w *Writer) flushStripe() error {
 	w.stripeInfos = append(w.stripeInfos, stripeInfo)
 	w.fileStatistics = fileStatistics
 	w.stripeStats = append(w.stripeStats, stripeStatistics{columns: cloneColumnStatistics(stripeStats)})
+	for variantIndex := range w.encryption {
+		w.encryption[variantIndex].fileStatistics = encryptedFileStatistics[variantIndex]
+		for columnIndex, statistics := range encryptedStripeStatistics[variantIndex] {
+			cloned := cloneColumnStatistics([]ColumnStatistics{statistics})[0]
+			w.encryption[variantIndex].stripeStatistics[columnIndex] = append(w.encryption[variantIndex].stripeStatistics[columnIndex], cloned)
+		}
+	}
 	w.bodyOffset += uint64(len(stripeData))
 	w.stripeRows = 0
 	w.rowsInRowGroup = 0
@@ -590,8 +658,10 @@ func (w *Writer) encodeStripe(offset, rows uint64) ([]byte, []byte, []ColumnStat
 
 func (w *Writer) encodeStripeWithoutIndexes(offset, rows uint64) ([]byte, []byte, []ColumnStatistics, error) {
 	stripeID := uint64(len(w.stripeInfos) + 1)
-	if len(w.encryption) > 0 && stripeID > 0xffffff {
-		return nil, nil, nil, fmt.Errorf("ORC encryption supports at most 0xffffff stripes")
+	if len(w.encryption) > 0 {
+		if err := validateEncryptedDataStripeID(stripeID); err != nil {
+			return nil, nil, nil, err
+		}
 	}
 	var streamBytes []byte
 	var streamFooter []byte
@@ -735,11 +805,14 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, columnEncodi
 	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindDate || column.kind == TypeKindTimestamp || column.kind == TypeKindTimestampInstant || column.kind == TypeKindDecimal || column.kind == TypeKindString || column.kind == TypeKindBinary || column.kind == TypeKindChar || column.kind == TypeKindVarchar || column.kind == TypeKindList || column.kind == TypeKindMap) {
 		encoding.kind = columnEncodingDirectV2
 	}
-	if len(values) == 0 {
-		return streams, encoding, nil
-	}
 	if w.options.UseDictionary && (column.kind == TypeKindString || column.kind == TypeKindChar || column.kind == TypeKindVarchar) {
 		return encodeStringDictionary(column, values, streams, w.options.UseRLEv2)
+	}
+	if len(values) == 0 {
+		for _, kind := range emptyColumnStreamKinds(column.kind) {
+			streams = append(streams, writerStream{kind: kind, column: column.id})
+		}
+		return streams, encoding, nil
 	}
 
 	var data []byte
@@ -858,6 +931,23 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, columnEncodi
 		streams = append(streams, writerStream{kind: streamKindLength, column: column.id, data: data})
 	}
 	return streams, encoding, nil
+}
+
+func emptyColumnStreamKinds(kind TypeKind) []uint32 {
+	switch kind {
+	case TypeKindStruct:
+		return nil
+	case TypeKindList, TypeKindMap:
+		return []uint32{streamKindLength}
+	case TypeKindUnion, TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindDate, TypeKindFloat, TypeKindDouble:
+		return []uint32{streamKindData}
+	case TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal:
+		return []uint32{streamKindData, streamKindSecondary}
+	case TypeKindString, TypeKindChar, TypeKindVarchar, TypeKindBinary:
+		return []uint32{streamKindData, streamKindLength}
+	default:
+		return nil
+	}
 }
 
 func encodeStringDictionary(column writerColumn, values []any, streams []writerStream, useRLEv2 bool) ([]writerStream, columnEncoding, error) {

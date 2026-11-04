@@ -28,11 +28,12 @@ func (kind CompressionKind) String() string {
 }
 
 type postScript struct {
-	footerLength         uint64
-	metadataLength       uint64
-	compression          CompressionKind
-	compressionBlockSize uint64
-	version              []uint32
+	footerLength           uint64
+	metadataLength         uint64
+	stripeStatisticsLength uint64
+	compression            CompressionKind
+	compressionBlockSize   uint64
+	version                []uint32
 }
 
 func parsePostScript(data []byte) (postScript, error) {
@@ -60,6 +61,8 @@ func parsePostScript(data []byte) (postScript, error) {
 			result.version, err = appendUint32Values(result.version, field)
 		case 5:
 			result.metadataLength, err = fieldVarint(field)
+		case 7:
+			result.stripeStatisticsLength, err = fieldVarint(field)
 		case 8000:
 			var value string
 			value, err = fieldString(field)
