@@ -23,6 +23,7 @@ type integerTestStripe struct {
 	streams        []integerTestStream
 	encoding       []uint32
 	dictionarySize []uint32
+	writerTimezone string
 }
 
 func TestReadAllReadsIntegerRowsAcrossStripesAndCodecs(t *testing.T) {
@@ -397,7 +398,7 @@ func TestReadRowsRejectsUnsupportedTypesAndEncodings(t *testing.T) {
 		encoding uint32
 		wantErr  error
 	}{
-		{name: "unsupported type", kind: TypeKindTimestamp, encoding: columnEncodingDirect, wantErr: ErrUnsupportedType},
+		{name: "unsupported type", kind: TypeKindDecimal, encoding: columnEncodingDirect, wantErr: ErrUnsupportedType},
 		{name: "dictionary", kind: TypeKindLong, encoding: columnEncodingDictionary, wantErr: ErrUnsupportedEncoding},
 		{name: "BYTE with RLEv2", kind: TypeKindByte, encoding: columnEncodingDirectV2, wantErr: ErrUnsupportedEncoding},
 		{name: "BOOLEAN with RLEv2", kind: TypeKindBoolean, encoding: columnEncodingDirectV2, wantErr: ErrUnsupportedEncoding},
@@ -717,6 +718,9 @@ func makeIntegerORCFile(t *testing.T, compression CompressionKind, names []strin
 				encoding = appendVarintField(encoding, 2, uint64(stripe.dictionarySize[column]))
 			}
 			stripeFooter = appendBytesField(stripeFooter, 2, encoding)
+		}
+		if stripe.writerTimezone != "" {
+			stripeFooter = appendBytesField(stripeFooter, 3, []byte(stripe.writerTimezone))
 		}
 		encodedStripeFooter := encodeTestSection(t, compression, stripeFooter)
 		body = append(body, encodedStripeFooter...)

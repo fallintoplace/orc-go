@@ -176,18 +176,22 @@ func (r *Reader) Close() error {
 
 func validateFooter(footer fileFooter, metadataAt int64) error {
 	contentEnd := uint64(metadataAt)
-	if footer.contentLength != 0 {
-		if footer.contentLength > contentEnd {
-			return fmt.Errorf("content length %d exceeds file body end %d", footer.contentLength, contentEnd)
-		}
-		contentEnd = footer.contentLength
-	}
 	headerLength := footer.headerLength
 	if headerLength == 0 {
 		headerLength = uint64(len(fileMagic))
 	}
 	if headerLength > contentEnd {
 		return fmt.Errorf("header length %d exceeds content length %d", headerLength, contentEnd)
+	}
+	fileBodyEnd := contentEnd
+	if footer.contentLength != 0 {
+		if footer.contentLength > contentEnd {
+			return fmt.Errorf("content length %d exceeds file body end %d", footer.contentLength, contentEnd)
+		}
+		// Some writers store the body length without the ORC header bytes.
+		if headerLength != fileBodyEnd-footer.contentLength {
+			contentEnd = footer.contentLength
+		}
 	}
 
 	previousEnd := headerLength

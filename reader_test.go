@@ -119,6 +119,28 @@ func TestNewReaderReadsStripeDirectory(t *testing.T) {
 	}
 }
 
+func TestValidateFooterAcceptsContentLengthWithoutHeader(t *testing.T) {
+	footer := fileFooter{
+		headerLength:  3,
+		contentLength: 4,
+		stripes:       []StripeInfo{{Offset: 3, DataLength: 4}},
+	}
+	if err := validateFooter(footer, 7); err != nil {
+		t.Fatalf("validateFooter() rejected a body length that excludes the header: %v", err)
+	}
+}
+
+func TestValidateFooterRejectsTruncatedContentLength(t *testing.T) {
+	footer := fileFooter{
+		headerLength:  3,
+		contentLength: 3,
+		stripes:       []StripeInfo{{Offset: 3, DataLength: 4}},
+	}
+	if err := validateFooter(footer, 7); err == nil {
+		t.Fatal("validateFooter() accepted a content length shorter than the stripe")
+	}
+}
+
 func TestNewReaderRejectsUnsupportedCompression(t *testing.T) {
 	data := makeORCFileWithPostScript(t, 4, uint64(len(simpleFooter())), 0, simpleFooter())
 	if _, err := NewReader(byteReaderAt(data), int64(len(data))); !errors.Is(err, ErrUnsupportedCompression) {

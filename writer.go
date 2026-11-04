@@ -22,14 +22,14 @@ const maxEncodedChunkLength = (1 << 23) - 1
 var ErrWriterClosed = errors.New("ORC writer is closed")
 
 // WriterOptions controls file compression and integer encoding. UseRLEv2
-// selects DIRECT_V2 for integer and variable-length columns.
+// selects DIRECT_V2 for integer, timestamp, and variable-length columns.
 type WriterOptions struct {
 	// Compression selects NONE, ZLIB, or SNAPPY.
 	Compression CompressionKind
 	// CompressionBlockSize sets the maximum uncompressed chunk size. Zero uses
 	// the ORC default.
 	CompressionBlockSize uint64
-	// UseRLEv2 selects DIRECT_V2 for integer and variable-length columns.
+	// UseRLEv2 selects DIRECT_V2 for integer, timestamp, and variable-length columns.
 	UseRLEv2 bool
 }
 
@@ -61,7 +61,8 @@ type writerStream struct {
 }
 
 // NewWriter creates a writer for a flat root STRUCT whose fields are
-// BOOLEAN, BYTE, SHORT, INT, LONG, FLOAT, DOUBLE, STRING, or BINARY.
+// BOOLEAN, BYTE, SHORT, INT, LONG, DATE, TIMESTAMP, TIMESTAMP_INSTANT, FLOAT,
+// DOUBLE, STRING, or BINARY.
 func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Writer, error) {
 	if destination == nil {
 		return nil, errors.New("ORC writer destination is nil")
@@ -106,7 +107,7 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 		}
 		kind := types[subtype].Kind
 		switch kind {
-		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate:
+		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant:
 		default:
 			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, kind)
 		}
@@ -156,6 +157,13 @@ func (w *Writer) WriteRow(row Row) error {
 				return fmt.Errorf("ORC field %q: %w", column.name, err)
 			}
 			value = days
+		}
+		if column.kind == TypeKindTimestamp || column.kind == TypeKindTimestampInstant {
+			timestamp, err := timestampForWriter(value.(time.Time), column.kind)
+			if err != nil {
+				return fmt.Errorf("ORC field %q: %w", column.name, err)
+			}
+			value = timestamp
 		}
 		if column.kind == TypeKindBinary {
 			data := value.([]byte)
@@ -256,6 +264,12 @@ func (w *Writer) encodeStripe(offset uint64) ([]byte, []byte, error) {
 		message := appendProtoVarintField(nil, 1, uint64(encoding))
 		streamFooter = appendProtoBytesField(streamFooter, 2, message)
 	}
+	for _, column := range w.columns {
+		if column.kind == TypeKindTimestamp {
+			streamFooter = appendProtoBytesField(streamFooter, 3, []byte("UTC"))
+			break
+		}
+	}
 	stripeFooter, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, streamFooter)
 	if err != nil {
 		return nil, nil, fmt.Errorf("compress stripe footer: %w", err)
@@ -288,7 +302,7 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 	}
 
 	encoding := columnEncodingDirect
-	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindDate || column.kind == TypeKindString || column.kind == TypeKindBinary) {
+	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindDate || column.kind == TypeKindTimestamp || column.kind == TypeKindTimestampInstant || column.kind == TypeKindString || column.kind == TypeKindBinary) {
 		encoding = columnEncodingDirectV2
 	}
 	if len(values) == 0 {
@@ -327,6 +341,27 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 		} else {
 			data = rlev1.EncodeSigned(integerValues)
 		}
+	case TypeKindTimestamp, TypeKindTimestampInstant:
+		seconds := make([]int64, len(values))
+		nanos := make([]uint64, len(values))
+		for i, value := range values {
+			timestamp := value.(encodedTimestamp)
+			seconds[i] = timestamp.seconds
+			nanos[i] = timestamp.nanos
+		}
+		var secondary []byte
+		if encoding == columnEncodingDirectV2 {
+			data = rlev2.EncodeSigned(seconds)
+			secondary = rlev2.EncodeUnsigned(nanos)
+		} else {
+			data = rlev1.EncodeSigned(seconds)
+			secondary = rlev1.EncodeUnsigned(nanos)
+		}
+		streams = append(streams, []writerStream{
+			{kind: streamKindData, column: column.id, data: data},
+			{kind: streamKindSecondary, column: column.id, data: secondary},
+		}...)
+		return streams, encoding, nil
 	case TypeKindFloat:
 		data = make([]byte, 4*len(values))
 		for i, value := range values {
@@ -376,6 +411,9 @@ func matchesType(kind TypeKind, value any) bool {
 		_, ok := value.(int64)
 		return ok
 	case TypeKindDate:
+		_, ok := value.(time.Time)
+		return ok
+	case TypeKindTimestamp, TypeKindTimestampInstant:
 		_, ok := value.(time.Time)
 		return ok
 	case TypeKindFloat:
