@@ -22,8 +22,10 @@ var (
 )
 
 const (
-	streamKindPresent uint32 = 0
-	streamKindData    uint32 = 1
+	streamKindPresent        uint32 = 0
+	streamKindData           uint32 = 1
+	streamKindLength         uint32 = 2
+	streamKindDictionaryData uint32 = 3
 )
 
 const (
@@ -34,8 +36,9 @@ const (
 )
 
 // Row contains one ORC root-struct row. Values use bool for BOOLEAN, the
-// matching integer width for integer columns, and float32 or float64 for FLOAT
-// or DOUBLE. A nil value represents an ORC null.
+// matching integer width for integer columns, float32 or float64 for FLOAT or
+// DOUBLE, string for STRING, and []byte for BINARY. A nil value represents an
+// ORC null.
 type Row map[string]any
 
 type rowColumn struct {
@@ -56,7 +59,8 @@ type stripeStream struct {
 }
 
 type columnEncoding struct {
-	kind uint32
+	kind           uint32
+	dictionarySize uint32
 }
 
 type stripeFooter struct {
@@ -75,10 +79,11 @@ func (r *Reader) ReadRows(yield func(Row) error) error {
 	if err != nil {
 		return err
 	}
-	wanted := make(map[streamKey]bool, len(columns)*2)
+	wanted := make(map[streamKey]bool, len(columns)*4)
 	for _, column := range columns {
-		wanted[streamKey{kind: streamKindPresent, column: column.id}] = true
-		wanted[streamKey{kind: streamKindData, column: column.id}] = true
+		for _, kind := range []uint32{streamKindPresent, streamKindData, streamKindLength, streamKindDictionaryData} {
+			wanted[streamKey{kind: kind, column: column.id}] = true
+		}
 	}
 
 	for stripeIndex, stripe := range r.footer.stripes {
@@ -96,9 +101,9 @@ func (r *Reader) ReadRows(yield func(Row) error) error {
 			if uint64(column.id) >= uint64(len(footer.encodings)) {
 				return fmt.Errorf("stripe %d column %q (id %d): missing column encoding", stripeIndex, column.name, column.id)
 			}
-			encoding := footer.encodings[column.id].kind
-			if !supportsRowEncoding(column.kind, encoding) {
-				return fmt.Errorf("stripe %d column %q (id %d): %w: kind %d", stripeIndex, column.name, column.id, ErrUnsupportedEncoding, encoding)
+			encoding := footer.encodings[column.id]
+			if !supportsRowEncoding(column.kind, encoding.kind) {
+				return fmt.Errorf("stripe %d column %q (id %d): %w: kind %d", stripeIndex, column.name, column.id, ErrUnsupportedEncoding, encoding.kind)
 			}
 			values[i], err = decodeColumn(stripe.NumberOfRows, column, streams, encoding)
 			if err != nil {
@@ -144,7 +149,7 @@ func (r *Reader) rowColumns() ([]rowColumn, error) {
 		seenNames[name] = struct{}{}
 		typ := r.footer.types[subtype]
 		switch typ.Kind {
-		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble:
+		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary:
 		default:
 			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, typ.Kind)
 		}
@@ -156,6 +161,10 @@ func (r *Reader) rowColumns() ([]rowColumn, error) {
 func supportsRowEncoding(kind TypeKind, encoding uint32) bool {
 	switch kind {
 	case TypeKindShort, TypeKindInt, TypeKindLong:
+		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
+	case TypeKindString:
+		return encoding == columnEncodingDirect || encoding == columnEncodingDictionary || encoding == columnEncodingDirectV2 || encoding == columnEncodingDictionaryV2
+	case TypeKindBinary:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
 	case TypeKindBoolean, TypeKindByte, TypeKindFloat, TypeKindDouble:
 		return encoding == columnEncodingDirect
@@ -295,18 +304,27 @@ func parseColumnEncoding(data []byte) (columnEncoding, error) {
 	var result columnEncoding
 	var hasKind bool
 	for _, field := range fields {
-		if field.Number != 1 {
-			continue
+		switch field.Number {
+		case 1:
+			value, err := fieldVarint(field)
+			if err != nil {
+				return columnEncoding{}, err
+			}
+			if value > math.MaxUint32 {
+				return columnEncoding{}, fmt.Errorf("column encoding kind %d overflows uint32", value)
+			}
+			result.kind = uint32(value)
+			hasKind = true
+		case 2:
+			value, err := fieldVarint(field)
+			if err != nil {
+				return columnEncoding{}, err
+			}
+			if value > math.MaxUint32 {
+				return columnEncoding{}, fmt.Errorf("dictionary size %d overflows uint32", value)
+			}
+			result.dictionarySize = uint32(value)
 		}
-		value, err := fieldVarint(field)
-		if err != nil {
-			return columnEncoding{}, err
-		}
-		if value > math.MaxUint32 {
-			return columnEncoding{}, fmt.Errorf("column encoding kind %d overflows uint32", value)
-		}
-		result.kind = uint32(value)
-		hasKind = true
 	}
 	if !hasKind {
 		return columnEncoding{}, fmt.Errorf("column encoding has no kind")
@@ -314,7 +332,7 @@ func parseColumnEncoding(data []byte) (columnEncoding, error) {
 	return result, nil
 }
 
-func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byte, encoding uint32) ([]any, error) {
+func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byte, encoding columnEncoding) ([]any, error) {
 	rows, err := checkedSliceLength(rowCount)
 	if err != nil {
 		return nil, err
@@ -339,10 +357,7 @@ func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byt
 			valueCount++
 		}
 	}
-	dataStream, hasData := streams[streamKey{kind: streamKindData, column: column.id}]
-	if !hasData && valueCount != 0 {
-		return nil, fmt.Errorf("missing DATA stream for %d values", valueCount)
-	}
+	dataStream := streams[streamKey{kind: streamKindData, column: column.id}]
 
 	values := make([]any, rows)
 	switch column.kind {
@@ -392,6 +407,8 @@ func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byt
 			valueIndex++
 		}
 		return values, nil
+	case TypeKindString, TypeKindBinary:
+		return decodeVariableLengthColumn(present, valueCount, column, streams, dataStream, encoding)
 	case TypeKindByte:
 		encodedValues, err := decodeByteRLE(dataStream, valueCount)
 		if err != nil {
@@ -412,7 +429,7 @@ func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byt
 	}
 
 	var encodedValues []int64
-	if encoding == columnEncodingDirectV2 {
+	if encoding.kind == columnEncodingDirectV2 {
 		encodedValues, err = rlev2.DecodeSigned(dataStream, valueCount)
 	} else {
 		encodedValues, err = rlev1.DecodeSigned(dataStream, valueCount)
@@ -445,6 +462,102 @@ func checkRawDataLength(data []byte, valueCount, width int) error {
 		return fmt.Errorf("raw DATA stream has %d bytes, want %d", len(data), want)
 	}
 	return nil
+}
+
+func decodeVariableLengthColumn(present []bool, valueCount int, column rowColumn, streams map[streamKey][]byte, data []byte, encoding columnEncoding) ([]any, error) {
+	lengthData, hasLengths := streams[streamKey{kind: streamKindLength, column: column.id}]
+	version2 := encoding.kind == columnEncodingDirectV2 || encoding.kind == columnEncodingDictionaryV2
+	if encoding.kind == columnEncodingDictionary || encoding.kind == columnEncodingDictionaryV2 {
+		dictionaryLength, err := checkedSliceLength(uint64(encoding.dictionarySize))
+		if err != nil {
+			return nil, fmt.Errorf("dictionary size: %w", err)
+		}
+		if dictionaryLength > 0 && !hasLengths {
+			return nil, fmt.Errorf("missing LENGTH stream for %d dictionary values", dictionaryLength)
+		}
+		dictionarySizes, err := decodeUnsignedIntegerStream(lengthData, dictionaryLength, version2)
+		if err != nil {
+			return nil, fmt.Errorf("decode dictionary LENGTH stream: %w", err)
+		}
+		dictionaryData := streams[streamKey{kind: streamKindDictionaryData, column: column.id}]
+		dictionary, err := splitVariableData(dictionaryData, dictionarySizes)
+		if err != nil {
+			return nil, fmt.Errorf("decode DICTIONARY_DATA stream: %w", err)
+		}
+		indices, err := decodeUnsignedIntegerStream(data, valueCount, version2)
+		if err != nil {
+			return nil, fmt.Errorf("decode dictionary DATA stream: %w", err)
+		}
+		values := make([]any, len(present))
+		valueIndex := 0
+		for rowIndex, isPresent := range present {
+			if !isPresent {
+				continue
+			}
+			index := indices[valueIndex]
+			if index >= uint64(len(dictionary)) {
+				return nil, fmt.Errorf("dictionary index %d exceeds dictionary size %d", index, len(dictionary))
+			}
+			values[rowIndex] = variableValue(column.kind, dictionary[index])
+			valueIndex++
+		}
+		return values, nil
+	}
+
+	if valueCount > 0 && !hasLengths {
+		return nil, fmt.Errorf("missing LENGTH stream for %d values", valueCount)
+	}
+	lengths, err := decodeUnsignedIntegerStream(lengthData, valueCount, version2)
+	if err != nil {
+		return nil, fmt.Errorf("decode LENGTH stream: %w", err)
+	}
+	valuesData, err := splitVariableData(data, lengths)
+	if err != nil {
+		return nil, fmt.Errorf("decode DATA stream: %w", err)
+	}
+	values := make([]any, len(present))
+	valueIndex := 0
+	for rowIndex, isPresent := range present {
+		if !isPresent {
+			continue
+		}
+		values[rowIndex] = variableValue(column.kind, valuesData[valueIndex])
+		valueIndex++
+	}
+	return values, nil
+}
+
+func decodeUnsignedIntegerStream(data []byte, expected int, version2 bool) ([]uint64, error) {
+	if version2 {
+		return rlev2.DecodeUnsigned(data, expected)
+	}
+	return rlev1.DecodeUnsigned(data, expected)
+}
+
+func splitVariableData(data []byte, lengths []uint64) ([][]byte, error) {
+	values := make([][]byte, len(lengths))
+	offset := 0
+	for i, length := range lengths {
+		if length > uint64(len(data)-offset) {
+			return nil, fmt.Errorf("value %d length %d exceeds remaining DATA bytes %d", i, length, len(data)-offset)
+		}
+		end := offset + int(length)
+		values[i] = data[offset:end]
+		offset = end
+	}
+	if offset != len(data) {
+		return nil, fmt.Errorf("DATA stream has %d unreferenced bytes", len(data)-offset)
+	}
+	return values, nil
+}
+
+func variableValue(kind TypeKind, data []byte) any {
+	if kind == TypeKindBinary {
+		value := make([]byte, len(data))
+		copy(value, data)
+		return value
+	}
+	return string(data)
 }
 
 func decodePresent(data []byte, rowCount int) ([]bool, error) {
