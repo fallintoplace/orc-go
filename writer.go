@@ -22,14 +22,14 @@ const maxEncodedChunkLength = (1 << 23) - 1
 var ErrWriterClosed = errors.New("ORC writer is closed")
 
 // WriterOptions controls file compression and integer encoding. UseRLEv2
-// selects DIRECT_V2 for integer, timestamp, and variable-length columns.
+// selects DIRECT_V2 for integer, timestamp, decimal, and variable-length columns.
 type WriterOptions struct {
 	// Compression selects NONE, ZLIB, or SNAPPY.
 	Compression CompressionKind
 	// CompressionBlockSize sets the maximum uncompressed chunk size. Zero uses
 	// the ORC default.
 	CompressionBlockSize uint64
-	// UseRLEv2 selects DIRECT_V2 for integer, timestamp, and variable-length columns.
+	// UseRLEv2 selects DIRECT_V2 for integer, timestamp, decimal, and variable-length columns.
 	UseRLEv2 bool
 }
 
@@ -48,10 +48,12 @@ type Writer struct {
 }
 
 type writerColumn struct {
-	id     uint32
-	name   string
-	kind   TypeKind
-	values []any
+	id        uint32
+	name      string
+	kind      TypeKind
+	precision uint32
+	scale     uint32
+	values    []any
 }
 
 type writerStream struct {
@@ -61,8 +63,8 @@ type writerStream struct {
 }
 
 // NewWriter creates a writer for a flat root STRUCT whose fields are
-// BOOLEAN, BYTE, SHORT, INT, LONG, DATE, TIMESTAMP, TIMESTAMP_INSTANT, FLOAT,
-// DOUBLE, STRING, or BINARY.
+// BOOLEAN, BYTE, SHORT, INT, LONG, DATE, TIMESTAMP, TIMESTAMP_INSTANT, DECIMAL,
+// FLOAT, DOUBLE, STRING, or BINARY.
 func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Writer, error) {
 	if destination == nil {
 		return nil, errors.New("ORC writer destination is nil")
@@ -105,13 +107,22 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 		if _, exists := columnByName[name]; exists {
 			return nil, fmt.Errorf("%w: duplicate root field name %q", ErrUnsupportedType, name)
 		}
-		kind := types[subtype].Kind
+		typ := types[subtype]
+		kind := typ.Kind
 		switch kind {
-		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant:
+		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal:
 		default:
 			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, kind)
 		}
-		columns[i] = writerColumn{id: subtype, name: name, kind: kind}
+		if kind == TypeKindDecimal {
+			if typ.Precision < 1 || typ.Precision > 38 {
+				return nil, fmt.Errorf("ORC field %q DECIMAL precision must be between 1 and 38, got %d", name, typ.Precision)
+			}
+			if typ.Scale > typ.Precision {
+				return nil, fmt.Errorf("ORC field %q DECIMAL scale %d exceeds precision %d", name, typ.Scale, typ.Precision)
+			}
+		}
+		columns[i] = writerColumn{id: subtype, name: name, kind: kind, precision: typ.Precision, scale: typ.Scale}
 		columnByName[name] = i
 	}
 
@@ -164,6 +175,13 @@ func (w *Writer) WriteRow(row Row) error {
 				return fmt.Errorf("ORC field %q: %w", column.name, err)
 			}
 			value = timestamp
+		}
+		if column.kind == TypeKindDecimal {
+			decimal, err := decimalForType(value.(Decimal), column.precision, column.scale)
+			if err != nil {
+				return fmt.Errorf("ORC field %q: %w", column.name, err)
+			}
+			value = decimal
 		}
 		if column.kind == TypeKindBinary {
 			data := value.([]byte)
@@ -302,7 +320,7 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 	}
 
 	encoding := columnEncodingDirect
-	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindDate || column.kind == TypeKindTimestamp || column.kind == TypeKindTimestampInstant || column.kind == TypeKindString || column.kind == TypeKindBinary) {
+	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindDate || column.kind == TypeKindTimestamp || column.kind == TypeKindTimestampInstant || column.kind == TypeKindDecimal || column.kind == TypeKindString || column.kind == TypeKindBinary) {
 		encoding = columnEncodingDirectV2
 	}
 	if len(values) == 0 {
@@ -356,6 +374,25 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, uint32, erro
 		} else {
 			data = rlev1.EncodeSigned(seconds)
 			secondary = rlev1.EncodeUnsigned(nanos)
+		}
+		streams = append(streams, []writerStream{
+			{kind: streamKindData, column: column.id, data: data},
+			{kind: streamKindSecondary, column: column.id, data: secondary},
+		}...)
+		return streams, encoding, nil
+	case TypeKindDecimal:
+		decimals := make([]encodedDecimal, len(values))
+		scales := make([]int64, len(values))
+		for i, value := range values {
+			decimals[i] = value.(encodedDecimal)
+			scales[i] = decimals[i].scale
+		}
+		data = encodeBigIntegerStream(decimals)
+		var secondary []byte
+		if encoding == columnEncodingDirectV2 {
+			secondary = rlev2.EncodeSigned(scales)
+		} else {
+			secondary = rlev1.EncodeSigned(scales)
 		}
 		streams = append(streams, []writerStream{
 			{kind: streamKindData, column: column.id, data: data},
@@ -427,6 +464,9 @@ func matchesType(kind TypeKind, value any) bool {
 		return ok
 	case TypeKindBinary:
 		_, ok := value.([]byte)
+		return ok
+	case TypeKindDecimal:
+		_, ok := value.(Decimal)
 		return ok
 	default:
 		return false
