@@ -6,9 +6,9 @@ The implementation is being built from the published ORC format specification.
 
 ## Status
 
-Work in progress. The reader supports BOOLEAN, BYTE, SHORT, INT, LONG, DATE, FLOAT, DOUBLE, STRING, and BINARY root fields, including nulls and multiple stripes. DATE values use `time.Time` at UTC midnight. It supports NONE, ZLIB, and SNAPPY compression. It reads integer and DATE DIRECT (RLEv1) and DIRECT_V2 (RLEv2), string direct and dictionary encodings, and binary direct encodings. `ReadRows` buffers one stripe at a time; `ReadAll` collects the whole file in memory.
+Work in progress. The reader supports BOOLEAN, BYTE, SHORT, INT, LONG, DATE, TIMESTAMP, TIMESTAMP_INSTANT, FLOAT, DOUBLE, STRING, and BINARY root fields, including nulls and multiple stripes. DATE and timestamp values use UTC `time.Time`. TIMESTAMP preserves wall-clock fields using the stripe writer timezone; files without that metadata use the process timezone. TIMESTAMP_INSTANT preserves the instant. It supports NONE, ZLIB, and SNAPPY compression. It reads integer, DATE, and timestamp DIRECT (RLEv1) and DIRECT_V2 (RLEv2), string direct and dictionary encodings, and binary direct encodings. `ReadRows` buffers one stripe at a time; `ReadAll` collects the whole file in memory.
 
-The writer supports flat schemas with those primitive types. DATE values use `time.Time`; the calendar date is taken from the value's location. It writes one stripe, buffers rows until `Close`, and supports NONE, ZLIB, and SNAPPY compression. `UseRLEv2` selects DIRECT_V2 for integer, DATE, and variable-length columns. Nested types and dictionary writing are not implemented yet, and the API is not stable.
+The writer supports flat schemas with those primitive types. DATE values use `time.Time`; the calendar date is taken from the value's location. TIMESTAMP keeps the value's calendar and clock fields and writes a UTC writer timezone, while TIMESTAMP_INSTANT keeps its instant. It writes one stripe, buffers rows until `Close`, and supports NONE, ZLIB, and SNAPPY compression. `UseRLEv2` selects DIRECT_V2 for integer, DATE, timestamp, and variable-length columns. Nested types and dictionary writing are not implemented yet, and the API is not stable.
 
 ```go
 package main

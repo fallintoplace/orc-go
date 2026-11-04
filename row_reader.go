@@ -27,6 +27,7 @@ const (
 	streamKindData           uint32 = 1
 	streamKindLength         uint32 = 2
 	streamKindDictionaryData uint32 = 3
+	streamKindSecondary      uint32 = 5
 )
 
 const (
@@ -37,9 +38,11 @@ const (
 )
 
 // Row contains one ORC root-struct row. Values use bool for BOOLEAN, the
-// matching integer width for integer columns, time.Time for DATE, float32 or
-// float64 for FLOAT or DOUBLE, string for STRING, and []byte for BINARY. A nil
-// value represents an ORC null.
+// matching integer width for integer columns, time.Time for DATE and
+// timestamps, float32 or float64 for FLOAT or DOUBLE, string for STRING, and
+// []byte for BINARY. Timestamp values use UTC; TIMESTAMP preserves wall-clock
+// fields while TIMESTAMP_INSTANT preserves the instant. A nil value represents
+// an ORC null.
 type Row map[string]any
 
 type rowColumn struct {
@@ -65,8 +68,9 @@ type columnEncoding struct {
 }
 
 type stripeFooter struct {
-	streams   []stripeStream
-	encodings []columnEncoding
+	streams        []stripeStream
+	encodings      []columnEncoding
+	writerTimezone string
 }
 
 // ReadRows calls yield for each row in file order. It keeps decoded column
@@ -82,7 +86,7 @@ func (r *Reader) ReadRows(yield func(Row) error) error {
 	}
 	wanted := make(map[streamKey]bool, len(columns)*4)
 	for _, column := range columns {
-		for _, kind := range []uint32{streamKindPresent, streamKindData, streamKindLength, streamKindDictionaryData} {
+		for _, kind := range []uint32{streamKindPresent, streamKindData, streamKindLength, streamKindDictionaryData, streamKindSecondary} {
 			wanted[streamKey{kind: kind, column: column.id}] = true
 		}
 	}
@@ -106,7 +110,7 @@ func (r *Reader) ReadRows(yield func(Row) error) error {
 			if !supportsRowEncoding(column.kind, encoding.kind) {
 				return fmt.Errorf("stripe %d column %q (id %d): %w: kind %d", stripeIndex, column.name, column.id, ErrUnsupportedEncoding, encoding.kind)
 			}
-			values[i], err = decodeColumn(stripe.NumberOfRows, column, streams, encoding)
+			values[i], err = decodeColumn(stripe.NumberOfRows, column, streams, encoding, footer.writerTimezone)
 			if err != nil {
 				return fmt.Errorf("stripe %d column %q (id %d): %w", stripeIndex, column.name, column.id, err)
 			}
@@ -150,7 +154,7 @@ func (r *Reader) rowColumns() ([]rowColumn, error) {
 		seenNames[name] = struct{}{}
 		typ := r.footer.types[subtype]
 		switch typ.Kind {
-		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate:
+		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant:
 		default:
 			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, typ.Kind)
 		}
@@ -161,7 +165,7 @@ func (r *Reader) rowColumns() ([]rowColumn, error) {
 
 func supportsRowEncoding(kind TypeKind, encoding uint32) bool {
 	switch kind {
-	case TypeKindShort, TypeKindInt, TypeKindLong, TypeKindDate:
+	case TypeKindShort, TypeKindInt, TypeKindLong, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
 	case TypeKindString:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDictionary || encoding == columnEncodingDirectV2 || encoding == columnEncodingDictionaryV2
@@ -254,6 +258,12 @@ func parseStripeFooter(data []byte) (stripeFooter, error) {
 				return stripeFooter{}, err
 			}
 			result.encodings = append(result.encodings, encoding)
+		case 3:
+			value, err := fieldBytes(field)
+			if err != nil {
+				return stripeFooter{}, err
+			}
+			result.writerTimezone = string(value)
 		}
 	}
 	return result, nil
@@ -333,7 +343,7 @@ func parseColumnEncoding(data []byte) (columnEncoding, error) {
 	return result, nil
 }
 
-func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byte, encoding columnEncoding) ([]any, error) {
+func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byte, encoding columnEncoding, writerTimezone string) ([]any, error) {
 	rows, err := checkedSliceLength(rowCount)
 	if err != nil {
 		return nil, err
@@ -410,6 +420,8 @@ func decodeColumn(rowCount uint64, column rowColumn, streams map[streamKey][]byt
 		return values, nil
 	case TypeKindString, TypeKindBinary:
 		return decodeVariableLengthColumn(present, valueCount, column, streams, dataStream, encoding)
+	case TypeKindTimestamp, TypeKindTimestampInstant:
+		return decodeTimestampColumn(present, valueCount, column, streams, encoding, writerTimezone)
 	case TypeKindByte:
 		encodedValues, err := decodeByteRLE(dataStream, valueCount)
 		if err != nil {
