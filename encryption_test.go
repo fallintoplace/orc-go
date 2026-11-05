@@ -602,6 +602,9 @@ func TestEncryptedStatisticsForEmptyFile(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if got, want := reader.EncryptionMasks(), []EncryptionMask{{Name: "nullify", Columns: []uint32{1}}}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("EncryptionMasks() = %+v, want %+v", got, want)
+			}
 			statistics, err := reader.EncryptionStatistics("secret")
 			if err != nil {
 				t.Fatal(err)
