@@ -187,11 +187,14 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 			return nil, fmt.Errorf("%w: column %d has type %s", ErrUnsupportedType, id, typ.Kind)
 		}
 		if typ.Kind == TypeKindDecimal {
-			if typ.Precision < 1 || typ.Precision > 38 {
-				return nil, fmt.Errorf("ORC column %d DECIMAL precision must be between 1 and 38, got %d", id, typ.Precision)
+			if typ.Precision > 38 {
+				return nil, fmt.Errorf("ORC column %d DECIMAL precision must not exceed 38, got %d", id, typ.Precision)
 			}
-			if typ.Scale > typ.Precision {
+			if typ.Precision > 0 && typ.Scale > typ.Precision {
 				return nil, fmt.Errorf("ORC column %d DECIMAL scale %d exceeds precision %d", id, typ.Scale, typ.Precision)
+			}
+			if typ.Precision == 0 && uint64(typ.Scale) > uint64(maxDecimalScaleExpansion) {
+				return nil, fmt.Errorf("ORC column %d DECIMAL scale %d exceeds the writer limit %d", id, typ.Scale, maxDecimalScaleExpansion)
 			}
 		}
 		columns[id] = writerColumn{

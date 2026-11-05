@@ -202,6 +202,103 @@ func TestWriterRoundTripsDecimalColumns(t *testing.T) {
 	}
 }
 
+func TestWriterRoundTripsLegacyUnboundedVariableScaleDecimals(t *testing.T) {
+	schema := []Type{
+		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"amount"}},
+		{Kind: TypeKindDecimal},
+	}
+	rows := []Row{
+		{"amount": Decimal("12345678901234567890123456789012345678901234567890.00")},
+		{"amount": Decimal("-0.001")},
+		{"amount": Decimal("1.2")},
+	}
+	for _, compression := range []CompressionKind{CompressionNone, CompressionZlib} {
+		for _, useRLEv2 := range []bool{false, true} {
+			t.Run(compression.String()+map[bool]string{false: "/RLEv1", true: "/RLEv2"}[useRLEv2], func(t *testing.T) {
+				var output bytes.Buffer
+				writer, err := NewWriter(&output, schema, WriterOptions{
+					Compression: compression, UseRLEv2: useRLEv2, MaxRowsPerStripe: 1,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, row := range rows {
+					if err := writer.WriteRow(row); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := writer.Close(); err != nil {
+					t.Fatal(err)
+				}
+				reader, err := NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := reader.ReadAll()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(got, rows) {
+					t.Fatalf("ReadAll() = %#v, want %#v", got, rows)
+				}
+				if gotSchema := reader.Schema(); !reflect.DeepEqual(gotSchema, schema) {
+					t.Fatalf("Schema() = %#v, want %#v", gotSchema, schema)
+				}
+				statistics := reader.FileStatistics()[1]
+				if !statistics.HasNumberOfValues || statistics.NumberOfValues != uint64(len(rows)) || statistics.Decimal == nil {
+					t.Fatalf("variable-scale decimal statistics = %+v", statistics)
+				}
+				decimal := statistics.Decimal
+				if !decimal.HasMinimum || decimal.Minimum != "-0.001" || !decimal.HasMaximum || decimal.Maximum != "12345678901234567890123456789012345678901234567890.00" || !decimal.HasSum || decimal.Sum != "12345678901234567890123456789012345678901234567891.199" {
+					t.Fatalf("variable-scale decimal bounds and sum = %+v", decimal)
+				}
+			})
+		}
+	}
+}
+
+func TestWriterSupportsUnboundedPrecisionWithFixedScale(t *testing.T) {
+	schema := []Type{
+		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"amount"}},
+		{Kind: TypeKindDecimal, Scale: 2},
+	}
+	rows := []Row{
+		{"amount": Decimal("12345678901234567890123456789012345678901234567890.2")},
+		{"amount": Decimal("1.2")},
+	}
+	var output bytes.Buffer
+	writer, err := NewWriter(&output, schema, WriterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if err := writer.WriteRow(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Row{
+		{"amount": Decimal("12345678901234567890123456789012345678901234567890.20")},
+		{"amount": Decimal("1.20")},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+	}
+	if statistics := reader.FileStatistics()[1].Decimal; statistics == nil || !statistics.HasMinimum || !statistics.HasMaximum || !statistics.HasSum {
+		t.Fatalf("fixed-scale unbounded decimal statistics = %+v", statistics)
+	}
+}
+
 func TestWriterRejectsInvalidDecimalsWithoutAppendingRows(t *testing.T) {
 	schema := []Type{
 		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"amount"}},
@@ -242,15 +339,20 @@ func TestWriterRejectsInvalidDecimalsWithoutAppendingRows(t *testing.T) {
 }
 
 func TestWriterRejectsInvalidDecimalSchema(t *testing.T) {
-	for _, typ := range []Type{
-		{Kind: TypeKindDecimal},
-		{Kind: TypeKindDecimal, Precision: 39},
-		{Kind: TypeKindDecimal, Precision: 2, Scale: 3},
+	for _, test := range []struct {
+		name string
+		typ  Type
+	}{
+		{name: "precision over maximum", typ: Type{Kind: TypeKindDecimal, Precision: 39}},
+		{name: "scale exceeds precision", typ: Type{Kind: TypeKindDecimal, Precision: 2, Scale: 3}},
+		{name: "unbounded scale exceeds writer limit", typ: Type{Kind: TypeKindDecimal, Scale: maxDecimalScaleExpansion + 1}},
 	} {
-		schema := []Type{{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"amount"}}, typ}
-		if _, err := NewWriter(&bytes.Buffer{}, schema, WriterOptions{}); err == nil {
-			t.Errorf("NewWriter() accepted decimal type %#v", typ)
-		}
+		t.Run(test.name, func(t *testing.T) {
+			schema := []Type{{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"amount"}}, test.typ}
+			if _, err := NewWriter(&bytes.Buffer{}, schema, WriterOptions{}); err == nil {
+				t.Errorf("NewWriter() accepted decimal type %#v", test.typ)
+			}
+		})
 	}
 }
 

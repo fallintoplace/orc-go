@@ -9,6 +9,7 @@ import (
 )
 
 const maxStringStatisticBoundBytes = 1024
+const maxCachedDecimalScaleFactors = 64
 
 func newEmptyColumnStatistics() ColumnStatistics {
 	return ColumnStatistics{HasNumberOfValues: true, HasNullSet: true}
@@ -158,35 +159,57 @@ func buildWriterColumnStatistics(column writerColumn, values []any, rows uint64)
 		}
 		stats.Binary = result
 	case TypeKindDecimal:
+		// Align values to one scale before comparing coefficients or adding them.
+		var commonScale int64
+		for _, value := range values {
+			if value != nil && value.(encodedDecimal).scale > commonScale {
+				commonScale = value.(encodedDecimal).scale
+			}
+		}
 		result := &DecimalStatistics{}
+		powerCache := make(map[int64]*big.Int)
+		scaleFactor := func(power int64) *big.Int {
+			if factor, ok := powerCache[power]; ok {
+				return factor
+			}
+			factor := decimalPowerOfTen(power)
+			if len(powerCache) < maxCachedDecimalScaleFactors {
+				powerCache[power] = factor
+			}
+			return factor
+		}
 		var minimum, maximum, sum *big.Int
 		for _, value := range values {
 			if value == nil {
 				continue
 			}
 			decimal := value.(encodedDecimal)
-			if minimum == nil || decimal.coefficient.Cmp(minimum) < 0 {
-				minimum = new(big.Int).Set(decimal.coefficient)
+			coefficient := new(big.Int).Set(decimal.coefficient)
+			if power := commonScale - decimal.scale; power > 0 {
+				coefficient.Mul(coefficient, scaleFactor(power))
 			}
-			if maximum == nil || decimal.coefficient.Cmp(maximum) > 0 {
-				maximum = new(big.Int).Set(decimal.coefficient)
+			if minimum == nil || coefficient.Cmp(minimum) < 0 {
+				minimum = new(big.Int).Set(coefficient)
+			}
+			if maximum == nil || coefficient.Cmp(maximum) > 0 {
+				maximum = new(big.Int).Set(coefficient)
 			}
 			if sum == nil {
 				sum = new(big.Int)
 			}
-			sum.Add(sum, decimal.coefficient)
+			sum.Add(sum, coefficient)
 		}
 		if minimum != nil {
 			var err error
-			result.Minimum, err = formatDecimal(minimum, int64(column.scale))
+			result.Minimum, err = formatDecimal(minimum, commonScale)
 			if err != nil {
 				return ColumnStatistics{}, err
 			}
-			result.Maximum, err = formatDecimal(maximum, int64(column.scale))
+			result.Maximum, err = formatDecimal(maximum, commonScale)
 			if err != nil {
 				return ColumnStatistics{}, err
 			}
-			result.Sum, err = formatDecimal(sum, int64(column.scale))
+			result.Sum, err = formatDecimal(sum, commonScale)
 			if err != nil {
 				return ColumnStatistics{}, err
 			}
@@ -585,39 +608,31 @@ func mergeDecimalStatistics(destination **DecimalStatistics, source *DecimalStat
 	}
 	result := *destination
 	if result.HasMinimum && source.HasMinimum {
-		left, _, leftErr := parseDecimal(result.Minimum)
-		right, _, rightErr := parseDecimal(source.Minimum)
-		if leftErr != nil || rightErr != nil {
+		comparison, err := compareDecimalNumbers(source.Minimum, result.Minimum)
+		if err != nil {
 			result.HasMinimum = false
-		} else if right.Cmp(left) < 0 {
+		} else if comparison < 0 {
 			result.Minimum = source.Minimum
 		}
 	} else {
 		result.HasMinimum = false
 	}
 	if result.HasMaximum && source.HasMaximum {
-		left, _, leftErr := parseDecimal(result.Maximum)
-		right, _, rightErr := parseDecimal(source.Maximum)
-		if leftErr != nil || rightErr != nil {
+		comparison, err := compareDecimalNumbers(source.Maximum, result.Maximum)
+		if err != nil {
 			result.HasMaximum = false
-		} else if right.Cmp(left) > 0 {
+		} else if comparison > 0 {
 			result.Maximum = source.Maximum
 		}
 	} else {
 		result.HasMaximum = false
 	}
 	if result.HasSum && source.HasSum {
-		left, scale, leftErr := parseDecimal(result.Sum)
-		right, rightScale, rightErr := parseDecimal(source.Sum)
-		if leftErr != nil || rightErr != nil || scale != rightScale {
+		sum, err := addDecimalNumbers(result.Sum, source.Sum)
+		if err != nil {
 			result.HasSum = false
 		} else {
-			left.Add(left, right)
-			if sum, err := formatDecimal(left, scale); err == nil {
-				result.Sum = sum
-			} else {
-				result.HasSum = false
-			}
+			result.Sum = sum
 		}
 	} else {
 		result.HasSum = false
