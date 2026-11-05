@@ -18,8 +18,9 @@ func newEmptyColumnStatistics() ColumnStatistics {
 func buildWriterColumnStatistics(column writerColumn, values []any, rows uint64) (ColumnStatistics, error) {
 	stats := newEmptyColumnStatistics()
 	if column.id == 0 {
-		stats.NumberOfValues = rows
-		return stats, nil
+		if uint64(len(values)) != rows {
+			return ColumnStatistics{}, fmt.Errorf("ORC root column has %d values, want %d rows", len(values), rows)
+		}
 	}
 
 	for _, value := range values {
