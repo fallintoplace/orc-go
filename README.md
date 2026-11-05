@@ -1,8 +1,15 @@
 # orc-go
 
-`orc-go` reads and writes [Apache ORC](https://orc.apache.org/) files in Go. It supports primitive and nested columns, multiple stripes, compression, column selection, row ranges, statistics, indexes, bloom filters, custom metadata, and column encryption.
+Read and write [Apache ORC](https://orc.apache.org/) files from Go.
 
-> Work in progress. The API may change. Requires Go 1.22 or newer.
+> This project is a work in progress, and its API may change. It requires Go 1.22 or newer.
+
+Use `orc-go` to:
+
+- Read and write primitive or nested columns across multiple stripes.
+- Read selected columns or a range of rows.
+- Compress files and inspect statistics, indexes, and bloom filters.
+- Store application metadata and encrypt columns.
 
 ## Install
 
@@ -10,9 +17,9 @@
 go get github.com/fallintoplace/orc-go
 ```
 
-## Read rows
+## Read a file
 
-Use `ReadRows` to process a file one row at a time. It decodes one stripe at a time, so it does not load the whole file into memory. Use `ReadAll` when you want all rows in a slice and the file fits in memory.
+ORC groups rows into stripes. `ReadRows` processes one stripe at a time, so it does not load the whole file into memory. Use `ReadAll` when you want every row in a slice and the file fits in memory.
 
 ```go
 package main
@@ -31,22 +38,23 @@ func main() {
 	}
 	defer reader.Close()
 
-	if err := reader.ReadRows(func(row orc.Row) error {
+	err = reader.ReadRows(func(row orc.Row) error {
 		fmt.Println(row)
 		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		log.Fatal(err)
 	}
 }
 ```
 
-To read only some fields, use `ReadRowsWithColumns` or `ReadAllWithColumns`. These methods select root fields. If a selected field contains nested data, the full nested value is returned.
+To read selected fields, use `ReadRowsWithColumns` or `ReadAllWithColumns`. These methods select top-level fields. If a field contains nested data, you get the complete nested value.
 
-To read a row range, use `ReadRowsRange` or `ReadAllRange`. The range uses zero-based row numbers and includes `start` but not `end` (`[start, end)`). Stripes outside the range are skipped; rows in a selected stripe are decoded together.
+To read part of a file, use `ReadRowsRange` or `ReadAllRange`. Row numbers start at zero, and the range includes `start` but not `end` (`[start, end)`). Stripes outside the range are skipped; rows in a selected stripe are decoded together.
 
-## Write rows
+## Write a file
 
-Create a schema, then pass rows to the writer. A schema is a list of ORC types. The root STRUCT is entry 0. Its `Subtypes` contain indexes of the field types in the same list. In this example, the `id` field points to the LONG at index 1.
+Create a schema, then write rows with `WriteRow`. An ORC schema is a list of types. The first type describes the row (`STRUCT`). Its `Subtypes` point to the types used by its fields. In this example, field `id` points to the `LONG` type at index 1.
 
 ```go
 package main
@@ -83,9 +91,9 @@ func main() {
 }
 ```
 
-Call `Close` to write the last stripe and the file footer. It does not close the destination. Missing fields and `nil` values are written as ORC nulls.
+Call `Close` to write the last stripe and the file footer. `Close` does not close the destination file, so close that file separately. Missing fields and `nil` values are written as ORC nulls.
 
-## Go values
+## Go values for ORC types
 
 | ORC type | Go value |
 | --- | --- |
@@ -101,13 +109,7 @@ Call `Close` to write the last stripe and the file footer. It does not close the
 | MAP | `[]orc.MapEntry` |
 | UNION | `orc.UnionValue` |
 
-DATE uses the calendar date in the input `time.Time` value's location. DATE values are returned in UTC. TIMESTAMP keeps calendar and clock fields using the stripe's writer timezone; TIMESTAMP_INSTANT keeps the instant.
-
-For DECIMAL, set `Precision` and `Scale` in the schema and use `orc.Decimal` values. Values are rescaled exactly, without rounding.
-
-CHAR values are truncated and padded to their declared length when written. Trailing spaces are removed when read. VARCHAR values are truncated when written. Both lengths count Unicode code points.
-
-Nested values use these Go shapes:
+Nested values use the matching Go shape. For example:
 
 ```go
 row := orc.Row{
@@ -117,39 +119,58 @@ row := orc.Row{
 }
 ```
 
-`[]orc.MapEntry` lets MAP keys use any ORC type.
+`[]orc.MapEntry` lets a map use any ORC type for its keys.
 
-## Compression and encodings
+For DECIMAL fields, set `Precision` and `Scale` in the schema and pass `orc.Decimal` values. Values are rescaled exactly, without rounding.
 
-The reader and writer support NONE, ZLIB, SNAPPY, LZO, LZ4, ZSTD, and BROTLI compression. The reader supports RLEv1 and RLEv2 for integer, DATE, timestamp, and DECIMAL streams. The writer uses RLEv1 by default; set `UseRLEv2` to write RLEv2 instead.
+DATE uses the calendar date in the input `time.Time` location and returns dates in UTC. TIMESTAMP keeps calendar and clock fields using the stripe's writer timezone; TIMESTAMP_INSTANT keeps the instant.
 
-The reader handles direct and dictionary encodings for STRING, CHAR, and VARCHAR values. Both reader and writer use direct encoding for BINARY values. The writer uses direct encoding by default; set `UseDictionary` to write string values with a dictionary.
+CHAR values are truncated and padded when written, then trailing spaces are removed when read. VARCHAR values are truncated when written. Both string lengths count Unicode code points.
+
+## Reading and writing options
+
+The reader and writer support NONE, ZLIB, SNAPPY, LZO, LZ4, ZSTD, and BROTLI compression. The writer uses no compression by default.
+
+The reader supports RLEv1 and RLEv2 for integer, DATE, timestamp, and DECIMAL streams. The writer uses RLEv1 by default; set `UseRLEv2` to write RLEv2.
+
+The reader handles direct and dictionary encodings for STRING, CHAR, and VARCHAR. The writer uses direct encoding by default; set `UseDictionary` to write those string types with a dictionary. BINARY columns use direct encoding.
+
+Common `WriterOptions` fields:
+
+| Option | What it does |
+| --- | --- |
+| `Compression` | Chooses the compression codec. Defaults to NONE. |
+| `CompressionBlockSize` | Changes the maximum uncompressed chunk size. Zero uses the ORC default. |
+| `MaxRowsPerStripe` | Starts a new stripe after this many rows. Zero keeps rows in one stripe until `Close`. |
+| `RowIndexStride` | Sets the maximum rows per row-index entry. Defaults to 10,000; values below 1,000 are not supported. |
+| `DisableRowIndexes` | Omits row indexes. Bloom filters require row indexes. |
+| `UseRLEv2` | Writes RLEv2 for supported integer, DATE, timestamp, DECIMAL, and length streams. |
+| `UseDictionary` | Writes STRING, CHAR, and VARCHAR columns with a dictionary. |
+| `BloomFilterColumns` | Adds bloom filters to selected top-level BYTE, SHORT, INT, LONG, FLOAT, DOUBLE, STRING, CHAR, VARCHAR, or BINARY fields. |
+| `EncryptColumns` | Encrypts selected top-level fields and all their nested fields, including row indexes and bloom filters. |
+
+Bloom filters can rule out a value quickly. A possible match still needs to be checked against the data, because it can be a false positive. The default false-positive probability is `0.01`; use `BloomFilterFPP` to change it. `LegacyBloomFilterEncoding` writes the older fixed64 bitset format.
 
 ## Inspect a file
 
-- `Schema` returns the file's ORC type tree. `Stripes` returns stripe locations and row counts. `NumRows` and `NumStripes` return file totals.
-- `FileStatistics` and `StripeStatistics` return column statistics.
-- `RowIndexes` returns row-group positions and optional statistics.
-- `BloomFilterIndexes` returns row-group bloom filters. Use `MightContainString`, `MightContainBytes`, `MightContainInt64`, or `MightContainFloat64` to check supported values. A positive result means a value may be present; it can be a false positive.
-- `UserMetadata` returns application-defined metadata stored in the footer.
+| Method | Returns |
+| --- | --- |
+| `Schema` | The file's ORC type tree. |
+| `Stripes`, `NumStripes`, `NumRows` | Stripe locations and file row/stripe totals. |
+| `FileStatistics`, `StripeStatistics` | Statistics for the whole file or each stripe. |
+| `RowIndexes` | Row-group positions and optional statistics. |
+| `BloomFilterIndexes` | Row-group bloom filters. Check supported values with `MightContainString`, `MightContainBytes`, `MightContainInt64`, or `MightContainFloat64`. |
+| `UserMetadata` | Application-defined metadata from the footer. |
 
-## Writer options
+Use `AddUserMetadata(name, value)` on the writer to store application-defined metadata.
 
-- `Compression` selects NONE, ZLIB, SNAPPY, LZO, LZ4, ZSTD, or BROTLI. The default is NONE.
-- `MaxRowsPerStripe` starts a new stripe after the given number of rows. Zero keeps rows in one stripe until `Close`.
-- `RowIndexStride` sets the maximum rows per row-index entry. The default is 10,000; values below 1,000 are not supported. Use `DisableRowIndexes` to omit row indexes.
-- `UseRLEv2` selects RLEv2 for supported integer, DATE, timestamp, DECIMAL, and length streams. The default is RLEv1.
-- `UseDictionary` writes STRING, CHAR, and VARCHAR columns using a dictionary.
-- `BloomFilterColumns` enables bloom filters for selected root BYTE, SHORT, INT, LONG, FLOAT, DOUBLE, STRING, CHAR, VARCHAR, or BINARY fields. `BloomFilterFPP` defaults to 0.01. `LegacyBloomFilterEncoding` writes the older fixed64 bitset format.
-- `EncryptColumns` encrypts selected root fields and their complete type subtrees, including row indexes and bloom filters.
+## Encrypt columns
 
-Use `AddUserMetadata(name, value)` to write application-defined footer metadata. Read it back with `UserMetadata`.
+`EncryptColumns` encrypts a selected top-level field and its nested fields. Pass the same key provider to the writer and reader. Use a 16-byte master key for AES-CTR 128 or a 32-byte master key for AES-CTR 256.
 
-## Column encryption
+ORC files store wrapped local encryption keys; they do not store the master key.
 
-Pass the same key provider to the writer and reader. Use a 16-byte master key for AES-CTR 128 or a 32-byte master key for AES-CTR 256. ORC files store wrapped local encryption keys; they do not store the master key.
-
-Assume `orc` is imported and `file` is writing to `path`. The schema must have a root field named `email`. Inside a function, create the key provider and writer like this:
+This example assumes `file` is the destination and `schema` has a top-level field named `email`. The hard-coded key is only for demonstration; load production keys from secure storage.
 
 ```go
 masterKey := []byte("0123456789abcdef") // 16 bytes for AES-CTR 128
@@ -170,11 +191,8 @@ writer, err := orc.NewWriter(file, schema, orc.WriterOptions{
 if err != nil {
 	return err
 }
-```
+// Write rows, then call writer.Close().
 
-Write rows with `writer.WriteRow(...)`, then call `writer.Close()` and close the destination file. When opening the file, pass the same key provider:
-
-```go
 reader, err := orc.OpenWithOptions(path, orc.ReaderOptions{KeyProvider: keys})
 if err != nil {
 	return err
@@ -182,7 +200,11 @@ if err != nil {
 defer reader.Close()
 ```
 
-Without a key, the reader returns the unencrypted fallback values stored in the file. Files written by this package use nulls as the fallback. `FileStatistics` and `StripeStatistics` report those fallback values. With a key, call `EncryptionStatistics("email")` to get file and per-stripe statistics for an encrypted field and its nested fields. The reader also uses encrypted row indexes and bloom filters when a key is available. User metadata is not encrypted. AES-CTR does not detect tampering, so verify file integrity separately if needed.
+Without a key, the reader returns the file's unencrypted fallback values. Files written by this package use nulls as those fallback values. File and stripe statistics also show the fallback values.
+
+With a key, `EncryptionStatistics("email")` returns statistics for the encrypted field and its nested fields. The reader also uses encrypted row indexes and bloom filters when a key is available. User metadata is not encrypted.
+
+AES-CTR does not detect tampering. Verify file integrity separately if you need tamper detection.
 
 ## License
 
