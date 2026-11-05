@@ -80,6 +80,7 @@ type stripeStream struct {
 type columnEncoding struct {
 	kind           uint32
 	dictionarySize uint32
+	bloomEncoding  uint32
 }
 
 type stripeFooter struct {
@@ -887,6 +888,11 @@ func parseColumnEncoding(data []byte) (columnEncoding, error) {
 				return columnEncoding{}, fmt.Errorf("dictionary size %d overflows uint32", value)
 			}
 			result.dictionarySize = uint32(value)
+		case 3:
+			result.bloomEncoding, err = readUint32Field(field)
+			if err != nil {
+				return columnEncoding{}, err
+			}
 		}
 	}
 	if !hasKind {
