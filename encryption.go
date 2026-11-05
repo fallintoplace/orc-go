@@ -790,7 +790,9 @@ func validateFileEncryption(encryption *fileEncryption, types []Type, stripes []
 		}
 		for _, other := range variantRanges {
 			if variant.root <= other[1] && other[0] <= last {
-				return fmt.Errorf("ORC encryption variants overlap at columns %d and %d", variant.root, other[0])
+				if variant.root != other[0] || last != other[1] {
+					return fmt.Errorf("ORC encryption variants overlap at columns %d and %d", variant.root, other[0])
+				}
 			}
 		}
 		variantRanges = append(variantRanges, [2]uint32{variant.root, last})

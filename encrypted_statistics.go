@@ -25,25 +25,36 @@ func (r *Reader) EncryptionStatistics(column string) (ColumnEncryptionStatistics
 	}
 
 	variantIndex := -1
-	for i, variant := range r.footer.encryption.variants {
-		if variant.root == root {
-			variantIndex = i
-			break
+	var variant fileEncryptionVariant
+	var keyDescription encryptionKeyDescription
+	var localKey []byte
+	foundVariant := false
+	for i, candidate := range r.footer.encryption.variants {
+		if candidate.root != root {
+			continue
 		}
+		foundVariant = true
+		if uint64(candidate.key) >= uint64(len(r.footer.encryption.keys)) {
+			return ColumnEncryptionStatistics{}, fmt.Errorf("%w: encrypted column %d references missing key %d", ErrInvalidFile, root, candidate.key)
+		}
+		candidateKey := r.footer.encryption.keys[candidate.key]
+		candidateLocalKey, unavailable, err := r.decryptLocalKey(candidateKey, candidate.encryptedKey)
+		if err != nil {
+			return ColumnEncryptionStatistics{}, fmt.Errorf("resolve key for encrypted column %d: %w", root, err)
+		}
+		if unavailable {
+			continue
+		}
+		variantIndex = i
+		variant = candidate
+		keyDescription = candidateKey
+		localKey = candidateLocalKey
+		break
 	}
-	if variantIndex < 0 {
+	if !foundVariant {
 		return ColumnEncryptionStatistics{}, fmt.Errorf("column %q: %w", column, ErrColumnNotEncrypted)
 	}
-	variant := r.footer.encryption.variants[variantIndex]
-	if int(variant.key) >= len(r.footer.encryption.keys) {
-		return ColumnEncryptionStatistics{}, fmt.Errorf("%w: encrypted column %d references missing key %d", ErrInvalidFile, root, variant.key)
-	}
-	keyDescription := r.footer.encryption.keys[variant.key]
-	localKey, unavailable, err := r.decryptLocalKey(keyDescription, variant.encryptedKey)
-	if err != nil {
-		return ColumnEncryptionStatistics{}, fmt.Errorf("resolve key for encrypted column %d: %w", root, err)
-	}
-	if unavailable {
+	if variantIndex < 0 {
 		return ColumnEncryptionStatistics{}, ErrKeyUnavailable
 	}
 
