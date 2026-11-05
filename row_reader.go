@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"time"
 
 	"github.com/fallintoplace/orc-go/internal/rlev1"
 	"github.com/fallintoplace/orc-go/internal/rlev2"
@@ -58,6 +57,7 @@ type rowColumn struct {
 	id        uint32
 	name      string
 	kind      TypeKind
+	calendar  CalendarKind
 	precision uint32
 	scale     uint32
 	maxLength uint32
@@ -331,7 +331,7 @@ func (r *Reader) rowColumns() ([]rowColumn, error) {
 		default:
 			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, typ.Kind)
 		}
-		columns[i] = rowColumn{id: subtype, name: name, kind: typ.Kind, precision: typ.Precision, scale: typ.Scale, maxLength: typ.MaxLength}
+		columns[i] = rowColumn{id: subtype, name: name, kind: typ.Kind, calendar: r.calendar, precision: typ.Precision, scale: typ.Scale, maxLength: typ.MaxLength}
 	}
 	return columns, nil
 }
@@ -848,7 +848,7 @@ func decodeColumn(rowCount uint64, column rowColumn, types []Type, encodings []c
 	case TypeKindString, TypeKindBinary, TypeKindChar, TypeKindVarchar:
 		return decodeVariableLengthColumn(present, valueCount, column, streams, dataStream, encoding)
 	case TypeKindTimestamp, TypeKindTimestampInstant:
-		return decodeTimestampColumn(present, valueCount, column, streams, encoding, writerTimezone)
+		return decodeTimestampColumn(present, valueCount, column, streams, encoding, writerTimezone, column.calendar)
 	case TypeKindDecimal:
 		return decodeDecimalColumn(present, valueCount, column, streams, encoding)
 	case TypeKindStruct:
@@ -898,7 +898,7 @@ func decodeColumn(rowCount uint64, column rowColumn, types []Type, encodings []c
 			if value < math.MinInt32 || value > math.MaxInt32 {
 				return nil, fmt.Errorf("DATE value %d is out of range", value)
 			}
-			values[rowIndex] = time.Unix(value*86400, 0).UTC()
+			values[rowIndex] = dateFromORCDays(value, column.calendar)
 			continue
 		}
 		values[rowIndex], err = narrowInteger(value, column.kind)
@@ -912,7 +912,7 @@ func decodeColumn(rowCount uint64, column rowColumn, types []Type, encodings []c
 func decodeStructColumn(present []bool, valueCount int, column rowColumn, typ Type, types []Type, encodings []columnEncoding, streams map[streamKey][]byte, writerTimezone string) ([]any, error) {
 	children := make([][]any, len(typ.Subtypes))
 	for i, subtype := range typ.Subtypes {
-		child, err := decodeColumn(uint64(valueCount), rowColumn{id: subtype}, types, encodings, streams, writerTimezone)
+		child, err := decodeColumn(uint64(valueCount), rowColumn{id: subtype, calendar: column.calendar}, types, encodings, streams, writerTimezone)
 		if err != nil {
 			return nil, fmt.Errorf("decode STRUCT field %q (column %d): %w", typ.FieldNames[i], subtype, err)
 		}
@@ -950,7 +950,7 @@ func decodeListColumn(present []bool, valueCount int, column rowColumn, typ Type
 	if err != nil {
 		return nil, err
 	}
-	childValues, err := decodeColumn(childCount, rowColumn{id: typ.Subtypes[0]}, types, encodings, streams, writerTimezone)
+	childValues, err := decodeColumn(childCount, rowColumn{id: typ.Subtypes[0], calendar: column.calendar}, types, encodings, streams, writerTimezone)
 	if err != nil {
 		return nil, fmt.Errorf("decode LIST elements (column %d): %w", typ.Subtypes[0], err)
 	}
@@ -990,11 +990,11 @@ func decodeMapColumn(present []bool, valueCount int, column rowColumn, typ Type,
 	if err != nil {
 		return nil, err
 	}
-	keys, err := decodeColumn(childCount, rowColumn{id: typ.Subtypes[0]}, types, encodings, streams, writerTimezone)
+	keys, err := decodeColumn(childCount, rowColumn{id: typ.Subtypes[0], calendar: column.calendar}, types, encodings, streams, writerTimezone)
 	if err != nil {
 		return nil, fmt.Errorf("decode MAP keys (column %d): %w", typ.Subtypes[0], err)
 	}
-	mapValues, err := decodeColumn(childCount, rowColumn{id: typ.Subtypes[1]}, types, encodings, streams, writerTimezone)
+	mapValues, err := decodeColumn(childCount, rowColumn{id: typ.Subtypes[1], calendar: column.calendar}, types, encodings, streams, writerTimezone)
 	if err != nil {
 		return nil, fmt.Errorf("decode MAP values (column %d): %w", typ.Subtypes[1], err)
 	}
@@ -1042,7 +1042,7 @@ func decodeUnionColumn(present []bool, valueCount int, column rowColumn, typ Typ
 	}
 	variants := make([][]any, len(typ.Subtypes))
 	for tag, subtype := range typ.Subtypes {
-		variants[tag], err = decodeColumn(counts[tag], rowColumn{id: subtype}, types, encodings, streams, writerTimezone)
+		variants[tag], err = decodeColumn(counts[tag], rowColumn{id: subtype, calendar: column.calendar}, types, encodings, streams, writerTimezone)
 		if err != nil {
 			return nil, fmt.Errorf("decode UNION variant %d (column %d): %w", tag, subtype, err)
 		}

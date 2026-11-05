@@ -108,6 +108,8 @@ row := orc.Row{
 
 DATE uses the calendar date from the input `time.Time` and returns dates in UTC. TIMESTAMP keeps the calendar and clock fields using the stripe's writer timezone. TIMESTAMP_INSTANT keeps the instant. CHAR values are truncated and padded when written, then trailing spaces are removed when read. VARCHAR values are truncated when written. CHAR and VARCHAR lengths count Unicode code points.
 
+The writer marks files as using Go's proleptic Gregorian calendar. When reading files written with the older Julian/Gregorian calendar, the reader keeps the date and clock fields when Go can represent them. A Julian-only leap day, such as February 29, 1500, is normalized to the next valid Gregorian date. If a file does not name a calendar, the reader assumes Julian/Gregorian. Set `ReaderOptions.DefaultCalendar` to choose a different fallback.
+
 ## Options
 
 The reader and writer support NONE, ZLIB, SNAPPY, LZO, LZ4, ZSTD, and BROTLI compression. The writer uses no compression by default.

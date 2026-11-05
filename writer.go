@@ -514,6 +514,7 @@ func (w *Writer) encodeFileTail() ([]byte, error) {
 	if len(w.encryption) != 0 {
 		footer = appendProtoBytesField(footer, 10, encodeFileEncryption(w.fileEncryption))
 	}
+	footer = appendProtoVarintField(footer, 11, uint64(CalendarKindProlepticGregorian))
 	encodedFooter, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, footer)
 	if err != nil {
 		return nil, fmt.Errorf("compress ORC footer: %w", err)

@@ -108,8 +108,11 @@ var ErrColumnNotEncrypted = errors.New("ORC column is not encrypted")
 // not stored for a column or are incomplete.
 var ErrEncryptedStatisticsUnavailable = errors.New("encrypted ORC statistics are unavailable")
 
-// ReaderOptions controls key lookup when reading encrypted columns.
+// ReaderOptions controls optional reader behavior.
 type ReaderOptions struct {
+	// DefaultCalendar is used for DATE and TIMESTAMP values when the file has
+	// no calendar metadata. Zero defaults to the Julian/Gregorian calendar.
+	DefaultCalendar CalendarKind
 	// KeyProvider resolves Hadoop master keys used to wrap ORC local keys. If
 	// nil and no matching EncryptionKeyProvider is set, encrypted columns use
 	// their unencrypted masked variant. When both are set for a Hadoop file,
