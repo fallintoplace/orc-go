@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"unicode/utf8"
 
 	"github.com/fallintoplace/orc-go/internal/wire"
@@ -32,6 +33,23 @@ const (
 	EncryptionAESCTR256 EncryptionAlgorithm = 2
 )
 
+// KeyProviderKind identifies how the encrypted local keys in an ORC file are
+// wrapped.
+type KeyProviderKind uint32
+
+const (
+	// KeyProviderKindUnknown is used when the file does not name a provider.
+	KeyProviderKindUnknown KeyProviderKind = iota
+	// KeyProviderKindHadoop uses Hadoop or Ranger KMS wrapping.
+	KeyProviderKindHadoop
+	// KeyProviderKindAWS uses AWS KMS wrapping.
+	KeyProviderKindAWS
+	// KeyProviderKindGCP uses Google Cloud KMS wrapping.
+	KeyProviderKindGCP
+	// KeyProviderKindAzure uses Azure Key Vault wrapping.
+	KeyProviderKindAzure
+)
+
 // EncryptionRule encrypts a root field and its complete type subtree. Column
 // names are root STRUCT field names.
 type EncryptionRule struct {
@@ -41,7 +59,8 @@ type EncryptionRule struct {
 	Algorithm  EncryptionAlgorithm
 }
 
-// KeyProvider resolves a named and versioned AES master key. The ORC file
+// KeyProvider resolves a named and versioned AES master key for Hadoop ORC key
+// wrapping. Use EncryptionKeyProvider for other wrapping formats. The ORC file
 // stores wrapped local keys, never the master key itself.
 type KeyProvider interface {
 	GetKey(name string, version uint32) ([]byte, error)
@@ -56,6 +75,22 @@ func (f KeyProviderFunc) GetKey(name string, version uint32) ([]byte, error) {
 		return nil, ErrKeyUnavailable
 	}
 	return f(name, version)
+}
+
+// EncryptionKeyProvider wraps and unwraps ORC local encryption keys. Use this
+// interface to connect a KMS without adding its SDK to this package. The
+// returned local key must be 16 bytes for AES-CTR-128 or 32 bytes for
+// AES-CTR-256. The encrypted local key is stored in the ORC file as opaque
+// bytes. Kind must be a provider kind defined by ORC. Return ErrKeyUnavailable
+// when a reader cannot access the key.
+type EncryptionKeyProvider interface {
+	// Kind identifies the key provider format written to the ORC file.
+	Kind() KeyProviderKind
+	// GenerateLocalKey creates an AES key and the opaque bytes needed to
+	// recover it later.
+	GenerateLocalKey(name string, version uint32, algorithm EncryptionAlgorithm) (localKey, encryptedLocalKey []byte, err error)
+	// DecryptLocalKey recovers a local AES key from its opaque bytes.
+	DecryptLocalKey(name string, version uint32, algorithm EncryptionAlgorithm, encryptedLocalKey []byte) ([]byte, error)
 }
 
 // ErrKeyUnavailable tells a reader that a key is not available and the
@@ -75,9 +110,14 @@ var ErrEncryptedStatisticsUnavailable = errors.New("encrypted ORC statistics are
 
 // ReaderOptions controls key lookup when reading encrypted columns.
 type ReaderOptions struct {
-	// KeyProvider resolves the master keys used to wrap ORC local keys. If nil,
-	// encrypted columns are read from their unencrypted masked variant.
+	// KeyProvider resolves Hadoop master keys used to wrap ORC local keys. If
+	// nil and no matching EncryptionKeyProvider is set, encrypted columns use
+	// their unencrypted masked variant. When both are set for a Hadoop file,
+	// KeyProvider is tried if EncryptionKeyProvider reports the key unavailable.
 	KeyProvider KeyProvider
+	// EncryptionKeyProvider handles the matching ORC key-provider format. It is
+	// tried before KeyProvider and can connect a KMS without adding its SDK.
+	EncryptionKeyProvider EncryptionKeyProvider
 }
 
 type encryptionKeyDescription struct {
@@ -145,7 +185,7 @@ func encodeStripeStreamDescriptor(stream stripeStream) []byte {
 	return appendProtoVarintField(data, 3, stream.length)
 }
 
-func prepareWriterEncryption(types []Type, rootColumns map[string]int, rules []EncryptionRule, provider KeyProvider) ([]writerEncryptionVariant, []int, fileEncryption, error) {
+func prepareWriterEncryption(types []Type, rootColumns map[string]int, rules []EncryptionRule, provider KeyProvider, encryptionProvider EncryptionKeyProvider) ([]writerEncryptionVariant, []int, fileEncryption, error) {
 	columnVariants := make([]int, len(types))
 	for i := range columnVariants {
 		columnVariants[i] = -1
@@ -153,12 +193,28 @@ func prepareWriterEncryption(types []Type, rootColumns map[string]int, rules []E
 	if len(rules) == 0 {
 		return nil, columnVariants, fileEncryption{}, nil
 	}
-	if provider == nil {
+	if isNilProvider(provider) {
+		provider = nil
+	}
+	if isNilProvider(encryptionProvider) {
+		encryptionProvider = nil
+	}
+	if provider != nil && encryptionProvider != nil {
+		return nil, nil, fileEncryption{}, fmt.Errorf("configure either KeyProvider or EncryptionKeyProvider for ORC encryption, not both")
+	}
+	if provider == nil && encryptionProvider == nil {
 		return nil, nil, fileEncryption{}, fmt.Errorf("ORC column encryption requires a key provider")
+	}
+	providerKind := KeyProviderKindHadoop
+	if encryptionProvider != nil {
+		providerKind = encryptionProvider.Kind()
+		if !isSupportedKeyProviderKind(providerKind) {
+			return nil, nil, fileEncryption{}, fmt.Errorf("unsupported ORC key provider kind %d", providerKind)
+		}
 	}
 
 	variants := make([]writerEncryptionVariant, 0, len(rules))
-	file := fileEncryption{keyProvider: 1}
+	file := fileEncryption{keyProvider: uint32(providerKind)}
 	mask := dataMask{name: "nullify"}
 	keyIndices := make(map[writerKeyID]uint32)
 	masterKeys := make(map[writerKeyID][]byte)
@@ -195,29 +251,47 @@ func prepareWriterEncryption(types []Type, rootColumns map[string]int, rules []E
 		keyID := writerKeyID{rule.KeyName, rule.KeyVersion, rule.Algorithm}
 		keyIndex, exists := keyIndices[keyID]
 		if !exists {
-			masterKey, err := provider.GetKey(rule.KeyName, rule.KeyVersion)
-			if err != nil {
-				return nil, nil, fileEncryption{}, fmt.Errorf("resolve ORC master key %q version %d: %w", rule.KeyName, rule.KeyVersion, err)
-			}
-			if err := validateMasterKey(masterKey, rule.Algorithm); err != nil {
-				return nil, nil, fileEncryption{}, fmt.Errorf("ORC master key %q version %d: %w", rule.KeyName, rule.KeyVersion, err)
+			if provider != nil {
+				masterKey, err := provider.GetKey(rule.KeyName, rule.KeyVersion)
+				if err != nil {
+					return nil, nil, fileEncryption{}, fmt.Errorf("resolve ORC master key %q version %d: %w", rule.KeyName, rule.KeyVersion, err)
+				}
+				if err := validateMasterKey(masterKey, rule.Algorithm); err != nil {
+					return nil, nil, fileEncryption{}, fmt.Errorf("ORC master key %q version %d: %w", rule.KeyName, rule.KeyVersion, err)
+				}
+				masterKeys[keyID] = append([]byte(nil), masterKey...)
 			}
 			if uint64(len(file.keys)) > mathMaxUint32 {
 				return nil, nil, fileEncryption{}, fmt.Errorf("ORC encryption key index overflows uint32")
 			}
 			keyIndex = uint32(len(file.keys))
 			keyIndices[keyID] = keyIndex
-			masterKeys[keyID] = append([]byte(nil), masterKey...)
 			file.keys = append(file.keys, encryptionKeyDescription{
 				name:      rule.KeyName,
 				version:   rule.KeyVersion,
 				algorithm: rule.Algorithm,
 			})
 		}
-		encryptedKey, localKey, err := wrapLocalKey(masterKeys[keyID], rule.Algorithm)
+		var encryptedKey, localKey []byte
+		if encryptionProvider != nil {
+			localKey, encryptedKey, err = encryptionProvider.GenerateLocalKey(rule.KeyName, rule.KeyVersion, rule.Algorithm)
+			if err != nil {
+				return nil, nil, fileEncryption{}, fmt.Errorf("generate ORC local key for column %q: %w", rule.Column, err)
+			}
+			if err := validateLocalKey(localKey, rule.Algorithm); err != nil {
+				return nil, nil, fileEncryption{}, fmt.Errorf("ORC local key for column %q: %w", rule.Column, err)
+			}
+			if err := validateEncryptedLocalKey(uint32(providerKind), rule.Algorithm, encryptedKey); err != nil {
+				return nil, nil, fileEncryption{}, fmt.Errorf("ORC encrypted local key for column %q: %w", rule.Column, err)
+			}
+		} else {
+			encryptedKey, localKey, err = wrapLocalKey(masterKeys[keyID], rule.Algorithm)
+		}
 		if err != nil {
 			return nil, nil, fileEncryption{}, fmt.Errorf("wrap ORC local key for column %q: %w", rule.Column, err)
 		}
+		encryptedKey = append([]byte(nil), encryptedKey...)
+		localKey = append([]byte(nil), localKey...)
 		variantIndex := len(variants)
 		for id := uint32(root); id <= last; id++ {
 			columnVariants[id] = variantIndex
@@ -303,6 +377,94 @@ func validateMasterKey(key []byte, algorithm EncryptionAlgorithm) error {
 		return fmt.Errorf("ORC master key must be a valid AES key: %w", err)
 	}
 	return nil
+}
+
+func validateLocalKey(key []byte, algorithm EncryptionAlgorithm) error {
+	keyLength, err := encryptionKeyLength(algorithm)
+	if err != nil {
+		return err
+	}
+	if len(key) != keyLength {
+		return fmt.Errorf("ORC local key has %d bytes, want %d for algorithm %d", len(key), keyLength, algorithm)
+	}
+	if _, err := aes.NewCipher(key); err != nil {
+		return fmt.Errorf("ORC local key must be a valid AES key: %w", err)
+	}
+	return nil
+}
+
+func isSupportedKeyProviderKind(kind KeyProviderKind) bool {
+	return kind >= KeyProviderKindHadoop && kind <= KeyProviderKindAzure
+}
+
+func isNilProvider(provider any) bool {
+	if provider == nil {
+		return true
+	}
+	value := reflect.ValueOf(provider)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func validateEncryptedLocalKey(providerKind uint32, algorithm EncryptionAlgorithm, encryptedKey []byte) error {
+	if len(encryptedKey) == 0 {
+		return fmt.Errorf("ORC encrypted local key is empty")
+	}
+	if providerKind != uint32(KeyProviderKindHadoop) {
+		return nil
+	}
+	keyLength, err := encryptionKeyLength(algorithm)
+	if err != nil {
+		// Let a keyless reader use the masked variant for a future algorithm.
+		if errors.Is(err, ErrUnsupportedEncryption) {
+			return nil
+		}
+		return err
+	}
+	if len(encryptedKey) != keyLength {
+		return fmt.Errorf("Hadoop encrypted ORC local key has %d bytes, want %d", len(encryptedKey), keyLength)
+	}
+	return nil
+}
+
+func (r *Reader) decryptLocalKey(description encryptionKeyDescription, encryptedKey []byte) ([]byte, bool, error) {
+	providerKind := KeyProviderKind(r.footer.encryption.keyProvider)
+	if provider := r.options.EncryptionKeyProvider; !isNilProvider(provider) && provider.Kind() == providerKind && isSupportedKeyProviderKind(providerKind) {
+		localKey, err := provider.DecryptLocalKey(description.name, description.version, description.algorithm, encryptedKey)
+		if errors.Is(err, ErrKeyUnavailable) || (err == nil && len(localKey) == 0) {
+			if providerKind != KeyProviderKindHadoop || isNilProvider(r.options.KeyProvider) {
+				return nil, true, nil
+			}
+		} else if err != nil {
+			return nil, false, fmt.Errorf("decrypt ORC local key %q version %d: %w", description.name, description.version, err)
+		} else {
+			if err := validateLocalKey(localKey, description.algorithm); err != nil {
+				return nil, false, err
+			}
+			return append([]byte(nil), localKey...), false, nil
+		}
+	}
+
+	if providerKind == KeyProviderKindHadoop && !isNilProvider(r.options.KeyProvider) {
+		masterKey, err := r.options.KeyProvider.GetKey(description.name, description.version)
+		if errors.Is(err, ErrKeyUnavailable) || (err == nil && len(masterKey) == 0) {
+			return nil, true, nil
+		}
+		if err != nil {
+			return nil, false, fmt.Errorf("resolve ORC master key %q version %d: %w", description.name, description.version, err)
+		}
+		localKey, err := unwrapLocalKey(masterKey, description.algorithm, encryptedKey)
+		if err != nil {
+			return nil, false, fmt.Errorf("unwrap ORC local key: %w", err)
+		}
+		return localKey, false, nil
+	}
+
+	return nil, true, nil
 }
 
 // wrapLocalKey follows the Hadoop ORC key-provider representation: the
@@ -424,12 +586,8 @@ func parseFileEncryption(data []byte) (fileEncryption, error) {
 		if uint64(variant.key) >= uint64(len(result.keys)) {
 			return fileEncryption{}, fmt.Errorf("ORC encryption variant %d refers to missing key %d", i, variant.key)
 		}
-		keyLength, err := encryptionKeyLength(result.keys[variant.key].algorithm)
-		if err != nil {
-			return fileEncryption{}, err
-		}
-		if len(variant.encryptedKey) != keyLength {
-			return fileEncryption{}, fmt.Errorf("ORC encryption variant %d has an encrypted key of %d bytes, want %d", i, len(variant.encryptedKey), keyLength)
+		if err := validateEncryptedLocalKey(result.keyProvider, result.keys[variant.key].algorithm, variant.encryptedKey); err != nil {
+			return fileEncryption{}, fmt.Errorf("ORC encryption variant %d: %w", i, err)
 		}
 	}
 	return result, nil
@@ -590,6 +748,12 @@ func validateFileEncryption(encryption *fileEncryption, types []Type, stripes []
 	}
 	variantRanges := make([][2]uint32, 0, len(encryption.variants))
 	for i, variant := range encryption.variants {
+		if uint64(variant.key) >= uint64(len(encryption.keys)) {
+			return fmt.Errorf("ORC encryption variant %d refers to missing key %d", i, variant.key)
+		}
+		if err := validateEncryptedLocalKey(encryption.keyProvider, encryption.keys[variant.key].algorithm, variant.encryptedKey); err != nil {
+			return fmt.Errorf("ORC encryption variant %d: %w", i, err)
+		}
 		if uint64(variant.root) >= uint64(len(types)) {
 			return fmt.Errorf("ORC encryption variant %d refers to missing root column %d", i, variant.root)
 		}
@@ -633,9 +797,8 @@ func validateFileEncryption(encryption *fileEncryption, types []Type, stripes []
 		}
 		for keyIndex, encryptedKey := range keys {
 			algorithm := encryption.keys[encryption.variants[keyIndex].key].algorithm
-			keyLength, _ := encryptionKeyLength(algorithm)
-			if len(encryptedKey) != keyLength {
-				return fmt.Errorf("stripe %d encrypted local key %d has %d bytes, want %d", i, keyIndex, len(encryptedKey), keyLength)
+			if err := validateEncryptedLocalKey(encryption.keyProvider, algorithm, encryptedKey); err != nil {
+				return fmt.Errorf("stripe %d encrypted local key %d: %w", i, keyIndex, err)
 			}
 		}
 	}

@@ -58,8 +58,11 @@ type WriterOptions struct {
 	LegacyBloomFilterEncoding bool
 	// EncryptColumns encrypts each named root field and its type subtree.
 	EncryptColumns []EncryptionRule
-	// KeyProvider supplies the master keys named by EncryptColumns.
+	// KeyProvider supplies Hadoop master keys named by EncryptColumns.
 	KeyProvider KeyProvider
+	// EncryptionKeyProvider wraps local keys using a provider-specific format,
+	// such as an external KMS integration. Set this instead of KeyProvider.
+	EncryptionKeyProvider EncryptionKeyProvider
 }
 
 // Writer writes ORC files for root STRUCT schemas with primitive or nested columns.
@@ -229,7 +232,7 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 	} else if options.BloomFilterFPP != 0 {
 		return nil, errors.New("ORC bloom-filter false-positive probability requires at least one bloom-filter column")
 	}
-	encryption, encryptionFor, fileEncryption, err := prepareWriterEncryption(types, columnByName, options.EncryptColumns, options.KeyProvider)
+	encryption, encryptionFor, fileEncryption, err := prepareWriterEncryption(types, columnByName, options.EncryptColumns, options.KeyProvider, options.EncryptionKeyProvider)
 	if err != nil {
 		return nil, err
 	}

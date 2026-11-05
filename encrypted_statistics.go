@@ -34,28 +34,17 @@ func (r *Reader) EncryptionStatistics(column string) (ColumnEncryptionStatistics
 	if variantIndex < 0 {
 		return ColumnEncryptionStatistics{}, fmt.Errorf("column %q: %w", column, ErrColumnNotEncrypted)
 	}
-	if r.footer.encryption.keyProvider != 1 {
-		return ColumnEncryptionStatistics{}, fmt.Errorf("%w: key provider kind %d", ErrUnsupportedEncryption, r.footer.encryption.keyProvider)
-	}
-	if r.options.KeyProvider == nil {
-		return ColumnEncryptionStatistics{}, ErrKeyUnavailable
-	}
-
 	variant := r.footer.encryption.variants[variantIndex]
 	if int(variant.key) >= len(r.footer.encryption.keys) {
 		return ColumnEncryptionStatistics{}, fmt.Errorf("%w: encrypted column %d references missing key %d", ErrInvalidFile, root, variant.key)
 	}
 	keyDescription := r.footer.encryption.keys[variant.key]
-	masterKey, err := r.options.KeyProvider.GetKey(keyDescription.name, keyDescription.version)
+	localKey, unavailable, err := r.decryptLocalKey(keyDescription, variant.encryptedKey)
 	if err != nil {
-		return ColumnEncryptionStatistics{}, fmt.Errorf("resolve ORC master key %q version %d: %w", keyDescription.name, keyDescription.version, err)
+		return ColumnEncryptionStatistics{}, fmt.Errorf("resolve key for encrypted column %d: %w", root, err)
 	}
-	if len(masterKey) == 0 {
+	if unavailable {
 		return ColumnEncryptionStatistics{}, ErrKeyUnavailable
-	}
-	localKey, err := unwrapLocalKey(masterKey, keyDescription.algorithm, variant.encryptedKey)
-	if err != nil {
-		return ColumnEncryptionStatistics{}, fmt.Errorf("unwrap ORC local key for column %d: %w", root, err)
 	}
 
 	last, err := contiguousEncryptionSubtreeLastColumn(r.footer.types, root)

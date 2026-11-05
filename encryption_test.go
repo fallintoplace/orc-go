@@ -2,12 +2,273 @@ package orc
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"errors"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+type testEncryptionKeyProvider struct {
+	kind        KeyProviderKind
+	wrappingKey []byte
+	unavailable bool
+}
+
+func (p *testEncryptionKeyProvider) Kind() KeyProviderKind {
+	return p.kind
+}
+
+func (p *testEncryptionKeyProvider) GenerateLocalKey(_ string, _ uint32, algorithm EncryptionAlgorithm) ([]byte, []byte, error) {
+	keyLength, err := encryptionKeyLength(algorithm)
+	if err != nil {
+		return nil, nil, err
+	}
+	localKey := make([]byte, keyLength)
+	if _, err := rand.Read(localKey); err != nil {
+		return nil, nil, err
+	}
+	block, err := aes.NewCipher(p.wrappingKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, nil, err
+	}
+	encrypted := gcm.Seal(nonce, nonce, localKey, nil)
+	return localKey, encrypted, nil
+}
+
+func (p *testEncryptionKeyProvider) DecryptLocalKey(_ string, _ uint32, _ EncryptionAlgorithm, encrypted []byte) ([]byte, error) {
+	if p.unavailable {
+		return nil, ErrKeyUnavailable
+	}
+	block, err := aes.NewCipher(p.wrappingKey)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	if len(encrypted) < gcm.NonceSize() {
+		return nil, errors.New("test encrypted key is too short")
+	}
+	nonce := encrypted[:gcm.NonceSize()]
+	return gcm.Open(nil, nonce, encrypted[gcm.NonceSize():], nil)
+}
+
+func TestEncryptionKeyProviderRoundTripAndMaskedFallback(t *testing.T) {
+	schema := []Type{
+		{Kind: TypeKindStruct, Subtypes: []uint32{1, 2}, FieldNames: []string{"secret", "clear"}},
+		{Kind: TypeKindString},
+		{Kind: TypeKindLong},
+	}
+	rows := []Row{{"secret": "private", "clear": int64(12)}, {"secret": nil, "clear": int64(13)}}
+	wantMasked := []Row{{"secret": nil, "clear": int64(12)}, {"secret": nil, "clear": int64(13)}}
+	for _, kind := range []KeyProviderKind{KeyProviderKindAWS, KeyProviderKindGCP, KeyProviderKindAzure} {
+		for _, algorithm := range []struct {
+			name string
+			kind EncryptionAlgorithm
+		}{{"aes-128", EncryptionAESCTR128}, {"aes-256", EncryptionAESCTR256}} {
+			providerName := map[KeyProviderKind]string{KeyProviderKindAWS: "aws", KeyProviderKindGCP: "gcp", KeyProviderKindAzure: "azure"}[kind]
+			t.Run(providerName+"/"+algorithm.name, func(t *testing.T) {
+				provider := &testEncryptionKeyProvider{kind: kind, wrappingKey: bytes.Repeat([]byte{0x71}, 32)}
+				rule := []EncryptionRule{{Column: "secret", KeyName: "kms-key", KeyVersion: 4, Algorithm: algorithm.kind}}
+				var output bytes.Buffer
+				writer, err := NewWriter(&output, schema, WriterOptions{
+					EncryptColumns:        rule,
+					EncryptionKeyProvider: provider,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, row := range rows {
+					if err := writer.WriteRow(row); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := writer.Close(); err != nil {
+					t.Fatal(err)
+				}
+
+				reader, err := NewReaderWithOptions(bytes.NewReader(output.Bytes()), int64(output.Len()), ReaderOptions{EncryptionKeyProvider: provider})
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := reader.ReadAll()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(got, rows) {
+					t.Fatalf("ReadAll() = %#v, want %#v", got, rows)
+				}
+				statistics, err := reader.EncryptionStatistics("secret")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(statistics.File) != 1 || statistics.File[0].NumberOfValues != 1 || statistics.File[0].String == nil || statistics.File[0].String.Minimum != "private" {
+					t.Fatalf("EncryptionStatistics(secret) = %+v", statistics)
+				}
+				variant := reader.footer.encryption.variants[0]
+				if reader.footer.encryption.keyProvider != uint32(kind) || len(variant.encryptedKey) <= 16 {
+					t.Fatalf("provider kind/blob = %d/%d bytes, want %d and opaque KMS bytes", reader.footer.encryption.keyProvider, len(variant.encryptedKey), kind)
+				}
+
+				unavailable := &testEncryptionKeyProvider{kind: kind, unavailable: true}
+				for _, options := range []ReaderOptions{
+					{},
+					{EncryptionKeyProvider: (*testEncryptionKeyProvider)(nil)},
+					{EncryptionKeyProvider: unavailable},
+					{KeyProvider: KeyProviderFunc(func(string, uint32) ([]byte, error) { return nil, ErrKeyUnavailable })},
+				} {
+					keyless, err := NewReaderWithOptions(bytes.NewReader(output.Bytes()), int64(output.Len()), options)
+					if err != nil {
+						t.Fatal(err)
+					}
+					masked, err := keyless.ReadAll()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(masked, wantMasked) {
+						t.Fatalf("keyless ReadAll() = %#v, want %#v", masked, wantMasked)
+					}
+					if _, err := keyless.EncryptionStatistics("secret"); !errors.Is(err, ErrKeyUnavailable) {
+						t.Fatalf("keyless EncryptionStatistics(secret) error = %v, want ErrKeyUnavailable", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestEncryptedWriterRejectsInvalidKeyProviderOptions(t *testing.T) {
+	schema := []Type{
+		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"secret"}},
+		{Kind: TypeKindString},
+	}
+	rule := []EncryptionRule{{Column: "secret", KeyName: "kms-key", KeyVersion: 1, Algorithm: EncryptionAESCTR128}}
+	masterProvider := KeyProviderFunc(func(string, uint32) ([]byte, error) { return bytes.Repeat([]byte{1}, 16), nil })
+	tests := []struct {
+		name    string
+		options WriterOptions
+	}{
+		{
+			name: "both provider interfaces",
+			options: WriterOptions{
+				EncryptColumns: rule, KeyProvider: masterProvider,
+				EncryptionKeyProvider: &testEncryptionKeyProvider{kind: KeyProviderKindAWS, wrappingKey: bytes.Repeat([]byte{2}, 32)},
+			},
+		},
+		{
+			name: "typed nil custom provider",
+			options: WriterOptions{
+				EncryptColumns:        rule,
+				EncryptionKeyProvider: (*testEncryptionKeyProvider)(nil),
+			},
+		},
+		{
+			name: "unknown provider kind",
+			options: WriterOptions{
+				EncryptColumns:        rule,
+				EncryptionKeyProvider: &testEncryptionKeyProvider{kind: KeyProviderKindUnknown, wrappingKey: bytes.Repeat([]byte{2}, 32)},
+			},
+		},
+		{
+			name: "invalid custom local key",
+			options: WriterOptions{
+				EncryptColumns: rule,
+				EncryptionKeyProvider: fixedEncryptionKeyProvider{
+					kind: KeyProviderKindAWS, local: []byte{1}, encrypted: []byte{2},
+				},
+			},
+		},
+		{
+			name: "invalid custom Hadoop wrapped key",
+			options: WriterOptions{
+				EncryptColumns: rule,
+				EncryptionKeyProvider: fixedEncryptionKeyProvider{
+					kind: KeyProviderKindHadoop, local: bytes.Repeat([]byte{1}, 16), encrypted: []byte{2},
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := NewWriter(&bytes.Buffer{}, schema, test.options); err == nil {
+				t.Fatal("NewWriter() succeeded for invalid encryption options")
+			}
+		})
+	}
+}
+
+type fixedEncryptionKeyProvider struct {
+	kind      KeyProviderKind
+	local     []byte
+	encrypted []byte
+}
+
+func (p fixedEncryptionKeyProvider) Kind() KeyProviderKind { return p.kind }
+
+func (p fixedEncryptionKeyProvider) GenerateLocalKey(string, uint32, EncryptionAlgorithm) ([]byte, []byte, error) {
+	return p.local, p.encrypted, nil
+}
+
+func (p fixedEncryptionKeyProvider) DecryptLocalKey(string, uint32, EncryptionAlgorithm, []byte) ([]byte, error) {
+	return p.local, nil
+}
+
+func TestValidateFileEncryptionRejectsMissingKeyReference(t *testing.T) {
+	types := []Type{
+		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"secret"}},
+		{Kind: TypeKindString},
+	}
+	encryption := &fileEncryption{
+		keyProvider: uint32(KeyProviderKindHadoop),
+		keys:        []encryptionKeyDescription{{algorithm: EncryptionAESCTR128}},
+		variants: []fileEncryptionVariant{{
+			root: 1, key: 1, encryptedKey: bytes.Repeat([]byte{1}, 16),
+		}},
+	}
+	if err := validateFileEncryption(encryption, types, nil, nil); err == nil {
+		t.Fatal("validateFileEncryption() accepted a variant with a missing key")
+	}
+}
+
+func TestValidateEncryptedLocalKeyUsesProviderFormat(t *testing.T) {
+	tests := []struct {
+		name         string
+		providerKind uint32
+		algorithm    EncryptionAlgorithm
+		key          []byte
+		wantErr      bool
+	}{
+		{name: "hadoop 128 bit", providerKind: uint32(KeyProviderKindHadoop), algorithm: EncryptionAESCTR128, key: bytes.Repeat([]byte{1}, 16)},
+		{name: "hadoop wrong size", providerKind: uint32(KeyProviderKindHadoop), algorithm: EncryptionAESCTR128, key: bytes.Repeat([]byte{1}, 32), wantErr: true},
+		{name: "cloud key blob", providerKind: uint32(KeyProviderKindAWS), algorithm: EncryptionAESCTR128, key: bytes.Repeat([]byte{1}, 40)},
+		{name: "unknown future provider", providerKind: 99, algorithm: EncryptionAESCTR256, key: []byte{1}},
+		{name: "empty opaque key", providerKind: uint32(KeyProviderKindGCP), algorithm: EncryptionAESCTR128, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateEncryptedLocalKey(test.providerKind, test.algorithm, test.key)
+			if test.wantErr && err == nil {
+				t.Fatal("validateEncryptedLocalKey() succeeded, want error")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("validateEncryptedLocalKey() error = %v", err)
+			}
+		})
+	}
+}
 
 func TestReadsApacheORCEncryptedFixture(t *testing.T) {
 	data, err := os.ReadFile("testdata/apache-encrypted.orc")
@@ -148,6 +409,20 @@ func TestEncryptedColumnRoundTrip(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, rows) {
 				t.Fatalf("ReadAll() = %#v, want %#v", got, rows)
+			}
+			fallbackReader, err := NewReaderWithOptions(bytes.NewReader(output.Bytes()), int64(output.Len()), ReaderOptions{
+				KeyProvider:           keyProvider,
+				EncryptionKeyProvider: &testEncryptionKeyProvider{kind: KeyProviderKindHadoop, unavailable: true},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fallbackRows, err := fallbackReader.ReadAll()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(fallbackRows, rows) {
+				t.Fatalf("fallback reader ReadAll() = %#v, want %#v", fallbackRows, rows)
 			}
 			secretStatistics, err := reader.EncryptionStatistics("secret")
 			if err != nil {
