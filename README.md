@@ -15,6 +15,7 @@ The project is under development, so its API may change. It requires Go 1.22 or 
 - [Compression and writer options](#compression-and-writer-options)
 - [Inspect a file](#inspect-a-file)
 - [Encrypt columns](#encrypt-columns)
+- [Interoperability checks](#interoperability-checks)
 - [License](#license)
 
 ## Install
@@ -213,6 +214,14 @@ reader, err := orc.OpenWithOptions(path, orc.ReaderOptions{KeyProvider: keys})
 Without a key, the reader returns fallback data for encrypted columns. This writer uses nulls as fallback data, so file and stripe statistics reflect those nulls. With a key, `EncryptionStatistics("email")` returns statistics for the encrypted field and its nested fields. The reader also uses encrypted row indexes and bloom filters when present. User metadata is not encrypted.
 
 AES-CTR does not detect tampering. Verify file integrity separately if you need tamper detection.
+
+## Interoperability checks
+
+Run the optional cross-implementation check with [PyArrow and Apache ORC Java](interop/README.md):
+
+```sh
+./interop/check-writer.sh
+```
 
 ## License
 

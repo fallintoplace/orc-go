@@ -1,0 +1,44 @@
+name: ORC interoperability
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  orc-interop:
+    name: Reader and writer interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Check Go reader interoperability
+        run: go test ./... -count=1
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: interop/pyarrow/requirements.txt
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: interop/java/pom.xml
+
+      - name: Install PyArrow
+        run: python3 -m pip install -r interop/pyarrow/requirements.txt
+
+      - name: Check Go writer interoperability
+        run: ./interop/check-writer.sh
