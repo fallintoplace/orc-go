@@ -49,15 +49,20 @@ type DoubleStatistics struct {
 	HasSum     bool
 }
 
-// StringStatistics describes string-like columns. Sum is the total UTF-8
-// byte length of the values, as stored by ORC.
+// StringStatistics describes string-like columns. HasMinimum and HasMaximum
+// are false when ORC stores only a truncated bound. Sum is the total UTF-8 byte
+// length of the values, as stored by ORC.
 type StringStatistics struct {
-	Minimum    string
-	HasMinimum bool
-	Maximum    string
-	HasMaximum bool
-	Sum        int64
-	HasSum     bool
+	Minimum       string
+	HasMinimum    bool
+	Maximum       string
+	HasMaximum    bool
+	LowerBound    string
+	HasLowerBound bool
+	UpperBound    string
+	HasUpperBound bool
+	Sum           int64
+	HasSum        bool
 }
 
 // BucketStatistics contains the counts for boolean values, in false/true order.
@@ -275,6 +280,12 @@ func parseStringStatistics(data []byte) (StringStatistics, error) {
 		case 3:
 			result.Sum, err = fieldSInt64(field)
 			result.HasSum = err == nil
+		case 4:
+			result.LowerBound, err = fieldString(field)
+			result.HasLowerBound = err == nil
+		case 5:
+			result.UpperBound, err = fieldString(field)
+			result.HasUpperBound = err == nil
 		}
 		if err != nil {
 			return StringStatistics{}, err
