@@ -196,6 +196,13 @@ func TestWriterRejectsBadRowsAndClosedWrites(t *testing.T) {
 	}
 	if err := writer.WriteRow(Row{"unknown": int64(1)}); err == nil {
 		t.Fatal("WriteRow() accepted an unknown field")
+	} else if err.Error() != `unknown ORC field "unknown"` {
+		t.Fatalf("WriteRow() unknown-field error = %q, want root field error", err)
+	}
+	if err := writer.WriteValue(Row{"unknown": int64(1)}); err == nil {
+		t.Fatal("WriteValue() accepted an unknown root field")
+	} else if err.Error() != `unknown ORC field "unknown"` {
+		t.Fatalf("WriteValue() unknown-field error = %q, want root field error", err)
 	}
 	valid := Row{"tiny": int8(4)}
 	if err := writer.WriteRow(valid); err != nil {
