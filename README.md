@@ -159,7 +159,7 @@ A stripe is a group of rows stored together in an ORC file. These options contro
 
 ## Inspect a file
 
-Use `Reader` to inspect a file without reading all of its values. It exposes the schema, type attributes, stripe locations, row and stripe counts, file and stripe statistics, row indexes, bloom-filter indexes, and user metadata. `WriterMetadata()` reports the writer ID and version in the footer. `EncryptionMasks()` returns the stored fallback masks. Use `AddUserMetadata(name, value)` to add application-defined metadata when writing.
+Use `Reader` to inspect a file without reading all of its values. It exposes the schema, type attributes, stripe locations, row and stripe counts, file and stripe statistics, row indexes, bloom-filter indexes, and user metadata. `WriterMetadata()` reports the writer ID, PostScript writer version, and footer software version when present. `EncryptionMasks()` returns the stored fallback masks. Use `AddUserMetadata(name, value)` to add application-defined metadata when writing.
 
 String statistics include exact minimum and maximum values when available. For long strings, they can include lower and upper bounds instead. LIST and MAP statistics report child counts, and geospatial statistics include bounding boxes and WKB type codes when the file stores them.
 
