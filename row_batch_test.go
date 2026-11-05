@@ -152,6 +152,11 @@ func TestReadRowBatchesAcrossStripes(t *testing.T) {
 		t.Fatalf("first stripe IsNull(1) = (%t, %t), want (true, true)", isNull, ok)
 	}
 	for batchIndex, batch := range batches {
+		if batchIndex > 0 {
+			if isNull, ok := batch.IsNull(0); !ok || isNull {
+				t.Fatalf("all-present batch %d IsNull(0) = (%t, %t), want (false, true)", batchIndex, isNull, ok)
+			}
+		}
 		for rowIndex := 0; rowIndex < batch.Len(); rowIndex++ {
 			if isNull, _ := batch.IsNull(rowIndex); isNull {
 				continue
