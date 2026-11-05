@@ -50,6 +50,7 @@ type Type struct {
 	Attributes []TypeAttribute
 	// MaxLength limits CHAR and VARCHAR values in Unicode code points.
 	MaxLength uint32
+	// Precision and Scale may both be zero for legacy variable-scale DECIMAL.
 	Precision uint32
 	Scale     uint32
 }

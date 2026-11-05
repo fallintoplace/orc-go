@@ -104,7 +104,9 @@ row := orc.Row{
 }
 ```
 
-`[]orc.MapEntry` supports map keys of any ORC type. For DECIMAL columns, set `Precision` and `Scale` in the schema and pass `orc.Decimal` values; values are rescaled without rounding.
+`[]orc.MapEntry` supports map keys of any ORC type.
+
+For `DECIMAL`, pass `orc.Decimal` values. Set `Precision` and `Scale` for fixed-scale columns; the legacy zero/zero schema keeps each value's scale and has no precision limit. Fixed-scale values are rescaled without rounding.
 
 DATE uses the calendar date from the input `time.Time` and returns dates in UTC. TIMESTAMP keeps the calendar and clock fields using the stripe's writer timezone. TIMESTAMP_INSTANT keeps the instant. CHAR values are truncated and padded when written, then trailing spaces are removed when read. VARCHAR values are truncated when written. CHAR and VARCHAR lengths count Unicode code points.
 

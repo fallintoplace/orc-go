@@ -75,6 +75,13 @@ func decimalForType(value Decimal, precision, scale uint32) (encodedDecimal, err
 	if err != nil {
 		return encodedDecimal{}, err
 	}
+	if precision == 0 && scale == 0 {
+		// Legacy DECIMAL stores the scale beside each value in the SECONDARY stream.
+		if inputScale > maxDecimalScaleExpansion {
+			return encodedDecimal{}, fmt.Errorf("decimal scale %d exceeds the formatting limit", inputScale)
+		}
+		return encodedDecimal{coefficient: coefficient, scale: inputScale}, nil
+	}
 	wantScale := int64(scale)
 	if inputScale > wantScale {
 		factor := decimalPowerOfTen(inputScale - wantScale)
@@ -87,8 +94,10 @@ func decimalForType(value Decimal, precision, scale uint32) (encodedDecimal, err
 	} else if inputScale < wantScale {
 		coefficient.Mul(coefficient, decimalPowerOfTen(wantScale-inputScale))
 	}
-	if digits := decimalPrecision(coefficient); digits > int(precision) {
-		return encodedDecimal{}, fmt.Errorf("decimal %q has precision %d after conversion, column allows %d", value, digits, precision)
+	if precision > 0 {
+		if digits := decimalPrecision(coefficient); digits > int(precision) {
+			return encodedDecimal{}, fmt.Errorf("decimal %q has precision %d after conversion, column allows %d", value, digits, precision)
+		}
 	}
 	return encodedDecimal{coefficient: coefficient, scale: int64(scale)}, nil
 }
@@ -126,6 +135,65 @@ func formatDecimal(coefficient *big.Int, scale int64) (string, error) {
 		digits = "-" + digits
 	}
 	return digits, nil
+}
+
+func decimalCoefficientAtScale(coefficient *big.Int, valueScale, targetScale int64) (*big.Int, error) {
+	if valueScale < 0 || targetScale < valueScale || targetScale > maxDecimalScaleExpansion {
+		return nil, fmt.Errorf("cannot rescale decimal from scale %d to %d", valueScale, targetScale)
+	}
+	result := new(big.Int).Set(coefficient)
+	if targetScale > valueScale {
+		result.Mul(result, decimalPowerOfTen(targetScale-valueScale))
+	}
+	return result, nil
+}
+
+func compareDecimalNumbers(left, right string) (int, error) {
+	leftCoefficient, leftScale, err := parseDecimal(left)
+	if err != nil {
+		return 0, err
+	}
+	rightCoefficient, rightScale, err := parseDecimal(right)
+	if err != nil {
+		return 0, err
+	}
+	commonScale := leftScale
+	if rightScale > commonScale {
+		commonScale = rightScale
+	}
+	leftCoefficient, err = decimalCoefficientAtScale(leftCoefficient, leftScale, commonScale)
+	if err != nil {
+		return 0, err
+	}
+	rightCoefficient, err = decimalCoefficientAtScale(rightCoefficient, rightScale, commonScale)
+	if err != nil {
+		return 0, err
+	}
+	return leftCoefficient.Cmp(rightCoefficient), nil
+}
+
+func addDecimalNumbers(left, right string) (string, error) {
+	leftCoefficient, leftScale, err := parseDecimal(left)
+	if err != nil {
+		return "", err
+	}
+	rightCoefficient, rightScale, err := parseDecimal(right)
+	if err != nil {
+		return "", err
+	}
+	commonScale := leftScale
+	if rightScale > commonScale {
+		commonScale = rightScale
+	}
+	leftCoefficient, err = decimalCoefficientAtScale(leftCoefficient, leftScale, commonScale)
+	if err != nil {
+		return "", err
+	}
+	rightCoefficient, err = decimalCoefficientAtScale(rightCoefficient, rightScale, commonScale)
+	if err != nil {
+		return "", err
+	}
+	return formatDecimal(leftCoefficient.Add(leftCoefficient, rightCoefficient), commonScale)
 }
 
 func encodeBigInteger(coefficient *big.Int) []byte {
