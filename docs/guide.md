@@ -88,8 +88,11 @@ use a dictionary in each stripe. BINARY columns use direct encoding.
 ORC stores rows in groups called stripes. The writer options control how it
 creates them:
 
-- `MaxRowsPerStripe` starts a new stripe after the chosen number of rows.
-  Zero writes all rows in one stripe when `Close` is called.
+- `MaxBufferedBytes` starts a new stripe when the writer's estimated value
+  buffers reach the chosen size. The default is 16 MiB. This is an estimate,
+  and one row can be larger than the limit.
+- `MaxRowsPerStripe` also starts a new stripe after the chosen number of rows.
+  Zero means there is no row-count limit; the byte limit still applies.
 - `RowIndexStride` sets the maximum rows covered by each row-index entry. The
   default is 10,000; values below 1,000 are not supported.
 - `DisableRowIndexes` omits row indexes. Bloom filters need row indexes.

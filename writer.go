@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"sort"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -22,6 +23,12 @@ import (
 )
 
 const maxEncodedChunkLength = (1 << 23) - 1
+
+const (
+	defaultMaxBufferedBytes       = 16 << 20
+	bufferedValueOverheadEstimate = 32
+	maxPendingReuseCapacity       = 256
+)
 
 // ErrWriterClosed is returned when a writer operation is called after Close.
 var ErrWriterClosed = errors.New("ORC writer is closed")
@@ -39,8 +46,11 @@ type WriterOptions struct {
 	UseRLEv2 bool
 	// UseDictionary writes STRING, CHAR, and VARCHAR values using a per-stripe dictionary.
 	UseDictionary bool
-	// MaxRowsPerStripe flushes a stripe after this many rows. Zero writes all rows
-	// as one stripe when Close is called.
+	// MaxBufferedBytes sets the approximate value-buffer limit for a stripe.
+	// Zero uses 16 MiB. A single row can exceed the limit.
+	MaxBufferedBytes uint64
+	// MaxRowsPerStripe also flushes a stripe after this many rows. Zero imposes
+	// no row-count limit; MaxBufferedBytes still applies.
 	MaxRowsPerStripe uint64
 	// RowIndexStride sets the maximum rows per row-index entry. Zero uses the
 	// ORC default of 10,000 rows. Values below 1,000 are not supported.
@@ -76,7 +86,10 @@ type Writer struct {
 	types              []Type
 	columns            []writerColumn
 	columnByName       map[string]int
+	structFieldNames   []map[string]struct{}
 	options            WriterOptions
+	pending            [][]any
+	valuePath          []writerPathSegment
 	bloomFilterColumns map[uint32]bool
 	bloomFilterFPP     float64
 	encryption         []writerEncryptionVariant
@@ -84,6 +97,7 @@ type Writer struct {
 	fileEncryption     fileEncryption
 	rowCount           uint64
 	stripeRows         uint64
+	bufferedBytes      uint64
 	rowIndexStride     uint64
 	rowsInRowGroup     uint64
 	rowGroupRows       []uint64
@@ -96,6 +110,21 @@ type Writer struct {
 	writeErr           error
 	closed             bool
 	closeErr           error
+}
+
+type writerPathKind uint8
+
+const (
+	writerPathRoot writerPathKind = iota
+	writerPathField
+	writerPathIndex
+	writerPathUnionTag
+)
+
+type writerPathSegment struct {
+	kind  writerPathKind
+	name  string
+	index int
 }
 
 type writerColumn struct {
@@ -124,6 +153,9 @@ type writerStream struct {
 func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Writer, error) {
 	if destination == nil {
 		return nil, errors.New("ORC writer destination is nil")
+	}
+	if options.MaxBufferedBytes == 0 {
+		options.MaxBufferedBytes = defaultMaxBufferedBytes
 	}
 	if options.DisableRowIndexes {
 		if len(options.BloomFilterColumns) != 0 {
@@ -217,6 +249,17 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 	}
 
 	columnByName := make(map[string]int, len(root.Subtypes))
+	structFieldNames := make([]map[string]struct{}, len(types))
+	for typeID, typ := range types {
+		if typ.Kind != TypeKindStruct {
+			continue
+		}
+		fieldNames := make(map[string]struct{}, len(typ.FieldNames))
+		for _, name := range typ.FieldNames {
+			fieldNames[name] = struct{}{}
+		}
+		structFieldNames[typeID] = fieldNames
+	}
 	if root.Kind == TypeKindStruct {
 		for i, subtype := range root.Subtypes {
 			name := root.FieldNames[i]
@@ -262,13 +305,18 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 	for i := range fileStatistics {
 		fileStatistics[i] = newEmptyColumnStatistics()
 	}
+	valuePath := make([]writerPathSegment, 1, 16)
+	valuePath[0].kind = writerPathRoot
 
 	return &Writer{
 		destination:        destination,
 		types:              types,
 		columns:            columns,
 		columnByName:       columnByName,
+		structFieldNames:   structFieldNames,
 		options:            options,
+		pending:            make([][]any, len(types)),
+		valuePath:          valuePath,
 		bloomFilterColumns: bloomFilterColumns,
 		bloomFilterFPP:     options.BloomFilterFPP,
 		rowIndexStride:     options.RowIndexStride,
@@ -331,13 +379,35 @@ func (w *Writer) checkCanWriteValue() error {
 }
 
 func (w *Writer) writeValue(value any) error {
-	pending := make([][]any, len(w.columns))
-	if err := w.collectValue(0, value, "root", pending); err != nil {
+	w.valuePath = w.valuePath[:1]
+	w.valuePath[0] = writerPathSegment{kind: writerPathRoot}
+	if err := w.collectValue(0, value, &w.valuePath, w.pending); err != nil {
+		w.resetPendingValues()
+		w.valuePath = w.valuePath[:1]
 		return err
 	}
-	for id := range w.columns {
-		w.columns[id].values = append(w.columns[id].values, pending[id]...)
+	rowBufferedBytes := estimateWriterBufferedValues(w.columns, w.pending)
+	if w.stripeRows > 0 && writerBufferWouldExceed(w.bufferedBytes, rowBufferedBytes, w.options.MaxBufferedBytes) {
+		if err := w.flushStripe(); err != nil {
+			w.writeErr = err
+			w.resetPendingValues()
+			w.valuePath = w.valuePath[:1]
+			return err
+		}
 	}
+	for id, pending := range w.pending {
+		if writerColumnStoresBytes(w.columns[id].kind) {
+			for _, value := range pending {
+				// Copy byte values after flushing so a large row does not overlap
+				// with the previous stripe's retained values.
+				w.columns[id].values = append(w.columns[id].values, cloneWriterBytes(value))
+			}
+		} else {
+			w.columns[id].values = append(w.columns[id].values, pending...)
+		}
+		w.resetPendingColumn(id)
+	}
+	w.bufferedBytes = addWriterBufferEstimate(w.bufferedBytes, rowBufferedBytes)
 	w.rowCount++
 	w.stripeRows++
 	if w.rowIndexStride > 0 {
@@ -346,13 +416,89 @@ func (w *Writer) writeValue(value any) error {
 			w.recordRowGroupEnd()
 		}
 	}
-	if w.options.MaxRowsPerStripe > 0 && w.stripeRows >= w.options.MaxRowsPerStripe {
+	if (w.options.MaxRowsPerStripe > 0 && w.stripeRows >= w.options.MaxRowsPerStripe) ||
+		w.bufferedBytes >= w.options.MaxBufferedBytes {
 		if err := w.flushStripe(); err != nil {
 			w.writeErr = err
 			return err
 		}
 	}
 	return nil
+}
+
+func (w *Writer) resetPendingValues() {
+	for id := range w.pending {
+		w.resetPendingColumn(id)
+	}
+}
+
+func (w *Writer) resetPendingColumn(id int) {
+	values := w.pending[id]
+	if cap(values) > maxPendingReuseCapacity {
+		w.pending[id] = nil
+		return
+	}
+	clear(values)
+	w.pending[id] = values[:0]
+}
+
+func writerColumnStoresBytes(kind TypeKind) bool {
+	switch kind {
+	case TypeKindBinary, TypeKindGeometry, TypeKindGeography:
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneWriterBytes(value any) any {
+	if value == nil {
+		return nil
+	}
+	data := value.([]byte)
+	copied := make([]byte, len(data))
+	copy(copied, data)
+	return copied
+}
+
+func estimateWriterBufferedValues(columns []writerColumn, pending [][]any) uint64 {
+	var estimate uint64
+	for id, values := range pending {
+		kind := columns[id].kind
+		for _, value := range values {
+			estimate = addWriterBufferEstimate(estimate, bufferedValueOverheadEstimate)
+			if value == nil {
+				continue
+			}
+			switch kind {
+			case TypeKindString, TypeKindChar, TypeKindVarchar:
+				if text, ok := value.(string); ok {
+					estimate = addWriterBufferEstimate(estimate, uint64(len(text)))
+				}
+			case TypeKindBinary, TypeKindGeometry, TypeKindGeography:
+				if data, ok := value.([]byte); ok {
+					estimate = addWriterBufferEstimate(estimate, uint64(len(data)))
+				}
+			case TypeKindDecimal:
+				if decimal, ok := value.(encodedDecimal); ok && decimal.coefficient != nil {
+					coefficientBytes := uint64((decimal.coefficient.BitLen() + 7) / 8)
+					estimate = addWriterBufferEstimate(estimate, coefficientBytes)
+				}
+			}
+		}
+	}
+	return estimate
+}
+
+func addWriterBufferEstimate(current, added uint64) uint64 {
+	if math.MaxUint64-current < added {
+		return math.MaxUint64
+	}
+	return current + added
+}
+
+func writerBufferWouldExceed(current, added, limit uint64) bool {
+	return current >= limit || added > limit-current
 }
 
 // AddUserMetadata appends an application-defined key/value pair to the file
@@ -388,7 +534,7 @@ func supportsWriterType(kind TypeKind) bool {
 	}
 }
 
-func (w *Writer) collectValue(id uint32, value any, path string, pending [][]any) error {
+func (w *Writer) collectValue(id uint32, value any, path *[]writerPathSegment, pending [][]any) error {
 	typ := w.types[id]
 	if isNilValue(value) {
 		pending[id] = append(pending[id], nil)
@@ -399,21 +545,17 @@ func (w *Writer) collectValue(id uint32, value any, path string, pending [][]any
 	case TypeKindStruct:
 		fields, ok := structValues(value)
 		if !ok {
-			return fmt.Errorf("ORC field %q expects STRUCT, got %T", path, value)
-		}
-		childByName := make(map[string]int, len(typ.FieldNames))
-		for i, name := range typ.FieldNames {
-			childByName[name] = i
+			return fmt.Errorf("ORC field %q expects STRUCT, got %T", formatWriterValuePath(*path), value)
 		}
 		for name := range fields {
-			if _, exists := childByName[name]; !exists {
-				return fmt.Errorf("unknown ORC field %q.%s", path, name)
+			if _, exists := w.structFieldNames[id][name]; !exists {
+				return fmt.Errorf("unknown ORC field %q.%s", formatWriterValuePath(*path), name)
 			}
 		}
 		pending[id] = append(pending[id], struct{}{})
 		for i, subtype := range typ.Subtypes {
 			name := typ.FieldNames[i]
-			if err := w.collectValue(subtype, fields[name], path+"."+name, pending); err != nil {
+			if err := w.collectValueAt(subtype, fields[name], writerPathSegment{kind: writerPathField, name: name}, path, pending); err != nil {
 				return err
 			}
 		}
@@ -421,11 +563,11 @@ func (w *Writer) collectValue(id uint32, value any, path string, pending [][]any
 	case TypeKindList:
 		items, ok := listValues(value)
 		if !ok {
-			return fmt.Errorf("ORC field %q expects LIST, got %T", path, value)
+			return fmt.Errorf("ORC field %q expects LIST, got %T", formatWriterValuePath(*path), value)
 		}
 		pending[id] = append(pending[id], uint64(len(items)))
 		for i, item := range items {
-			if err := w.collectValue(typ.Subtypes[0], item, fmt.Sprintf("%s[%d]", path, i), pending); err != nil {
+			if err := w.collectValueAt(typ.Subtypes[0], item, writerPathSegment{kind: writerPathIndex, index: i}, path, pending); err != nil {
 				return err
 			}
 		}
@@ -433,15 +575,14 @@ func (w *Writer) collectValue(id uint32, value any, path string, pending [][]any
 	case TypeKindMap:
 		entries, ok := value.([]MapEntry)
 		if !ok {
-			return fmt.Errorf("ORC field %q expects []MapEntry, got %T", path, value)
+			return fmt.Errorf("ORC field %q expects []MapEntry, got %T", formatWriterValuePath(*path), value)
 		}
 		pending[id] = append(pending[id], uint64(len(entries)))
 		for i, entry := range entries {
-			entryPath := fmt.Sprintf("%s[%d]", path, i)
-			if err := w.collectValue(typ.Subtypes[0], entry.Key, entryPath+".key", pending); err != nil {
+			if err := w.collectMapEntryValue(typ.Subtypes[0], entry.Key, i, "key", path, pending); err != nil {
 				return err
 			}
-			if err := w.collectValue(typ.Subtypes[1], entry.Value, entryPath+".value", pending); err != nil {
+			if err := w.collectMapEntryValue(typ.Subtypes[1], entry.Value, i, "value", path, pending); err != nil {
 				return err
 			}
 		}
@@ -449,27 +590,27 @@ func (w *Writer) collectValue(id uint32, value any, path string, pending [][]any
 	case TypeKindUnion:
 		union, ok := value.(UnionValue)
 		if !ok {
-			return fmt.Errorf("ORC field %q expects UNION, got %T", path, value)
+			return fmt.Errorf("ORC field %q expects UNION, got %T", formatWriterValuePath(*path), value)
 		}
 		if int(union.Tag) >= len(typ.Subtypes) {
-			return fmt.Errorf("ORC field %q has union tag %d, want less than %d", path, union.Tag, len(typ.Subtypes))
+			return fmt.Errorf("ORC field %q has union tag %d, want less than %d", formatWriterValuePath(*path), union.Tag, len(typ.Subtypes))
 		}
 		pending[id] = append(pending[id], union.Tag)
-		return w.collectValue(typ.Subtypes[union.Tag], union.Value, fmt.Sprintf("%s<%d>", path, union.Tag), pending)
+		return w.collectValueAt(typ.Subtypes[union.Tag], union.Value, writerPathSegment{kind: writerPathUnionTag, index: int(union.Tag)}, path, pending)
 	default:
 		column := w.columns[id]
 		if !matchesType(typ.Kind, value) {
-			return fmt.Errorf("ORC field %q expects %s, got %T", path, typ.Kind, value)
+			return fmt.Errorf("ORC field %q expects %s, got %T", formatWriterValuePath(*path), typ.Kind, value)
 		}
 		if typ.Kind == TypeKindString || typ.Kind == TypeKindChar || typ.Kind == TypeKindVarchar {
 			stringValue := value.(string)
 			if !utf8.ValidString(stringValue) {
-				return fmt.Errorf("ORC field %q string is not valid UTF-8", path)
+				return fmt.Errorf("ORC field %q string is not valid UTF-8", formatWriterValuePath(*path))
 			}
 			if typ.Kind == TypeKindChar || typ.Kind == TypeKindVarchar {
 				prepared, err := prepareStringTypeValue(stringValue, typ.Kind, column.maxLength)
 				if err != nil {
-					return fmt.Errorf("ORC field %q: %w", path, err)
+					return fmt.Errorf("ORC field %q: %w", formatWriterValuePath(*path), err)
 				}
 				value = prepared
 			}
@@ -477,33 +618,64 @@ func (w *Writer) collectValue(id uint32, value any, path string, pending [][]any
 		if typ.Kind == TypeKindDate {
 			days, err := dateDays(value.(time.Time))
 			if err != nil {
-				return fmt.Errorf("ORC field %q: %w", path, err)
+				return fmt.Errorf("ORC field %q: %w", formatWriterValuePath(*path), err)
 			}
 			value = days
 		}
 		if typ.Kind == TypeKindTimestamp || typ.Kind == TypeKindTimestampInstant {
 			timestamp, err := timestampForWriter(value.(time.Time), typ.Kind)
 			if err != nil {
-				return fmt.Errorf("ORC field %q: %w", path, err)
+				return fmt.Errorf("ORC field %q: %w", formatWriterValuePath(*path), err)
 			}
 			value = timestamp
 		}
 		if typ.Kind == TypeKindDecimal {
 			decimal, err := decimalForType(value.(Decimal), column.precision, column.scale)
 			if err != nil {
-				return fmt.Errorf("ORC field %q: %w", path, err)
+				return fmt.Errorf("ORC field %q: %w", formatWriterValuePath(*path), err)
 			}
 			value = decimal
-		}
-		if typ.Kind == TypeKindBinary || typ.Kind == TypeKindGeometry || typ.Kind == TypeKindGeography {
-			data := value.([]byte)
-			copied := make([]byte, len(data))
-			copy(copied, data)
-			value = copied
 		}
 		pending[id] = append(pending[id], value)
 		return nil
 	}
+}
+
+func (w *Writer) collectValueAt(id uint32, value any, segment writerPathSegment, path *[]writerPathSegment, pending [][]any) error {
+	pathLength := len(*path)
+	*path = append(*path, segment)
+	err := w.collectValue(id, value, path, pending)
+	*path = (*path)[:pathLength]
+	return err
+}
+
+func (w *Writer) collectMapEntryValue(id uint32, value any, index int, field string, path *[]writerPathSegment, pending [][]any) error {
+	pathLength := len(*path)
+	*path = append(*path,
+		writerPathSegment{kind: writerPathIndex, index: index},
+		writerPathSegment{kind: writerPathField, name: field},
+	)
+	err := w.collectValue(id, value, path, pending)
+	*path = (*path)[:pathLength]
+	return err
+}
+
+func formatWriterValuePath(path []writerPathSegment) string {
+	var formatted strings.Builder
+	for _, segment := range path {
+		switch segment.kind {
+		case writerPathRoot:
+			formatted.WriteString("root")
+		case writerPathField:
+			formatted.WriteByte('.')
+			formatted.WriteString(segment.name)
+		case writerPathIndex:
+			fmt.Fprintf(&formatted, "[%d]", segment.index)
+		case writerPathUnionTag:
+			fmt.Fprintf(&formatted, "<%d>", segment.index)
+		}
+	}
+	return formatted.String()
 }
 
 // Close writes the final stripe and ORC file footer. Calling Close again
@@ -513,6 +685,9 @@ func (w *Writer) Close() error {
 		return w.closeErr
 	}
 	w.closed = true
+	w.resetPendingValues()
+	w.pending = nil
+	w.valuePath = nil
 	if w.writeErr != nil {
 		w.closeErr = w.writeErr
 		return w.closeErr
@@ -691,6 +866,7 @@ func (w *Writer) flushStripe() error {
 	}
 	w.bodyOffset += uint64(len(stripeData))
 	w.stripeRows = 0
+	w.bufferedBytes = 0
 	w.rowsInRowGroup = 0
 	w.rowGroupRows = nil
 	for i := range w.columns {
