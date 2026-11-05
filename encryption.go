@@ -59,6 +59,17 @@ type EncryptionRule struct {
 	Algorithm  EncryptionAlgorithm
 }
 
+// EncryptionMask describes a fallback data mask recorded in ORC encryption
+// metadata. Columns contains the unencrypted root column IDs for the mask.
+type EncryptionMask struct {
+	// Name is the mask name.
+	Name string
+	// Parameters contains the mask's stored parameters in order.
+	Parameters []string
+	// Columns contains unencrypted root type IDs covered by the mask.
+	Columns []uint32
+}
+
 // KeyProvider resolves a named and versioned AES master key for Hadoop ORC key
 // wrapping. Use EncryptionKeyProvider for other wrapping formats. The ORC file
 // stores wrapped local keys, never the master key itself.
@@ -138,8 +149,9 @@ type fileEncryptionVariant struct {
 }
 
 type dataMask struct {
-	name    string
-	columns []uint32
+	name       string
+	parameters []string
+	columns    []uint32
 }
 
 type fileEncryption struct {
@@ -606,6 +618,12 @@ func parseDataMask(data []byte) (dataMask, error) {
 		switch field.Number {
 		case 1:
 			result.name, err = fieldString(field)
+		case 2:
+			var parameter string
+			parameter, err = fieldString(field)
+			if err == nil {
+				result.parameters = append(result.parameters, parameter)
+			}
 		case 3:
 			result.columns, err = appendUint32Values(result.columns, field)
 		}
@@ -701,6 +719,9 @@ func encodeFileEncryption(encryption fileEncryption) []byte {
 			var data []byte
 			if mask.name != "" {
 				data = appendProtoBytesField(data, 1, []byte(mask.name))
+			}
+			for _, parameter := range mask.parameters {
+				data = appendProtoBytesField(data, 2, []byte(parameter))
 			}
 			for _, column := range mask.columns {
 				data = appendProtoVarintField(data, 3, uint64(column))

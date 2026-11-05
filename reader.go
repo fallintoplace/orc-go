@@ -232,6 +232,23 @@ func (r *Reader) FileStatistics() []ColumnStatistics {
 	return cloneColumnStatistics(r.footer.statistics)
 }
 
+// EncryptionMasks returns the fallback data masks declared in the file.
+// The returned slices do not alias the reader's encryption metadata.
+func (r *Reader) EncryptionMasks() []EncryptionMask {
+	if r.footer.encryption == nil || len(r.footer.encryption.masks) == 0 {
+		return nil
+	}
+	masks := make([]EncryptionMask, len(r.footer.encryption.masks))
+	for i, mask := range r.footer.encryption.masks {
+		masks[i] = EncryptionMask{
+			Name:       mask.name,
+			Parameters: append([]string(nil), mask.parameters...),
+			Columns:    append([]uint32(nil), mask.columns...),
+		}
+	}
+	return masks
+}
+
 // StripeStatistics returns the statistics for each stripe, with columns in
 // type-id order. The returned nested slices do not alias reader state.
 func (r *Reader) StripeStatistics() [][]ColumnStatistics {
