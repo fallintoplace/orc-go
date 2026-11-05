@@ -96,6 +96,85 @@ func TestWriterAndReaderPreserveNullMapKeys(t *testing.T) {
 	}
 }
 
+func TestWriterEmitsBooleanDataStreamForAllNullNestedStripe(t *testing.T) {
+	schema := []Type{
+		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"profile"}},
+		{Kind: TypeKindStruct, Subtypes: []uint32{2}, FieldNames: []string{"active"}},
+		{Kind: TypeKindBoolean},
+	}
+	rows := []Row{
+		{"profile": Row{"active": true}},
+		{"profile": Row(nil)},
+		{"profile": Row(nil)},
+		{"profile": Row{}},
+	}
+	var output bytes.Buffer
+	writer, err := NewWriter(&output, schema, WriterOptions{MaxRowsPerStripe: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if err := writer.WriteRow(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if len(reader.footer.stripes) != 2 {
+		t.Fatalf("stripe count = %d, want 2", len(reader.footer.stripes))
+	}
+	streams, _, err := reader.readStripeStreams(reader.footer.stripes[1], map[streamKey]bool{
+		{kind: streamKindData, column: 2}: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, exists := streams[streamKey{kind: streamKindData, column: 2}]
+	if !exists {
+		t.Fatal("all-null BOOLEAN column is missing its DATA stream")
+	}
+	if len(data) != 0 {
+		t.Fatalf("all-null BOOLEAN DATA stream has %d bytes, want 0", len(data))
+	}
+	indexes, err := reader.RowIndexes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var booleanIndex *ColumnRowIndex
+	for i := range indexes[1].Columns {
+		if indexes[1].Columns[i].ColumnID == 2 {
+			booleanIndex = &indexes[1].Columns[i]
+			break
+		}
+	}
+	if booleanIndex == nil || len(booleanIndex.Entries) != 1 {
+		t.Fatalf("all-null BOOLEAN row index = %+v, want one entry", booleanIndex)
+	}
+	if got, want := len(booleanIndex.Entries[0].Positions), 6; got != want {
+		t.Fatalf("all-null BOOLEAN row-index positions = %d, want %d", got, want)
+	}
+	got, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Row{
+		{"profile": Row{"active": true}},
+		{"profile": nil},
+		{"profile": nil},
+		{"profile": Row{"active": nil}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+	}
+}
+
 func TestWriterWritesStringDictionaries(t *testing.T) {
 	schema := []Type{
 		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"text"}},
