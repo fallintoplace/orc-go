@@ -661,9 +661,6 @@ func parseEncryptionKey(data []byte) (encryptionKeyDescription, error) {
 	if !hasName || !hasAlgorithm || result.name == "" || !utf8.ValidString(result.name) {
 		return encryptionKeyDescription{}, fmt.Errorf("ORC encryption key has incomplete or invalid metadata")
 	}
-	if _, err := encryptionKeyLength(result.algorithm); err != nil {
-		return encryptionKeyDescription{}, err
-	}
 	return result, nil
 }
 
