@@ -1,5 +1,7 @@
 package orc
 
+import "fmt"
+
 // RowValues contains one row's selected fields without constructing a Row map.
 // Its values remain valid after the callback returns.
 type RowValues struct {
@@ -69,6 +71,7 @@ func (r RowValues) Field(index int) (string, any, bool) {
 type rowRangeOutput struct {
 	row         func(any) error
 	rowValues   func(RowValues) error
+	rowBatch    func(RowBatch) error
 	valueSchema *rowValuesSchema
 }
 
@@ -96,4 +99,42 @@ func (o rowRangeOutput) yieldNullRoot() error {
 
 func (o rowRangeOutput) yieldValue(value any) error {
 	return o.row(value)
+}
+
+func (o rowRangeOutput) yieldBatches(stripeIndex int, columns []rowColumn, values [][]any, rootPresent []bool, rowStart, rowEnd, rootValueIndex int) error {
+	for batchStart := rowStart; batchStart < rowEnd; {
+		batchEnd := min(batchStart+defaultRowBatchSize, rowEnd)
+		batchPresent := append([]bool(nil), rootPresent[batchStart:batchEnd]...)
+		batchColumns := make([][]any, len(columns))
+		batchValueEnd := rootValueIndex
+		for rowIndex := batchStart; rowIndex < batchEnd; rowIndex++ {
+			if rootPresent[rowIndex] {
+				batchValueEnd++
+			}
+		}
+		for columnIndex := range columns {
+			if columnIndex >= len(values) {
+				return fmt.Errorf("stripe %d has too few decoded root columns", stripeIndex)
+			}
+			columnValues := make([]any, batchEnd-batchStart)
+			valueIndex := rootValueIndex
+			for rowIndex := batchStart; rowIndex < batchEnd; rowIndex++ {
+				if !rootPresent[rowIndex] {
+					continue
+				}
+				if valueIndex >= len(values[columnIndex]) {
+					return fmt.Errorf("stripe %d root STRUCT has too few decoded field values", stripeIndex)
+				}
+				columnValues[rowIndex-batchStart] = values[columnIndex][valueIndex]
+				valueIndex++
+			}
+			batchColumns[columnIndex] = columnValues
+		}
+		if err := o.rowBatch(RowBatch{schema: o.valueSchema, columns: batchColumns, rootPresent: batchPresent}); err != nil {
+			return err
+		}
+		rootValueIndex = batchValueEnd
+		batchStart = batchEnd
+	}
+	return nil
 }

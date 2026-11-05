@@ -152,6 +152,34 @@ func (r *Reader) ReadRowsRangeValuesWithColumns(start, end uint64, names []strin
 	return r.readValuesRangeWithOutput(start, end, names, true, rowRangeOutput{rowValues: yield})
 }
 
+// ReadRowBatches calls yield with up to 1,024 rows at a time without building a
+// map for each row. Fields are available by name through RowBatch.
+func (r *Reader) ReadRowBatches(yield func(RowBatch) error) error {
+	return r.ReadRowBatchesWithColumns(nil, yield)
+}
+
+// ReadRowBatchesWithColumns reads all rows and yields only the named root
+// fields. A nil names slice selects all root fields.
+func (r *Reader) ReadRowBatchesWithColumns(names []string, yield func(RowBatch) error) error {
+	if yield == nil {
+		return errors.New("ORC row batches callback is nil")
+	}
+	if r.footer.types[0].Kind != TypeKindStruct {
+		return fmt.Errorf("ORC root type is %s; row batches require STRUCT", r.footer.types[0].Kind)
+	}
+	if names == nil {
+		columns, err := r.rowColumns()
+		if err != nil {
+			return err
+		}
+		names = make([]string, len(columns))
+		for index, column := range columns {
+			names[index] = column.name
+		}
+	}
+	return r.readValuesRangeWithOutput(0, r.NumRows(), names, true, rowRangeOutput{rowBatch: yield})
+}
+
 // ReadAllRange reads the rows in [start, end) into memory.
 func (r *Reader) ReadAllRange(start, end uint64) ([]Row, error) {
 	return r.readAllRange(start, end, nil, false)
@@ -225,7 +253,7 @@ func (r *Reader) readValuesRange(start, end uint64, names []string, projected bo
 }
 
 func (r *Reader) readValuesRangeWithOutput(start, end uint64, names []string, projected bool, output rowRangeOutput) error {
-	if output.row == nil && output.rowValues == nil {
+	if output.row == nil && output.rowValues == nil && output.rowBatch == nil {
 		return errors.New("ORC value callback is nil")
 	}
 	if start > end {
@@ -255,7 +283,7 @@ func (r *Reader) readValuesRangeWithOutput(start, end uint64, names []string, pr
 		}
 		columns = []rowColumn{{id: 0, name: "root", kind: root.Kind, calendar: r.calendar}}
 	}
-	if output.rowValues != nil {
+	if output.rowValues != nil || output.rowBatch != nil {
 		output.valueSchema = newRowValuesSchema(columns)
 	}
 	var wanted map[streamKey]bool
@@ -294,21 +322,23 @@ func (r *Reader) readValuesRangeWithOutput(start, end uint64, names []string, pr
 		if err != nil {
 			return fmt.Errorf("stripe %d row count: %w", stripeIndex, err)
 		}
-		handled, err := r.readIndexedVariableRangeStripe(stripe, stripeIndex, stripeRowStart, stripeRowEnd, start, end, columns, projected, output)
-		if err != nil {
-			return err
-		}
-		if handled {
-			stripeRowStart = stripeRowEnd
-			continue
-		}
-		handled, err = r.readIndexedNumericRangeStripe(stripe, stripeIndex, stripeRowStart, stripeRowEnd, start, end, columns, projected, output)
-		if err != nil {
-			return err
-		}
-		if handled {
-			stripeRowStart = stripeRowEnd
-			continue
+		if output.rowBatch == nil {
+			handled, err := r.readIndexedVariableRangeStripe(stripe, stripeIndex, stripeRowStart, stripeRowEnd, start, end, columns, projected, output)
+			if err != nil {
+				return err
+			}
+			if handled {
+				stripeRowStart = stripeRowEnd
+				continue
+			}
+			handled, err = r.readIndexedNumericRangeStripe(stripe, stripeIndex, stripeRowStart, stripeRowEnd, start, end, columns, projected, output)
+			if err != nil {
+				return err
+			}
+			if handled {
+				stripeRowStart = stripeRowEnd
+				continue
+			}
 		}
 		if wanted == nil {
 			wanted = make(map[streamKey]bool, len(r.footer.types)*5)
@@ -360,6 +390,13 @@ func (r *Reader) readValuesRangeWithOutput(start, end uint64, names []string, pr
 					rootValueIndex++
 				}
 			}
+		}
+		if output.rowBatch != nil {
+			if err := output.yieldBatches(stripeIndex, columns, values, rootPresent, rowStart, rowEnd, rootValueIndex); err != nil {
+				return err
+			}
+			stripeRowStart = stripeRowEnd
+			continue
 		}
 		for rowIndex := rowStart; rowIndex < rowEnd; rowIndex++ {
 			var err error

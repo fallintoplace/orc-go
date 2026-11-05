@@ -52,8 +52,10 @@ func BenchmarkReaderReadRowsBinary(b *testing.B) {
 	}
 }
 
-func BenchmarkReaderReadRowsRepeatedDictionaryStrings(b *testing.B) {
-	const rowsPerFile = 40_000
+const repeatedDictionaryRowsPerFile = 40_000
+
+func makeRepeatedDictionaryStringFile(b *testing.B) []byte {
+	b.Helper()
 	schema := []Type{
 		{Kind: TypeKindStruct, Subtypes: []uint32{1, 2}, FieldNames: []string{"id", "label"}},
 		{Kind: TypeKindLong},
@@ -65,7 +67,7 @@ func BenchmarkReaderReadRowsRepeatedDictionaryStrings(b *testing.B) {
 		b.Fatal(err)
 	}
 	row := Row{"id": int64(0), "label": ""}
-	for index := 0; index < rowsPerFile; index++ {
+	for index := 0; index < repeatedDictionaryRowsPerFile; index++ {
 		row["id"] = int64(index)
 		row["label"] = fmt.Sprintf("customer-%02d", index%16)
 		if err := writer.WriteRow(row); err != nil {
@@ -75,10 +77,14 @@ func BenchmarkReaderReadRowsRepeatedDictionaryStrings(b *testing.B) {
 	if err := writer.Close(); err != nil {
 		b.Fatal(err)
 	}
-	data := output.Bytes()
+	return output.Bytes()
+}
+
+func BenchmarkReaderReadRowsRepeatedDictionaryStrings(b *testing.B) {
+	data := makeRepeatedDictionaryStringFile(b)
 
 	b.ReportAllocs()
-	b.SetBytes(rowsPerFile * 24)
+	b.SetBytes(repeatedDictionaryRowsPerFile * 24)
 	b.ResetTimer()
 	for iteration := 0; iteration < b.N; iteration++ {
 		reader, err := NewReader(bytes.NewReader(data), int64(len(data)))
@@ -92,8 +98,32 @@ func BenchmarkReaderReadRowsRepeatedDictionaryStrings(b *testing.B) {
 		}); err != nil {
 			b.Fatal(err)
 		}
-		if readRows != rowsPerFile {
-			b.Fatalf("ReadRows() returned %d rows, want %d", readRows, rowsPerFile)
+		if readRows != repeatedDictionaryRowsPerFile {
+			b.Fatalf("ReadRows() returned %d rows, want %d", readRows, repeatedDictionaryRowsPerFile)
+		}
+	}
+}
+
+func BenchmarkReaderReadRowBatchesRepeatedDictionaryStrings(b *testing.B) {
+	data := makeRepeatedDictionaryStringFile(b)
+
+	b.ReportAllocs()
+	b.SetBytes(repeatedDictionaryRowsPerFile * 24)
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		reader, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			b.Fatal(err)
+		}
+		readRows := 0
+		if err := reader.ReadRowBatchesWithColumns([]string{"id", "label"}, func(batch RowBatch) error {
+			readRows += batch.Len()
+			return nil
+		}); err != nil {
+			b.Fatal(err)
+		}
+		if readRows != repeatedDictionaryRowsPerFile {
+			b.Fatalf("ReadRowBatchesWithColumns() returned %d rows, want %d", readRows, repeatedDictionaryRowsPerFile)
 		}
 	}
 }
