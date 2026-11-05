@@ -19,14 +19,15 @@ type ColumnStatistics struct {
 	HasNullSet bool
 	// The type-specific statistics below are nil when the file does not include
 	// the corresponding statistic.
-	Integer   *IntegerStatistics
-	Double    *DoubleStatistics
-	String    *StringStatistics
-	Bucket    *BucketStatistics
-	Decimal   *DecimalStatistics
-	Date      *DateStatistics
-	Binary    *BinaryStatistics
-	Timestamp *TimestampStatistics
+	Integer    *IntegerStatistics
+	Double     *DoubleStatistics
+	String     *StringStatistics
+	Bucket     *BucketStatistics
+	Decimal    *DecimalStatistics
+	Date       *DateStatistics
+	Binary     *BinaryStatistics
+	Timestamp  *TimestampStatistics
+	Geospatial *GeospatialStatistics
 }
 
 // IntegerStatistics describes integer, byte, and long columns.
@@ -107,6 +108,33 @@ type TimestampStatistics struct {
 	HasMinimumUTC bool
 	MaximumUTC    int64
 	HasMaximumUTC bool
+}
+
+// GeospatialStatistics describes the values in a GEOMETRY or GEOGRAPHY column.
+type GeospatialStatistics struct {
+	BoundingBox     *GeospatialBoundingBox
+	GeospatialTypes []int32
+}
+
+// GeospatialBoundingBox contains the minimum and maximum coordinate for each
+// axis present in the column's geospatial values.
+type GeospatialBoundingBox struct {
+	XMin    float64
+	HasXMin bool
+	XMax    float64
+	HasXMax bool
+	YMin    float64
+	HasYMin bool
+	YMax    float64
+	HasYMax bool
+	ZMin    float64
+	HasZMin bool
+	ZMax    float64
+	HasZMax bool
+	MMin    float64
+	HasMMin bool
+	MMax    float64
+	HasMMax bool
 }
 
 type stripeStatistics struct {
@@ -202,9 +230,92 @@ func parseColumnStatistics(data []byte) (ColumnStatistics, error) {
 				result.HasNull = value == 1
 				result.HasNullSet = true
 			}
+		case 13:
+			var value []byte
+			value, err = fieldBytes(field)
+			if err == nil {
+				var stats GeospatialStatistics
+				stats, err = parseGeospatialStatistics(value)
+				result.Geospatial = &stats
+			}
 		}
 		if err != nil {
 			return ColumnStatistics{}, err
+		}
+	}
+	return result, nil
+}
+
+func parseGeospatialStatistics(data []byte) (GeospatialStatistics, error) {
+	fields, err := wire.Fields(data)
+	if err != nil {
+		return GeospatialStatistics{}, fmt.Errorf("decode ORC geospatial statistics: %w", err)
+	}
+	var result GeospatialStatistics
+	for _, field := range fields {
+		switch field.Number {
+		case 1:
+			value, err := fieldBytes(field)
+			if err != nil {
+				return GeospatialStatistics{}, err
+			}
+			box, err := parseGeospatialBoundingBox(value)
+			if err != nil {
+				return GeospatialStatistics{}, err
+			}
+			result.BoundingBox = &box
+		case 2:
+			switch field.Type {
+			case 0:
+				result.GeospatialTypes = append(result.GeospatialTypes, int32(field.Varint))
+			case 2:
+				values, err := wire.Varints(field.Bytes)
+				if err != nil {
+					return GeospatialStatistics{}, fmt.Errorf("decode ORC geospatial type codes: %w", err)
+				}
+				for _, value := range values {
+					result.GeospatialTypes = append(result.GeospatialTypes, int32(value))
+				}
+			default:
+				return GeospatialStatistics{}, fmt.Errorf("protobuf field %d has wire type %d, want varint or packed varints", field.Number, field.Type)
+			}
+		}
+	}
+	return result, nil
+}
+
+func parseGeospatialBoundingBox(data []byte) (GeospatialBoundingBox, error) {
+	fields, err := wire.Fields(data)
+	if err != nil {
+		return GeospatialBoundingBox{}, fmt.Errorf("decode ORC geospatial bounding box: %w", err)
+	}
+	var result GeospatialBoundingBox
+	for _, field := range fields {
+		if field.Number < 1 || field.Number > 8 {
+			continue
+		}
+		bits, err := fieldFixed64(field)
+		if err != nil {
+			return GeospatialBoundingBox{}, err
+		}
+		value := math.Float64frombits(bits)
+		switch field.Number {
+		case 1:
+			result.XMin, result.HasXMin = value, true
+		case 2:
+			result.XMax, result.HasXMax = value, true
+		case 3:
+			result.YMin, result.HasYMin = value, true
+		case 4:
+			result.YMax, result.HasYMax = value, true
+		case 5:
+			result.ZMin, result.HasZMin = value, true
+		case 6:
+			result.ZMax, result.HasZMax = value, true
+		case 7:
+			result.MMin, result.HasMMin = value, true
+		case 8:
+			result.MMax, result.HasMMax = value, true
 		}
 	}
 	return result, nil
@@ -546,6 +657,15 @@ func cloneColumnStatistics(stats []ColumnStatistics) []ColumnStatistics {
 		if stat.Timestamp != nil {
 			value := *stat.Timestamp
 			result[i].Timestamp = &value
+		}
+		if stat.Geospatial != nil {
+			value := *stat.Geospatial
+			value.GeospatialTypes = append([]int32(nil), stat.Geospatial.GeospatialTypes...)
+			if stat.Geospatial.BoundingBox != nil {
+				box := *stat.Geospatial.BoundingBox
+				value.BoundingBox = &box
+			}
+			result[i].Geospatial = &value
 		}
 	}
 	return result

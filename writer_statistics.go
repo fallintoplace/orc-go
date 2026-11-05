@@ -787,6 +787,46 @@ func encodeColumnStatistics(statistics ColumnStatistics) []byte {
 		}
 		result = appendProtoBytesField(result, 9, values)
 	}
+	if statistics.Geospatial != nil {
+		var values []byte
+		if statistics.Geospatial.BoundingBox != nil {
+			box := statistics.Geospatial.BoundingBox
+			var bounds []byte
+			if box.HasXMin {
+				bounds = appendProtoFixed64Field(bounds, 1, math.Float64bits(box.XMin))
+			}
+			if box.HasXMax {
+				bounds = appendProtoFixed64Field(bounds, 2, math.Float64bits(box.XMax))
+			}
+			if box.HasYMin {
+				bounds = appendProtoFixed64Field(bounds, 3, math.Float64bits(box.YMin))
+			}
+			if box.HasYMax {
+				bounds = appendProtoFixed64Field(bounds, 4, math.Float64bits(box.YMax))
+			}
+			if box.HasZMin {
+				bounds = appendProtoFixed64Field(bounds, 5, math.Float64bits(box.ZMin))
+			}
+			if box.HasZMax {
+				bounds = appendProtoFixed64Field(bounds, 6, math.Float64bits(box.ZMax))
+			}
+			if box.HasMMin {
+				bounds = appendProtoFixed64Field(bounds, 7, math.Float64bits(box.MMin))
+			}
+			if box.HasMMax {
+				bounds = appendProtoFixed64Field(bounds, 8, math.Float64bits(box.MMax))
+			}
+			values = appendProtoBytesField(values, 1, bounds)
+		}
+		if len(statistics.Geospatial.GeospatialTypes) > 0 {
+			var typeCodes []byte
+			for _, code := range statistics.Geospatial.GeospatialTypes {
+				typeCodes = appendProtoVarint(typeCodes, uint64(int64(code)))
+			}
+			values = appendProtoBytesField(values, 2, typeCodes)
+		}
+		result = appendProtoBytesField(result, 13, values)
+	}
 	if statistics.HasNullSet {
 		value := uint64(0)
 		if statistics.HasNull {

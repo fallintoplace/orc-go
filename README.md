@@ -108,6 +108,7 @@ The reader returns these Go types for ORC values. Use `nil` for an ORC null.
 | FLOAT, DOUBLE | `float32`, `float64` |
 | STRING, CHAR, VARCHAR | `string` |
 | BINARY | `[]byte` |
+| GEOMETRY, GEOGRAPHY | `[]byte` (WKB) |
 | DATE, TIMESTAMP, TIMESTAMP_INSTANT | `time.Time` |
 | DECIMAL | `orc.Decimal` |
 | STRUCT | `orc.Row` or `map[string]any` |
@@ -126,6 +127,8 @@ row := orc.Row{
 ```
 
 `[]orc.MapEntry` represents a map as key/value pairs, so keys can use any ORC type. `UnionValue.Tag` is the zero-based index of the selected alternative in the schema.
+
+`GEOMETRY` and `GEOGRAPHY` values use WKB byte slices. Set `Type.CRS` to choose a coordinate reference system; an empty value uses `OGC:CRS84`. `GEOGRAPHY` uses spherical edge interpolation by default; set `Type.EdgeInterpolation` to choose another supported algorithm.
 
 For `DECIMAL`, use `orc.Decimal` or validate a string with `orc.ParseDecimal`. Set `Precision` and `Scale` on the schema for a fixed-scale column. Values that would need rounding to fit that scale are rejected. A legacy schema with both set to zero keeps each value's scale and has no precision limit.
 
@@ -157,7 +160,7 @@ A stripe is a group of rows stored together in an ORC file. These options contro
 
 Use `Reader` to inspect a file without reading all of its values. It exposes the schema, type attributes, stripe locations, row and stripe counts, file and stripe statistics, row indexes, bloom-filter indexes, and user metadata. For example, call `Schema()`, `NumRows()`, `NumStripes()`, or `FileStatistics()` on a reader. Use `AddUserMetadata(name, value)` to add application-defined metadata when writing.
 
-String statistics include exact minimum and maximum values when available. For long strings, they can include lower and upper bounds instead.
+String statistics include exact minimum and maximum values when available. For long strings, they can include lower and upper bounds instead. Geospatial statistics include bounding boxes and WKB type codes when the file stores them.
 
 ## Encrypt columns
 

@@ -161,6 +161,9 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 				return nil, fmt.Errorf("ORC type attribute value in type %d is not valid UTF-8", typeID)
 			}
 		}
+		if !utf8.ValidString(typ.CRS) {
+			return nil, fmt.Errorf("ORC coordinate reference system in type %d is not valid UTF-8", typeID)
+		}
 	}
 
 	switch options.Compression {
@@ -273,7 +276,7 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 
 // WriteRow adds one non-null root STRUCT row. Missing fields and nil values
 // are written as ORC nulls. Use WriteValue to write a null root STRUCT.
-// Binary values are copied before they are buffered.
+// Binary and geospatial byte values are copied before they are buffered.
 func (w *Writer) WriteRow(row Row) error {
 	if err := w.checkCanWriteValue(); err != nil {
 		return err
@@ -294,8 +297,8 @@ func (w *Writer) WriteRow(row Row) error {
 
 // WriteValue adds one value of the schema's root type. Use this method when
 // the root is not a STRUCT, or when a root STRUCT itself may be null. For a
-// root STRUCT, non-null values may be Row or map[string]any. Binary values are
-// copied before they are buffered.
+// root STRUCT, non-null values may be Row or map[string]any. Binary and
+// geospatial byte values are copied before they are buffered.
 func (w *Writer) WriteValue(value any) error {
 	if err := w.checkCanWriteValue(); err != nil {
 		return err
@@ -371,7 +374,8 @@ func supportsWriterType(kind TypeKind) bool {
 	case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong,
 		TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary,
 		TypeKindTimestamp, TypeKindList, TypeKindMap, TypeKindStruct, TypeKindUnion,
-		TypeKindDecimal, TypeKindDate, TypeKindVarchar, TypeKindChar, TypeKindTimestampInstant:
+		TypeKindDecimal, TypeKindDate, TypeKindVarchar, TypeKindChar, TypeKindTimestampInstant,
+		TypeKindGeometry, TypeKindGeography:
 		return true
 	default:
 		return false
@@ -485,7 +489,7 @@ func (w *Writer) collectValue(id uint32, value any, path string, pending [][]any
 			}
 			value = decimal
 		}
-		if typ.Kind == TypeKindBinary {
+		if typ.Kind == TypeKindBinary || typ.Kind == TypeKindGeometry || typ.Kind == TypeKindGeography {
 			data := value.([]byte)
 			copied := make([]byte, len(data))
 			copy(copied, data)
@@ -848,7 +852,7 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, columnEncodi
 	}
 
 	encoding := columnEncoding{kind: columnEncodingDirect}
-	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindDate || column.kind == TypeKindTimestamp || column.kind == TypeKindTimestampInstant || column.kind == TypeKindDecimal || column.kind == TypeKindString || column.kind == TypeKindBinary || column.kind == TypeKindChar || column.kind == TypeKindVarchar || column.kind == TypeKindList || column.kind == TypeKindMap) {
+	if w.options.UseRLEv2 && (column.kind == TypeKindShort || column.kind == TypeKindInt || column.kind == TypeKindLong || column.kind == TypeKindDate || column.kind == TypeKindTimestamp || column.kind == TypeKindTimestampInstant || column.kind == TypeKindDecimal || column.kind == TypeKindString || column.kind == TypeKindBinary || column.kind == TypeKindChar || column.kind == TypeKindVarchar || column.kind == TypeKindList || column.kind == TypeKindMap || column.kind == TypeKindGeometry || column.kind == TypeKindGeography) {
 		encoding.kind = columnEncodingDirectV2
 	}
 	if w.options.UseDictionary && (column.kind == TypeKindString || column.kind == TypeKindChar || column.kind == TypeKindVarchar) {
@@ -960,7 +964,7 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, columnEncodi
 		}
 	case TypeKindString, TypeKindChar, TypeKindVarchar:
 		data, lengths = flattenVariableValues(values, func(value any) []byte { return []byte(value.(string)) })
-	case TypeKindBinary:
+	case TypeKindBinary, TypeKindGeometry, TypeKindGeography:
 		data, lengths = flattenVariableValues(values, func(value any) []byte { return value.([]byte) })
 	default:
 		return nil, columnEncoding{}, fmt.Errorf("%w: %s", ErrUnsupportedType, column.kind)
@@ -989,7 +993,7 @@ func emptyColumnStreamKinds(kind TypeKind) []uint32 {
 		return []uint32{streamKindData}
 	case TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal:
 		return []uint32{streamKindData, streamKindSecondary}
-	case TypeKindString, TypeKindChar, TypeKindVarchar, TypeKindBinary:
+	case TypeKindString, TypeKindChar, TypeKindVarchar, TypeKindBinary, TypeKindGeometry, TypeKindGeography:
 		return []uint32{streamKindData, streamKindLength}
 	default:
 		return nil
@@ -1073,7 +1077,7 @@ func matchesType(kind TypeKind, value any) bool {
 	case TypeKindString, TypeKindChar, TypeKindVarchar:
 		_, ok := value.(string)
 		return ok
-	case TypeKindBinary:
+	case TypeKindBinary, TypeKindGeometry, TypeKindGeography:
 		_, ok := value.([]byte)
 		return ok
 	case TypeKindDecimal:
@@ -1276,6 +1280,16 @@ func encodeType(typ Type) []byte {
 		attributeMessage := appendProtoBytesField(nil, 1, []byte(attribute.Key))
 		attributeMessage = appendProtoBytesField(attributeMessage, 2, []byte(attribute.Value))
 		message = appendProtoBytesField(message, 7, attributeMessage)
+	}
+	if typ.Kind == TypeKindGeometry || typ.Kind == TypeKindGeography {
+		crs := typ.CRS
+		if crs == "" {
+			crs = defaultGeospatialCRS
+		}
+		message = appendProtoBytesField(message, 8, []byte(crs))
+	}
+	if typ.Kind == TypeKindGeography && typ.EdgeInterpolation != EdgeInterpolationSpherical {
+		message = appendProtoVarintField(message, 9, uint64(typ.EdgeInterpolation))
 	}
 	return message
 }

@@ -2,6 +2,8 @@ package orc
 
 import "fmt"
 
+const defaultGeospatialCRS = "OGC:CRS84"
+
 // TypeKind identifies an ORC column type.
 type TypeKind uint32
 
@@ -25,13 +27,27 @@ const (
 	TypeKindVarchar
 	TypeKindChar
 	TypeKindTimestampInstant
+	TypeKindGeometry
+	TypeKindGeography
 )
 
 var typeKindNames = [...]string{
 	"BOOLEAN", "BYTE", "SHORT", "INT", "LONG", "FLOAT", "DOUBLE", "STRING", "BINARY",
 	"TIMESTAMP", "LIST", "MAP", "STRUCT", "UNION", "DECIMAL", "DATE", "VARCHAR", "CHAR",
-	"TIMESTAMP_INSTANT",
+	"TIMESTAMP_INSTANT", "GEOMETRY", "GEOGRAPHY",
 }
+
+// EdgeInterpolationAlgorithm selects how geography edges are interpreted.
+type EdgeInterpolationAlgorithm uint32
+
+const (
+	// EdgeInterpolationSpherical is the default spherical geodesic algorithm.
+	EdgeInterpolationSpherical EdgeInterpolationAlgorithm = iota
+	EdgeInterpolationVincenty
+	EdgeInterpolationThomas
+	EdgeInterpolationAndoyer
+	EdgeInterpolationKarney
+)
 
 func (kind TypeKind) String() string {
 	if uint64(kind) < uint64(len(typeKindNames)) {
@@ -53,6 +69,12 @@ type Type struct {
 	// Precision and Scale may both be zero for legacy variable-scale DECIMAL.
 	Precision uint32
 	Scale     uint32
+	// CRS sets the coordinate reference system for GEOMETRY and GEOGRAPHY.
+	// Empty uses the ORC default, OGC:CRS84.
+	CRS string
+	// EdgeInterpolation sets the GEOGRAPHY edge algorithm. Zero selects
+	// EdgeInterpolationSpherical, the ORC default.
+	EdgeInterpolation EdgeInterpolationAlgorithm
 }
 
 // TypeAttribute is a key/value annotation stored on an ORC type.
@@ -92,6 +114,10 @@ func validateTypes(types []Type) error {
 				return fmt.Errorf("type %d references missing subtype %d", i, subtype)
 			}
 		}
+		if typ.Kind != TypeKindGeometry && typ.Kind != TypeKindGeography &&
+			(typ.CRS != "" || typ.EdgeInterpolation != EdgeInterpolationSpherical) {
+			return fmt.Errorf("type %d has geospatial metadata but is %s", i, typ.Kind)
+		}
 
 		switch typ.Kind {
 		case TypeKindList:
@@ -109,6 +135,16 @@ func validateTypes(types []Type) error {
 		case TypeKindUnion:
 			if len(typ.Subtypes) == 0 || len(typ.Subtypes) > 256 || len(typ.FieldNames) != 0 {
 				return fmt.Errorf("UNION type %d must have 1 to 256 subtypes and no field names", i)
+			}
+		case TypeKindGeometry, TypeKindGeography:
+			if len(typ.Subtypes) != 0 || len(typ.FieldNames) != 0 {
+				return fmt.Errorf("%s type %d cannot have subtypes or field names", typ.Kind, i)
+			}
+			if typ.EdgeInterpolation > EdgeInterpolationKarney {
+				return fmt.Errorf("GEOGRAPHY type %d has unknown edge interpolation algorithm %d", i, typ.EdgeInterpolation)
+			}
+			if typ.Kind == TypeKindGeometry && typ.EdgeInterpolation != EdgeInterpolationSpherical {
+				return fmt.Errorf("GEOMETRY type %d cannot set an edge interpolation algorithm", i)
 			}
 		default:
 			if uint32(typ.Kind) < uint32(len(typeKindNames)) && (len(typ.Subtypes) != 0 || len(typ.FieldNames) != 0) {

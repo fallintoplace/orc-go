@@ -27,6 +27,8 @@ func TestWriterAndReaderRoundTripRootValues(t *testing.T) {
 		{name: "double", schema: []Type{{Kind: TypeKindDouble}}, values: []any{float64(-1e100), nil, float64(0), float64(3.141592653589793)}},
 		{name: "string", schema: []Type{{Kind: TypeKindString}}, values: []any{"repeat", nil, "", "東京"}},
 		{name: "binary", schema: []Type{{Kind: TypeKindBinary}}, values: []any{[]byte{0, 0xff}, nil, []byte{}, []byte{1, 2, 3}}},
+		{name: "geometry", schema: []Type{{Kind: TypeKindGeometry}}, values: []any{testWKBPoint(1, 2), nil, testWKBPoint(-180, 90)}},
+		{name: "geography", schema: []Type{{Kind: TypeKindGeography, CRS: "EPSG:4326", EdgeInterpolation: EdgeInterpolationKarney}}, values: []any{testWKBPoint(13.4, 52.5), nil, testWKBPoint(-73.9, 40.7)}},
 		{name: "date", schema: []Type{{Kind: TypeKindDate}}, values: []any{day, nil, day.AddDate(1, 0, 0)}},
 		{name: "timestamp", schema: []Type{{Kind: TypeKindTimestamp}}, values: []any{instant, nil, instant.Add(time.Hour)}},
 		{name: "timestamp instant", schema: []Type{{Kind: TypeKindTimestampInstant}}, values: []any{instant, nil, instant.Add(time.Hour)}},

@@ -49,7 +49,8 @@ const (
 // UnionValue. Primitive values use bool for BOOLEAN, the matching integer
 // width for integer columns, time.Time for DATE and timestamps, Decimal for
 // DECIMAL, float32 or float64 for FLOAT or DOUBLE, string for STRING, CHAR, or
-// VARCHAR, and []byte for BINARY. Timestamp values use UTC; TIMESTAMP preserves
+// VARCHAR, and []byte for BINARY, GEOMETRY, or GEOGRAPHY. Geospatial values use
+// ORC's WKB representation. Timestamp values use UTC; TIMESTAMP preserves
 // wall-clock fields while TIMESTAMP_INSTANT preserves the instant. A nil value
 // represents an ORC null.
 type Row map[string]any
@@ -416,7 +417,7 @@ func (r *Reader) rowColumns() ([]rowColumn, error) {
 		name := root.FieldNames[i]
 		typ := r.footer.types[subtype]
 		switch typ.Kind {
-		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal, TypeKindChar, TypeKindVarchar, TypeKindStruct, TypeKindList, TypeKindMap, TypeKindUnion:
+		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal, TypeKindChar, TypeKindVarchar, TypeKindStruct, TypeKindList, TypeKindMap, TypeKindUnion, TypeKindGeometry, TypeKindGeography:
 		default:
 			return nil, fmt.Errorf("%w: root field %q has type %s", ErrUnsupportedType, name, typ.Kind)
 		}
@@ -481,7 +482,7 @@ func supportsRowEncoding(kind TypeKind, encoding uint32) bool {
 		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
 	case TypeKindString, TypeKindChar, TypeKindVarchar:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDictionary || encoding == columnEncodingDirectV2 || encoding == columnEncodingDictionaryV2
-	case TypeKindBinary:
+	case TypeKindBinary, TypeKindGeometry, TypeKindGeography:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
 	case TypeKindBoolean, TypeKindByte, TypeKindFloat, TypeKindDouble:
 		return encoding == columnEncodingDirect
@@ -984,7 +985,7 @@ func decodeColumn(rowCount uint64, column rowColumn, types []Type, encodings []c
 			valueIndex++
 		}
 		return values, nil
-	case TypeKindString, TypeKindBinary, TypeKindChar, TypeKindVarchar:
+	case TypeKindString, TypeKindBinary, TypeKindChar, TypeKindVarchar, TypeKindGeometry, TypeKindGeography:
 		return decodeVariableLengthColumn(present, valueCount, column, streams, dataStream, encoding)
 	case TypeKindTimestamp, TypeKindTimestampInstant:
 		return decodeTimestampColumn(present, valueCount, column, streams, encoding, writerTimezone, column.calendar)
@@ -1368,7 +1369,7 @@ func splitVariableData(data []byte, lengths []uint64) ([][]byte, error) {
 }
 
 func variableValue(kind TypeKind, data []byte) any {
-	if kind == TypeKindBinary {
+	if kind == TypeKindBinary || kind == TypeKindGeometry || kind == TypeKindGeography {
 		value := make([]byte, len(data))
 		copy(value, data)
 		return value

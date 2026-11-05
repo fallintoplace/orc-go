@@ -57,7 +57,7 @@ func (w *Writer) encodeColumnGroups(column writerColumn, ranges []writerValueRan
 			delete(group, streamKindData)
 		}
 	}
-	if (isWriterStringType(column.kind) || column.kind == TypeKindBinary) && hasWriterNonNull(column.values) {
+	if (isWriterStringType(column.kind) || column.kind == TypeKindBinary || column.kind == TypeKindGeometry || column.kind == TypeKindGeography) && hasWriterNonNull(column.values) {
 		streamKinds[streamKindData] = true
 	}
 
