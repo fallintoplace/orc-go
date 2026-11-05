@@ -141,19 +141,156 @@ func TestDecodeRLEv2PatchedBaseContinuedGap(t *testing.T) {
 
 func TestEncodeRLEv2SpecificationExamples(t *testing.T) {
 	testCases := []struct {
-		name string
-		got  []byte
-		want []byte
+		name   string
+		values []uint64
+		want   []byte
 	}{
-		{name: "short repeat", got: EncodeUnsigned([]uint64{10000, 10000, 10000, 10000, 10000}), want: []byte{0x0a, 0x27, 0x10}},
-		{name: "direct", got: EncodeUnsigned([]uint64{23713, 43806, 57005, 48879}), want: []byte{0x5e, 0x03, 0x5c, 0xa1, 0xab, 0x1e, 0xde, 0xad, 0xbe, 0xef}},
+		{name: "short repeat", values: []uint64{10000, 10000, 10000, 10000, 10000}, want: []byte{0x0a, 0x27, 0x10}},
+		{name: "direct", values: []uint64{23713, 43806, 57005, 48879}, want: []byte{0x5e, 0x03, 0x5c, 0xa1, 0xab, 0x1e, 0xde, 0xad, 0xbe, 0xef}},
+		{
+			name: "patched base",
+			values: []uint64{2030, 2000, 2020, 1000000, 2040, 2050, 2060, 2070, 2080, 2090,
+				2100, 2110, 2120, 2130, 2140, 2150, 2160, 2170, 2180, 2190},
+			want: []byte{0x8e, 0x13, 0x2b, 0x21, 0x07, 0xd0, 0x1e, 0x00, 0x14, 0x70, 0x28, 0x32, 0x3c, 0x46,
+				0x50, 0x5a, 0x64, 0x6e, 0x78, 0x82, 0x8c, 0x96, 0xa0, 0xaa, 0xb4, 0xbe, 0xfc, 0xe8},
+		},
+		{
+			name:   "delta",
+			values: []uint64{2, 3, 5, 7, 11, 13, 17, 19, 23, 29},
+			want:   []byte{0xc6, 0x09, 0x02, 0x02, 0x22, 0x42, 0x42, 0x46},
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if !reflect.DeepEqual(tc.got, tc.want) {
-				t.Fatalf("encoded bytes = %x, want %x", tc.got, tc.want)
+			got := EncodeUnsigned(tc.values)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("encoded bytes = %x, want %x", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestEncodeSignedSelectsAllRLEv2Modes(t *testing.T) {
+	patched := make([]int64, 20)
+	negativePatched := make([]int64, 20)
+	for i := range patched {
+		patched[i] = int64(10 + i)
+		negativePatched[i] = int64(-100 + i)
+	}
+	patched[4] = 1_000_000
+	negativePatched[4] = 900_000
+
+	testCases := []struct {
+		name   string
+		values []int64
+		mode   byte
+	}{
+		{name: "short repeat", values: []int64{-2, -2, -2, -2}, mode: shortRepeat},
+		{name: "direct", values: []int64{math.MinInt64, math.MaxInt64, math.MinInt64, math.MaxInt64}, mode: direct},
+		{name: "patched base", values: patched, mode: patchedBase},
+		{name: "patched base with negative base", values: negativePatched, mode: patchedBase},
+		{name: "delta", values: []int64{2, 3, 5, 7, 11, 13, 17, 19, 23, 29}, mode: delta},
+		{name: "decreasing delta", values: []int64{29, 23, 19, 17, 13, 11, 7, 5, 3, 2}, mode: delta},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded := EncodeSigned(tc.values)
+			if got := encoded[0] >> 6; got != tc.mode {
+				t.Fatalf("RLEv2 mode = %d, want %d (bytes %x)", got, tc.mode, encoded)
+			}
+			decoded, err := DecodeSigned(encoded, len(tc.values))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(decoded, tc.values) {
+				t.Fatalf("DecodeSigned() = %v, want %v", decoded, tc.values)
+			}
+		})
+	}
+}
+
+func TestEncodeUnsignedRLEv2BoundaryValues(t *testing.T) {
+	testCases := [][]uint64{
+		{math.MaxUint64, math.MaxUint64 - 1, math.MaxUint64 - 3, math.MaxUint64 - 6},
+		{math.MaxUint64, 0},
+		{uint64(math.MaxInt64) + 1, uint64(math.MaxInt64) + 2, uint64(math.MaxInt64) + 4},
+	}
+	for caseIndex, values := range testCases {
+		encoded := EncodeUnsigned(values)
+		got, err := DecodeUnsigned(encoded, len(values))
+		if err != nil {
+			t.Fatalf("case %d DecodeUnsigned() error = %v", caseIndex, err)
+		}
+		if !reflect.DeepEqual(got, values) {
+			t.Fatalf("case %d DecodeUnsigned() = %v, want %v", caseIndex, got, values)
+		}
+	}
+}
+
+func TestEncodeUnsignedRLEv2WidePatchBoundary(t *testing.T) {
+	values := []uint64{0}
+	for value := uint64(256); value < 274; value++ {
+		values = append(values, value)
+	}
+	values = append(values, math.MaxUint64)
+
+	encoded := EncodeUnsigned(values)
+	if mode := encoded[0] >> 6; mode != patchedBase {
+		t.Fatalf("RLEv2 mode = %d, want patched base (bytes %x)", mode, encoded)
+	}
+	got, err := DecodeUnsigned(encoded, len(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, values) {
+		t.Fatalf("DecodeUnsigned() = %v, want %v", got, values)
+	}
+}
+
+func TestEncodeSignedRLEv2WidePatchBoundary(t *testing.T) {
+	values := []int64{-1000}
+	for value := int64(256); value < 274; value++ {
+		values = append(values, value)
+	}
+	values = append(values, math.MaxInt64)
+
+	encoded := EncodeSigned(values)
+	if mode := encoded[0] >> 6; mode != patchedBase {
+		t.Fatalf("RLEv2 mode = %d, want patched base (bytes %x)", mode, encoded)
+	}
+	got, err := DecodeSigned(encoded, len(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, values) {
+		t.Fatalf("DecodeSigned() = %v, want %v", got, values)
+	}
+}
+
+func TestEncodeUnsignedRLEv2ContinuedPatchGap(t *testing.T) {
+	values := make([]uint64, 400)
+	for i := range values {
+		values[i] = uint64(i % 200)
+	}
+	values[300] = uint64(1) << 40
+
+	encoded := EncodeUnsigned(values)
+	if mode := encoded[0] >> 6; mode != patchedBase {
+		t.Fatalf("RLEv2 mode = %d, want patched base (bytes %x)", mode, encoded)
+	}
+	got, err := DecodeUnsigned(encoded, len(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, values) {
+		t.Fatal("DecodeUnsigned() did not reproduce values across a continued patch gap")
+	}
+}
+
+func TestApplyPatchesRejectsShiftOverflow(t *testing.T) {
+	_, err := applyPatches([]uint64{0}, []uint64{uint64(1) << 55}, 9, 56, 1)
+	if err == nil {
+		t.Fatal("applyPatches() accepted a patch that overflows after shifting")
 	}
 }
 
