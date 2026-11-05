@@ -5,7 +5,10 @@ import (
 	"math"
 	"math/big"
 	"time"
+	"unicode/utf8"
 )
+
+const maxStringStatisticBoundBytes = 1024
 
 func newEmptyColumnStatistics() ColumnStatistics {
 	return ColumnStatistics{HasNumberOfValues: true, HasNullSet: true}
@@ -127,6 +130,17 @@ func buildWriterColumnStatistics(column writerColumn, values []any, rows uint64)
 					result.Sum += int64(len(text))
 				}
 			}
+		}
+		if result.HasMinimum && len(result.Minimum) > maxStringStatisticBoundBytes {
+			result.LowerBound = truncateStringLowerBound(result.Minimum)
+			result.HasLowerBound = true
+			result.Minimum = ""
+			result.HasMinimum = false
+		}
+		if result.HasMaximum && len(result.Maximum) > maxStringStatisticBoundBytes {
+			result.UpperBound, result.HasUpperBound = truncateStringUpperBound(result.Maximum)
+			result.Maximum = ""
+			result.HasMaximum = false
 		}
 		stats.String = result
 	case TypeKindBinary:
@@ -416,20 +430,8 @@ func mergeStringStatistics(destination **StringStatistics, source *StringStatist
 		return
 	}
 	result := *destination
-	if result.HasMinimum && source.HasMinimum {
-		if source.Minimum < result.Minimum {
-			result.Minimum = source.Minimum
-		}
-	} else {
-		result.HasMinimum = false
-	}
-	if result.HasMaximum && source.HasMaximum {
-		if source.Maximum > result.Maximum {
-			result.Maximum = source.Maximum
-		}
-	} else {
-		result.HasMaximum = false
-	}
+	mergeStringBound(result, source, true)
+	mergeStringBound(result, source, false)
 	if result.HasSum && source.HasSum {
 		if source.Sum > math.MaxInt64-result.Sum {
 			result.HasSum = false
@@ -439,6 +441,114 @@ func mergeStringStatistics(destination **StringStatistics, source *StringStatist
 	} else {
 		result.HasSum = false
 	}
+}
+
+func mergeStringBound(destination, source *StringStatistics, minimum bool) {
+	var destinationValue, sourceValue string
+	var destinationPresent, sourcePresent bool
+	var destinationExact, sourceExact bool
+	if minimum {
+		destinationValue, destinationPresent, destinationExact = stringLowerBound(destination)
+		sourceValue, sourcePresent, sourceExact = stringLowerBound(source)
+	} else {
+		destinationValue, destinationPresent, destinationExact = stringUpperBound(destination)
+		sourceValue, sourcePresent, sourceExact = stringUpperBound(source)
+	}
+
+	if !destinationPresent || !sourcePresent {
+		if minimum {
+			destination.Minimum, destination.HasMinimum = "", false
+			destination.LowerBound, destination.HasLowerBound = "", false
+		} else {
+			destination.Maximum, destination.HasMaximum = "", false
+			destination.UpperBound, destination.HasUpperBound = "", false
+		}
+		return
+	}
+
+	chooseSource := sourceValue < destinationValue
+	if !minimum {
+		chooseSource = sourceValue > destinationValue
+	}
+	if sourceValue == destinationValue && sourceExact && !destinationExact {
+		chooseSource = true
+	}
+	value, exact := destinationValue, destinationExact
+	if chooseSource {
+		value, exact = sourceValue, sourceExact
+	}
+	if minimum {
+		destination.Minimum, destination.HasMinimum = "", false
+		destination.LowerBound, destination.HasLowerBound = "", false
+		if exact {
+			destination.Minimum, destination.HasMinimum = value, true
+		} else {
+			destination.LowerBound, destination.HasLowerBound = value, true
+		}
+	} else {
+		destination.Maximum, destination.HasMaximum = "", false
+		destination.UpperBound, destination.HasUpperBound = "", false
+		if exact {
+			destination.Maximum, destination.HasMaximum = value, true
+		} else {
+			destination.UpperBound, destination.HasUpperBound = value, true
+		}
+	}
+}
+
+func stringLowerBound(statistics *StringStatistics) (value string, present, exact bool) {
+	if statistics.HasMinimum {
+		return statistics.Minimum, true, true
+	}
+	if statistics.HasLowerBound {
+		return statistics.LowerBound, true, false
+	}
+	return "", false, false
+}
+
+func stringUpperBound(statistics *StringStatistics) (value string, present, exact bool) {
+	if statistics.HasMaximum {
+		return statistics.Maximum, true, true
+	}
+	if statistics.HasUpperBound {
+		return statistics.UpperBound, true, false
+	}
+	return "", false, false
+}
+
+func truncateStringLowerBound(value string) string {
+	if len(value) <= maxStringStatisticBoundBytes {
+		return value
+	}
+	end := maxStringStatisticBoundBytes
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end]
+}
+
+func truncateStringUpperBound(value string) (string, bool) {
+	if !utf8.ValidString(value) {
+		return "", false
+	}
+	var bound string
+	found := false
+	for offset := 0; offset < maxStringStatisticBoundBytes; {
+		r, size := utf8.DecodeRuneInString(value[offset:])
+		if r == utf8.RuneError && size == 1 {
+			return "", false
+		}
+		nextRune := r + 1
+		if nextRune <= utf8.MaxRune && (nextRune < 0xd800 || nextRune > 0xdfff) {
+			nextSize := utf8.RuneLen(nextRune)
+			if offset+nextSize <= maxStringStatisticBoundBytes {
+				bound = value[:offset] + string(nextRune)
+				found = true
+			}
+		}
+		offset += size
+	}
+	return bound, found
 }
 
 func mergeBucketStatistics(destination **BucketStatistics, source *BucketStatistics) {
@@ -599,6 +709,12 @@ func encodeColumnStatistics(statistics ColumnStatistics) []byte {
 		}
 		if statistics.String.HasSum {
 			values = appendProtoVarintField(values, 3, encodeSInt64(statistics.String.Sum))
+		}
+		if statistics.String.HasLowerBound {
+			values = appendProtoBytesField(values, 4, []byte(statistics.String.LowerBound))
+		}
+		if statistics.String.HasUpperBound {
+			values = appendProtoBytesField(values, 5, []byte(statistics.String.UpperBound))
 		}
 		result = appendProtoBytesField(result, 4, values)
 	}
