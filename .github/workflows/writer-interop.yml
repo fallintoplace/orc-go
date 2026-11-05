@@ -1,4 +1,4 @@
-name: Writer interoperability
+name: ORC interoperability
 
 on:
   pull_request:
@@ -11,8 +11,8 @@ permissions:
   contents: read
 
 jobs:
-  writer-interop:
-    name: Writer interoperability
+  orc-interop:
+    name: Reader and writer interoperability
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -20,6 +20,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+
+      - name: Check Go reader interoperability
+        run: go test ./... -count=1
 
       - uses: actions/setup-python@v7
         with:
