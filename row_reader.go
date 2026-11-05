@@ -271,6 +271,14 @@ func (r *Reader) readValuesRange(start, end uint64, names []string, projected bo
 		if err != nil {
 			return fmt.Errorf("stripe %d row count: %w", stripeIndex, err)
 		}
+		handled, err := r.readIndexedNumericRangeStripe(stripe, stripeIndex, stripeRowStart, stripeRowEnd, start, end, columns, projected, yield)
+		if err != nil {
+			return err
+		}
+		if handled {
+			stripeRowStart = stripeRowEnd
+			continue
+		}
 		streams, footer, err := r.readStripeStreamsAt(stripe, wanted, stripeIndex, encryptionStripeID, encryptedLocalKeys)
 		if err != nil {
 			return fmt.Errorf("read stripe %d: %w", stripeIndex, err)
