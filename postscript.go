@@ -33,6 +33,8 @@ type postScript struct {
 	stripeStatisticsLength uint64
 	compression            CompressionKind
 	compressionBlockSize   uint64
+	writerVersion          uint32
+	hasWriterVersion       bool
 	version                []uint32
 }
 
@@ -61,6 +63,9 @@ func parsePostScript(data []byte) (postScript, error) {
 			result.version, err = appendUint32Values(result.version, field)
 		case 5:
 			result.metadataLength, err = fieldVarint(field)
+		case 6:
+			result.writerVersion, err = readUint32Field(field)
+			result.hasWriterVersion = err == nil
 		case 7:
 			result.stripeStatisticsLength, err = fieldVarint(field)
 		case 8000:
