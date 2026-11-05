@@ -6,7 +6,7 @@ Run the optional cross-implementation check from the repository root:
 ./interop/check-writer.sh
 ```
 
-It needs Go 1.22 or newer, Python with PyArrow 24.0.0, Maven, and JDK 11 or newer.
+It needs Go 1.22 or newer, Python with PyArrow 24.0.0, Maven, and JDK 17 or newer.
 Install PyArrow with `python3 -m pip install -r interop/pyarrow/requirements.txt`.
 The Java check uses Apache ORC 2.3.1; Maven downloads it if it is not already cached.
 
