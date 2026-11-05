@@ -1202,9 +1202,9 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, columnEncodi
 			binary.LittleEndian.PutUint64(data[i*8:], math.Float64bits(value.(float64)))
 		}
 	case TypeKindString, TypeKindChar, TypeKindVarchar:
-		data, lengths = flattenVariableValues(values, func(value any) []byte { return []byte(value.(string)) })
+		data, lengths = flattenVariableValues(values, column.kind)
 	case TypeKindBinary, TypeKindGeometry, TypeKindGeography:
-		data, lengths = flattenVariableValues(values, func(value any) []byte { return value.([]byte) })
+		data, lengths = flattenVariableValues(values, column.kind)
 	default:
 		return nil, columnEncoding{}, fmt.Errorf("%w: %s", ErrUnsupportedType, column.kind)
 	}
@@ -1344,13 +1344,37 @@ func dateDays(value time.Time) (int64, error) {
 	return days, nil
 }
 
-func flattenVariableValues(values []any, bytesOf func(any) []byte) ([]byte, []uint64) {
-	var data []byte
+func flattenVariableValues(values []any, kind TypeKind) ([]byte, []uint64) {
 	lengths := make([]uint64, len(values))
-	for i, value := range values {
-		part := bytesOf(value)
-		lengths[i] = uint64(len(part))
-		data = append(data, part...)
+	dataLength := 0
+	stringValues := isWriterStringType(kind)
+	// Compute the exact buffer size first to avoid repeated growth copies.
+	if stringValues {
+		for i, value := range values {
+			text := value.(string)
+			lengths[i] = uint64(len(text))
+			dataLength += len(text)
+		}
+	} else {
+		for i, value := range values {
+			part := value.([]byte)
+			lengths[i] = uint64(len(part))
+			dataLength += len(part)
+		}
+	}
+
+	if dataLength == 0 {
+		return nil, lengths
+	}
+	data := make([]byte, 0, dataLength)
+	if stringValues {
+		for _, value := range values {
+			data = append(data, value.(string)...)
+		}
+	} else {
+		for _, value := range values {
+			data = append(data, value.([]byte)...)
+		}
 	}
 	return data, lengths
 }
