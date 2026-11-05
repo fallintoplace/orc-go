@@ -245,17 +245,21 @@ func buildWriterColumnStatistics(column writerColumn, values []any, rows uint64)
 			if value == nil {
 				continue
 			}
-			millis, ok := writerTimestampMillis(value.(encodedTimestamp))
+			millis, nanos, ok := writerTimestampBounds(value.(encodedTimestamp))
 			if !ok {
 				continue
 			}
-			if !result.HasMinimum || millis < result.Minimum {
+			if !result.HasMinimum || millis < result.Minimum ||
+				(millis == result.Minimum && nanos < timestampNanosValue(result, true)) {
 				result.Minimum, result.MinimumUTC = millis, millis
-				result.HasMinimum, result.HasMinimumUTC = true, true
+				result.MinimumNanos = nanos
+				result.HasMinimum, result.HasMinimumUTC, result.HasMinimumNanos = true, true, true
 			}
-			if !result.HasMaximum || millis > result.Maximum {
+			if !result.HasMaximum || millis > result.Maximum ||
+				(millis == result.Maximum && nanos > timestampNanosValue(result, false)) {
 				result.Maximum, result.MaximumUTC = millis, millis
-				result.HasMaximum, result.HasMaximumUTC = true, true
+				result.MaximumNanos = nanos
+				result.HasMaximum, result.HasMaximumUTC, result.HasMaximumNanos = true, true, true
 			}
 		}
 		stats.Timestamp = result
@@ -320,19 +324,20 @@ func writerFloatValue(kind TypeKind, value any) float64 {
 	return value.(float64)
 }
 
-func writerTimestampMillis(value encodedTimestamp) (int64, bool) {
+func writerTimestampBounds(value encodedTimestamp) (int64, int32, bool) {
 	if (value.seconds > 0 && orcTimestampEpoch > math.MaxInt64-value.seconds) || (value.seconds < 0 && orcTimestampEpoch < math.MinInt64-value.seconds) {
-		return 0, false
+		return 0, 0, false
 	}
 	seconds := orcTimestampEpoch + value.seconds
 	if seconds > math.MaxInt64/1000+1 || seconds < math.MinInt64/1000-1 {
-		return 0, false
+		return 0, 0, false
 	}
 	nanos, err := decodeTimestampNanos(value.nanos)
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
-	return time.Unix(seconds, nanos).UnixMilli(), true
+	timestamp := time.Unix(seconds, nanos)
+	return timestamp.UnixMilli(), int32(timestamp.Nanosecond() % 1_000_000), true
 }
 
 func mergeWriterColumnStatistics(kind TypeKind, destination, source ColumnStatistics) (ColumnStatistics, error) {
@@ -343,6 +348,7 @@ func mergeWriterColumnStatistics(kind TypeKind, destination, source ColumnStatis
 	if math.MaxUint64-destination.NumberOfValues < source.NumberOfValues {
 		return ColumnStatistics{}, fmt.Errorf("ORC column statistics value count overflows uint64")
 	}
+	hadExistingValues := destination.NumberOfValues > 0
 	destination.NumberOfValues += source.NumberOfValues
 	destination.HasNumberOfValues = true
 	destination.HasNull = destination.HasNull || source.HasNull
@@ -371,7 +377,16 @@ func mergeWriterColumnStatistics(kind TypeKind, destination, source ColumnStatis
 	case TypeKindList, TypeKindMap:
 		mergeCollectionStatistics(&destination.Collection, source.Collection)
 	case TypeKindTimestamp, TypeKindTimestampInstant:
-		mergeTimestampStatistics(&destination.Timestamp, source.Timestamp)
+		if !hadExistingValues {
+			// An all-null stripe has no bounds to merge into the first values.
+			destination.Timestamp = nil
+			if source.Timestamp != nil {
+				value := *source.Timestamp
+				destination.Timestamp = &value
+			}
+		} else {
+			mergeTimestampStatistics(&destination.Timestamp, source.Timestamp)
+		}
 	}
 	return destination, nil
 }
@@ -724,10 +739,70 @@ func mergeTimestampStatistics(destination **TimestampStatistics, source *Timesta
 		return
 	}
 	result := *destination
+	_, hasMinimumDestination := timestampMillisBound(result, true)
+	_, hasMinimumSource := timestampMillisBound(source, true)
+	_, hasMaximumDestination := timestampMillisBound(result, false)
+	_, hasMaximumSource := timestampMillisBound(source, false)
+	minimumSourceWins := timestampSourceWinsBound(result, source, true)
+	maximumSourceWins := timestampSourceWinsBound(result, source, false)
 	mergeIntBounds(&result.Minimum, &result.HasMinimum, source.Minimum, source.HasMinimum, true)
 	mergeIntBounds(&result.Maximum, &result.HasMaximum, source.Maximum, source.HasMaximum, false)
 	mergeIntBounds(&result.MinimumUTC, &result.HasMinimumUTC, source.MinimumUTC, source.HasMinimumUTC, true)
 	mergeIntBounds(&result.MaximumUTC, &result.HasMaximumUTC, source.MaximumUTC, source.HasMaximumUTC, false)
+	if !hasMinimumDestination || !hasMinimumSource {
+		result.HasMinimumNanos = false
+	} else if minimumSourceWins {
+		result.MinimumNanos, result.HasMinimumNanos = source.MinimumNanos, source.HasMinimumNanos
+	}
+	if !hasMaximumDestination || !hasMaximumSource {
+		result.HasMaximumNanos = false
+	} else if maximumSourceWins {
+		result.MaximumNanos, result.HasMaximumNanos = source.MaximumNanos, source.HasMaximumNanos
+	}
+}
+
+func timestampSourceWinsBound(destination, source *TimestampStatistics, minimum bool) bool {
+	destinationMillis, hasDestination := timestampMillisBound(destination, minimum)
+	sourceMillis, hasSource := timestampMillisBound(source, minimum)
+	if !hasSource || !hasDestination {
+		return false
+	}
+	if sourceMillis != destinationMillis {
+		if minimum {
+			return sourceMillis < destinationMillis
+		}
+		return sourceMillis > destinationMillis
+	}
+	if minimum {
+		return timestampNanosValue(source, true) < timestampNanosValue(destination, true)
+	}
+	return timestampNanosValue(source, false) > timestampNanosValue(destination, false)
+}
+
+func timestampMillisBound(statistics *TimestampStatistics, minimum bool) (int64, bool) {
+	if minimum {
+		if statistics.HasMinimumUTC {
+			return statistics.MinimumUTC, true
+		}
+		return statistics.Minimum, statistics.HasMinimum
+	}
+	if statistics.HasMaximumUTC {
+		return statistics.MaximumUTC, true
+	}
+	return statistics.Maximum, statistics.HasMaximum
+}
+
+func timestampNanosValue(statistics *TimestampStatistics, minimum bool) int32 {
+	if minimum {
+		if statistics.HasMinimumNanos {
+			return statistics.MinimumNanos
+		}
+		return 0
+	}
+	if statistics.HasMaximumNanos {
+		return statistics.MaximumNanos
+	}
+	return 999_999
 }
 
 func addInt64(left, right int64) (int64, bool) {
@@ -837,6 +912,12 @@ func encodeColumnStatistics(statistics ColumnStatistics) []byte {
 		}
 		if statistics.Timestamp.HasMaximumUTC {
 			values = appendProtoVarintField(values, 4, encodeSInt64(statistics.Timestamp.MaximumUTC))
+		}
+		if statistics.Timestamp.HasMinimumNanos {
+			values = appendProtoVarintField(values, 5, uint64(statistics.Timestamp.MinimumNanos+1))
+		}
+		if statistics.Timestamp.HasMaximumNanos {
+			values = appendProtoVarintField(values, 6, uint64(statistics.Timestamp.MaximumNanos+1))
 		}
 		result = appendProtoBytesField(result, 9, values)
 	}

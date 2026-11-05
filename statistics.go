@@ -102,16 +102,23 @@ type BinaryStatistics struct {
 
 // TimestampStatistics stores timestamp minima and maxima as Unix milliseconds.
 // The UTC fields are present in newer ORC writers and distinguish instant
-// comparisons from wall-clock timestamp comparisons.
+// comparisons from wall-clock timestamp comparisons. The nanosecond fields
+// store the final six digits below millisecond precision, as values from 0 to
+// 999999. When a nanosecond field is absent, ORC uses 0 for a minimum and
+// 999999 for a maximum.
 type TimestampStatistics struct {
-	Minimum       int64
-	HasMinimum    bool
-	Maximum       int64
-	HasMaximum    bool
-	MinimumUTC    int64
-	HasMinimumUTC bool
-	MaximumUTC    int64
-	HasMaximumUTC bool
+	Minimum         int64
+	HasMinimum      bool
+	Maximum         int64
+	HasMaximum      bool
+	MinimumUTC      int64
+	HasMinimumUTC   bool
+	MaximumUTC      int64
+	HasMaximumUTC   bool
+	MinimumNanos    int32
+	HasMinimumNanos bool
+	MaximumNanos    int32
+	HasMaximumNanos bool
 }
 
 // CollectionStatistics describes the number of children in LIST and MAP values.
@@ -560,7 +567,19 @@ func parseTimestampStatistics(data []byte) (TimestampStatistics, error) {
 	}
 	var result TimestampStatistics
 	for _, field := range fields {
-		if field.Number < 1 || field.Number > 4 {
+		if field.Number < 1 || field.Number > 6 {
+			continue
+		}
+		if field.Number == 5 || field.Number == 6 {
+			value, err := fieldTimestampNanos(field)
+			if err != nil {
+				return TimestampStatistics{}, err
+			}
+			if field.Number == 5 {
+				result.MinimumNanos, result.HasMinimumNanos = value, true
+			} else {
+				result.MaximumNanos, result.HasMaximumNanos = value, true
+			}
 			continue
 		}
 		value, err := fieldSInt64(field)
@@ -578,7 +597,23 @@ func parseTimestampStatistics(data []byte) (TimestampStatistics, error) {
 			result.MaximumUTC, result.HasMaximumUTC = value, true
 		}
 	}
+	if !result.HasMaximumNanos && (result.HasMaximum || result.HasMaximumUTC) {
+		result.MaximumNanos = 999_999
+	}
 	return result, nil
+}
+
+func fieldTimestampNanos(field wire.Field) (int32, error) {
+	value, err := fieldVarint(field)
+	if err != nil {
+		return 0, err
+	}
+	// ORC stores the final six timestamp digits plus one. The offset keeps
+	// the default values (0 for minima and 999999 for maxima) omittable.
+	if value < 1 || value > 1_000_000 {
+		return 0, fmt.Errorf("ORC timestamp statistics nanos field %d has value %d, want 1..1000000", field.Number, value)
+	}
+	return int32(value - 1), nil
 }
 
 func parseFileMetadata(data []byte) (fileMetadata, error) {
