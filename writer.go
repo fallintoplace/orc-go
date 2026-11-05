@@ -981,7 +981,11 @@ func (w *Writer) encodeColumn(column writerColumn) ([]writerStream, columnEncodi
 	default:
 		return nil, columnEncoding{}, fmt.Errorf("%w: %s", ErrUnsupportedType, column.kind)
 	}
-	if len(data) > 0 {
+	// Direct variable-length columns need a DATA stream even when all values
+	// are empty. Their LENGTH stream alone does not declare the DATA stream.
+	variableData := isWriterStringType(column.kind) || column.kind == TypeKindBinary ||
+		column.kind == TypeKindGeometry || column.kind == TypeKindGeography
+	if len(data) > 0 || (variableData && len(values) > 0) {
 		streams = append(streams, writerStream{kind: streamKindData, column: column.id, data: data})
 	}
 	if lengths != nil {
