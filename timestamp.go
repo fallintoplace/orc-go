@@ -44,10 +44,10 @@ func decodeTimestampColumn(present []bool, valueCount int, column rowColumn, str
 		}
 	}
 
-	values := make([]any, len(present))
+	values := make([]any, outputRowCount(present, valueCount))
 	valueIndex := 0
-	for rowIndex, isPresent := range present {
-		if !isPresent {
+	for rowIndex := range values {
+		if present != nil && !present[rowIndex] {
 			continue
 		}
 		value, err := decodeTimestampValue(seconds[valueIndex], nanos[valueIndex], column.kind, location, calendar)
