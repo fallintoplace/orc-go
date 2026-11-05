@@ -180,6 +180,9 @@ func parseType(data []byte) (Type, error) {
 	if !hasKind {
 		return Type{}, fmt.Errorf("ORC type has no kind")
 	}
+	if err := validateTypeParameters(result); err != nil {
+		return Type{}, fmt.Errorf("ORC type: %w", err)
+	}
 	if !hasCRS && (result.Kind == TypeKindGeometry || result.Kind == TypeKindGeography) {
 		result.CRS = defaultGeospatialCRS
 	}

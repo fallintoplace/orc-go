@@ -114,6 +114,9 @@ func validateTypes(types []Type) error {
 				return fmt.Errorf("type %d references missing subtype %d", i, subtype)
 			}
 		}
+		if err := validateTypeParameters(typ); err != nil {
+			return fmt.Errorf("type %d: %w", i, err)
+		}
 		if typ.Kind != TypeKindGeometry && typ.Kind != TypeKindGeography &&
 			(typ.CRS != "" || typ.EdgeInterpolation != EdgeInterpolationSpherical) {
 			return fmt.Errorf("type %d has geospatial metadata but is %s", i, typ.Kind)
@@ -178,6 +181,19 @@ func validateTypes(types []Type) error {
 				stack = append(stack, typeVisit{id: child})
 			}
 		}
+	}
+	return nil
+}
+
+func validateTypeParameters(typ Type) error {
+	if typ.MaxLength != 0 && typ.Kind != TypeKindChar && typ.Kind != TypeKindVarchar {
+		return fmt.Errorf("maximum length is only valid for CHAR or VARCHAR, not %s", typ.Kind)
+	}
+	if typ.Precision != 0 && typ.Kind != TypeKindDecimal {
+		return fmt.Errorf("precision is only valid for DECIMAL, not %s", typ.Kind)
+	}
+	if typ.Scale != 0 && typ.Kind != TypeKindDecimal {
+		return fmt.Errorf("scale is only valid for DECIMAL, not %s", typ.Kind)
 	}
 	return nil
 }
