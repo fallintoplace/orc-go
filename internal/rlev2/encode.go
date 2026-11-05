@@ -11,8 +11,10 @@ func encodeUnsignedValues(values []uint64) []byte {
 	for position := 0; position < len(values); {
 		repeat := equalRunLength(values[position:])
 		if repeat >= minRepeat {
-			count := shortRepeatChunk(repeat)
-			writeShortRepeat(&output, values[position], count)
+			count := min(repeat, maxRun)
+			run := values[position : position+count]
+			encoded := bestRunEncoding(encodeShortRepeatRun(run[0], count), encodeDeltaUnsigned(run))
+			output.Write(encoded)
 			position += count
 			continue
 		}
@@ -31,8 +33,10 @@ func encodeSignedValues(values []int64) []byte {
 	for position := 0; position < len(values); {
 		repeat := signedEqualRunLength(values[position:])
 		if repeat >= minRepeat {
-			count := shortRepeatChunk(repeat)
-			writeShortRepeat(&output, zigzagEncode(values[position]), count)
+			count := min(repeat, maxRun)
+			run := values[position : position+count]
+			encoded := bestRunEncoding(encodeSignedShortRepeatRun(run[0], count), encodeDeltaSigned(run))
+			output.Write(encoded)
 			position += count
 			continue
 		}
@@ -60,6 +64,20 @@ func shortRepeatChunk(runLength int) int {
 		count -= minRepeat - remaining
 	}
 	return count
+}
+
+func encodeShortRepeatRun(value uint64, count int) []byte {
+	var output bytes.Buffer
+	for count > 0 {
+		chunk := shortRepeatChunk(count)
+		writeShortRepeat(&output, value, chunk)
+		count -= chunk
+	}
+	return output.Bytes()
+}
+
+func encodeSignedShortRepeatRun(value int64, count int) []byte {
+	return encodeShortRepeatRun(zigzagEncode(value), count)
 }
 
 func unsignedRunEnd(values []uint64, start int) int {
@@ -92,13 +110,12 @@ func signedEqualRunLength(values []int64) int {
 	return length
 }
 
-func bestRunEncoding(direct, delta, patched []byte) []byte {
-	best := direct
-	if len(delta) > 0 && len(delta) < len(best) {
-		best = delta
-	}
-	if len(patched) > 0 && len(patched) < len(best) {
-		best = patched
+func bestRunEncoding(candidates ...[]byte) []byte {
+	var best []byte
+	for _, candidate := range candidates {
+		if len(candidate) > 0 && (best == nil || len(candidate) < len(best)) {
+			best = candidate
+		}
 	}
 	return best
 }
@@ -113,17 +130,31 @@ func encodeDeltaUnsigned(values []uint64) []byte {
 	if len(values) < 2 {
 		return nil
 	}
+	if values[0] == values[1] {
+		deltas := make([]uint64, len(values)-1)
+		for i := 1; i < len(values); i++ {
+			if values[i] < values[i-1] {
+				return nil
+			}
+			deltas[i-1] = values[i] - values[i-1]
+		}
+		variableDeltas := deltas[1:]
+		if hasNonZeroDelta(variableDeltas) {
+			return encodeDeltaRun(len(values), values[0], 0, variableDeltas)
+		}
+		return encodeDeltaRun(len(values), values[0], 0, nil)
+	}
 
 	increasing := values[1] > values[0]
 	deltas := make([]uint64, len(values)-1)
 	for i := 1; i < len(values); i++ {
 		if increasing {
-			if values[i] <= values[i-1] {
+			if values[i] < values[i-1] {
 				return nil
 			}
 			deltas[i-1] = values[i] - values[i-1]
 		} else {
-			if values[i] >= values[i-1] {
+			if values[i] > values[i-1] {
 				return nil
 			}
 			deltas[i-1] = values[i-1] - values[i]
@@ -151,14 +182,35 @@ func encodeDeltaSigned(values []int64) []byte {
 	if len(values) < 2 {
 		return nil
 	}
+	if values[0] == values[1] {
+		deltas := make([]uint64, len(values)-1)
+		for i := 1; i < len(values); i++ {
+			if values[i] < values[i-1] {
+				return nil
+			}
+			deltas[i-1] = uint64(values[i]) - uint64(values[i-1])
+		}
+		variableDeltas := deltas[1:]
+		if hasNonZeroDelta(variableDeltas) {
+			return encodeDeltaRun(len(values), zigzagEncode(values[0]), 0, variableDeltas)
+		}
+		return encodeDeltaRun(len(values), zigzagEncode(values[0]), 0, nil)
+	}
 
 	negative, firstDelta, ok := signedDifference(values[0], values[1])
 	if !ok {
 		return nil
 	}
+	if negative && firstDelta > uint64(1)<<63 || !negative && firstDelta > math.MaxInt64 {
+		return nil
+	}
 	deltas := make([]uint64, len(values)-1)
 	deltas[0] = firstDelta
 	for i := 2; i < len(values); i++ {
+		if values[i] == values[i-1] {
+			deltas[i-1] = 0
+			continue
+		}
 		currentNegative, magnitude, ok := signedDifference(values[i-1], values[i])
 		if !ok || currentNegative != negative {
 			return nil
@@ -186,11 +238,11 @@ func encodeDeltaSigned(values []int64) []byte {
 func signedDifference(from, to int64) (negative bool, magnitude uint64, ok bool) {
 	if to > from {
 		magnitude = uint64(to) - uint64(from)
-		return false, magnitude, magnitude <= math.MaxInt64
+		return false, magnitude, true
 	}
 	if to < from {
 		magnitude = uint64(from) - uint64(to)
-		return true, magnitude, magnitude <= uint64(1)<<63
+		return true, magnitude, true
 	}
 	return false, 0, false
 }
@@ -203,9 +255,9 @@ func encodeDeltaRun(count int, base uint64, deltaBase int64, deltas []uint64) []
 			maximum = value
 		}
 	}
-	if maximum > 0 {
+	if len(deltas) > 0 {
 		width = closestDeltaFixedWidth(bits.Len64(maximum))
-		if width == 1 {
+		if width < 2 {
 			width = 2 // Width code zero means a fixed delta in RLEv2.
 		}
 	}
@@ -226,6 +278,15 @@ func encodeDeltaRun(count int, base uint64, deltaBase int64, deltas []uint64) []
 		output = append(output, packed...)
 	}
 	return output
+}
+
+func hasNonZeroDelta(deltas []uint64) bool {
+	for _, delta := range deltas {
+		if delta != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func closestDeltaFixedWidth(width int) int {

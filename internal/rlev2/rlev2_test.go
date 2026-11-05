@@ -209,6 +209,107 @@ func TestEncodeSignedSelectsAllRLEv2Modes(t *testing.T) {
 	}
 }
 
+func TestEncodeRLEv2UsesDeltaForLongRepeats(t *testing.T) {
+	unsigned := make([]uint64, maxRun+1)
+	for i := range unsigned {
+		unsigned[i] = math.MaxUint64
+	}
+	encodedUnsigned := EncodeUnsigned(unsigned)
+	if mode := encodedUnsigned[0] >> 6; mode != delta {
+		t.Fatalf("unsigned RLEv2 mode = %d, want delta", mode)
+	}
+	gotUnsigned, err := DecodeUnsigned(encodedUnsigned, len(unsigned))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotUnsigned, unsigned) {
+		t.Fatal("unsigned delta run did not reproduce the repeated values")
+	}
+
+	signed := make([]int64, maxRun+1)
+	for i := range signed {
+		signed[i] = math.MinInt64
+	}
+	encodedSigned := EncodeSigned(signed)
+	if mode := encodedSigned[0] >> 6; mode != delta {
+		t.Fatalf("signed RLEv2 mode = %d, want delta", mode)
+	}
+	gotSigned, err := DecodeSigned(encodedSigned, len(signed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotSigned, signed) {
+		t.Fatal("signed delta run did not reproduce the repeated values")
+	}
+}
+
+func TestEncodeRLEv2DeltaAllowsRepeatedAndWideDeltas(t *testing.T) {
+	unsigned := []uint64{0}
+	unsignedLeadingEqual := []uint64{0, 0}
+	unsignedDecreasing := []uint64{24}
+	signed := []int64{0}
+	signedLeadingEqual := []int64{0, 0}
+	signedDecreasing := []int64{24}
+	for value := uint64(1); value <= 24; value++ {
+		unsigned = append(unsigned, value, value)
+		signed = append(signed, int64(value), int64(value))
+		unsignedLeadingEqual = append(unsignedLeadingEqual, value, value)
+		signedLeadingEqual = append(signedLeadingEqual, int64(value), int64(value))
+		decreasing := 24 - value
+		unsignedDecreasing = append(unsignedDecreasing, decreasing, decreasing)
+		signedDecreasing = append(signedDecreasing, int64(decreasing), int64(decreasing))
+	}
+
+	wideSigned := []int64{-2, -1, math.MaxInt64}
+	testCases := []struct {
+		name   string
+		signed bool
+		mode   byte
+		wantS  []int64
+		wantU  []uint64
+	}{
+		{name: "unsigned repeated deltas", wantU: unsigned, mode: delta},
+		{name: "unsigned zero trailing delta", wantU: []uint64{math.MaxUint64 - 1, math.MaxUint64, math.MaxUint64}, mode: delta},
+		{name: "unsigned first delta zero", wantU: unsignedLeadingEqual, mode: delta},
+		{name: "unsigned decreasing repeated deltas", wantU: unsignedDecreasing, mode: delta},
+		{name: "signed repeated deltas", signed: true, wantS: signed, mode: delta},
+		{name: "signed zero trailing delta", signed: true, wantS: []int64{math.MaxInt64 - 1, math.MaxInt64, math.MaxInt64}, mode: delta},
+		{name: "signed first delta zero", signed: true, wantS: signedLeadingEqual, mode: delta},
+		{name: "signed decreasing repeated deltas", signed: true, wantS: signedDecreasing, mode: delta},
+		{name: "signed wide variable delta", signed: true, wantS: wideSigned, mode: delta},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var encoded []byte
+			if tc.signed {
+				encoded = EncodeSigned(tc.wantS)
+			} else {
+				encoded = EncodeUnsigned(tc.wantU)
+			}
+			if mode := encoded[0] >> 6; mode != tc.mode {
+				t.Fatalf("RLEv2 mode = %d, want delta (bytes %x)", mode, encoded)
+			}
+			if tc.signed {
+				got, err := DecodeSigned(encoded, len(tc.wantS))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(got, tc.wantS) {
+					t.Fatalf("DecodeSigned() = %v, want %v", got, tc.wantS)
+				}
+				return
+			}
+			got, err := DecodeUnsigned(encoded, len(tc.wantU))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tc.wantU) {
+				t.Fatalf("DecodeUnsigned() = %v, want %v", got, tc.wantU)
+			}
+		})
+	}
+}
+
 func TestEncodeUnsignedRLEv2BoundaryValues(t *testing.T) {
 	testCases := [][]uint64{
 		{math.MaxUint64, math.MaxUint64 - 1, math.MaxUint64 - 3, math.MaxUint64 - 6},
@@ -326,7 +427,12 @@ func TestEncodeDecodeRLEv2RoundTrips(t *testing.T) {
 			t.Fatalf("case %d signed decode (input=%d values, %d bytes): %v", caseIndex, len(signed), len(encodedSigned), err)
 		}
 		if !reflect.DeepEqual(gotSigned, signed) {
-			t.Fatalf("case %d signed round trip differs", caseIndex)
+			for i := range signed {
+				if gotSigned[i] != signed[i] {
+					t.Fatalf("case %d signed round trip differs at %d: got %d, want %d", caseIndex, i, gotSigned[i], signed[i])
+				}
+			}
+			t.Fatalf("case %d signed round trip differs in length", caseIndex)
 		}
 		gotUnsigned, err := DecodeUnsigned(EncodeUnsigned(unsigned), len(unsigned))
 		if err != nil {
