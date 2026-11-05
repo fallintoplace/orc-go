@@ -23,7 +23,7 @@ import (
 
 const maxEncodedChunkLength = (1 << 23) - 1
 
-// ErrWriterClosed is returned when WriteRow is called after Close.
+// ErrWriterClosed is returned when a writer operation is called after Close.
 var ErrWriterClosed = errors.New("ORC writer is closed")
 
 // WriterOptions controls file compression and column encodings. UseRLEv2
@@ -65,9 +65,9 @@ type WriterOptions struct {
 	EncryptionKeyProvider EncryptionKeyProvider
 }
 
-// Writer writes ORC files for root STRUCT schemas with primitive or nested columns.
-// It buffers rows for the current stripe and writes completed stripes to the
-// destination. Close writes the file footer and does not close the destination.
+// Writer writes ORC files for primitive or nested root values. It buffers
+// values for the current stripe and writes completed stripes to the destination.
+// Close writes the file footer and does not close the destination.
 type Writer struct {
 	destination        io.Writer
 	types              []Type
@@ -115,9 +115,9 @@ type writerStream struct {
 	groupBitOffsets []uint8
 }
 
-// NewWriter creates a writer for a root STRUCT whose fields are
-// BOOLEAN, BYTE, SHORT, INT, LONG, DATE, TIMESTAMP, TIMESTAMP_INSTANT, DECIMAL,
-// FLOAT, DOUBLE, STRING, CHAR, VARCHAR, BINARY, STRUCT, LIST, MAP, or UNION.
+// NewWriter creates a writer for a supported ORC type tree. The root may be
+// any supported scalar or compound type. Use WriteRow for root STRUCT schemas
+// and WriteValue for any root type.
 func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Writer, error) {
 	if destination == nil {
 		return nil, errors.New("ORC writer destination is nil")
@@ -208,13 +208,15 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 	}
 
 	columnByName := make(map[string]int, len(root.Subtypes))
-	for i, subtype := range root.Subtypes {
-		name := root.FieldNames[i]
-		if _, exists := columnByName[name]; exists {
-			return nil, fmt.Errorf("%w: duplicate root field name %q", ErrUnsupportedType, name)
+	if root.Kind == TypeKindStruct {
+		for i, subtype := range root.Subtypes {
+			name := root.FieldNames[i]
+			if _, exists := columnByName[name]; exists {
+				return nil, fmt.Errorf("%w: duplicate root field name %q", ErrUnsupportedType, name)
+			}
+			columns[subtype].name = name
+			columnByName[name] = int(subtype)
 		}
-		columns[subtype].name = name
-		columnByName[name] = int(subtype)
 	}
 	bloomFilterColumns := make(map[uint32]bool, len(options.BloomFilterColumns))
 	if len(options.BloomFilterColumns) != 0 {
@@ -269,9 +271,44 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 	}, nil
 }
 
-// WriteRow adds one row. Missing fields and nil values are written as ORC
-// nulls. Binary values are copied before they are buffered.
+// WriteRow adds one non-null root STRUCT row. Missing fields and nil values
+// are written as ORC nulls. Use WriteValue to write a null root STRUCT.
+// Binary values are copied before they are buffered.
 func (w *Writer) WriteRow(row Row) error {
+	if err := w.checkCanWriteValue(); err != nil {
+		return err
+	}
+	if w.types[0].Kind != TypeKindStruct {
+		return fmt.Errorf("ORC root type is %s; WriteRow requires STRUCT, use WriteValue", w.types[0].Kind)
+	}
+	if row == nil {
+		row = Row{}
+	}
+	for name := range row {
+		if _, exists := w.columnByName[name]; !exists {
+			return fmt.Errorf("unknown ORC field %q", name)
+		}
+	}
+	return w.writeValue(row)
+}
+
+// WriteValue adds one value of the schema's root type. Use this method when
+// the root is not a STRUCT, or when a root STRUCT itself may be null. For a
+// root STRUCT, non-null values may be Row or map[string]any. Binary values are
+// copied before they are buffered.
+func (w *Writer) WriteValue(value any) error {
+	if err := w.checkCanWriteValue(); err != nil {
+		return err
+	}
+	if w.types[0].Kind == TypeKindStruct && !isNilValue(value) {
+		if _, ok := structValues(value); !ok {
+			return fmt.Errorf("ORC root value expects STRUCT, got %T", value)
+		}
+	}
+	return w.writeValue(value)
+}
+
+func (w *Writer) checkCanWriteValue() error {
 	if w.closed {
 		return ErrWriterClosed
 	}
@@ -281,21 +318,15 @@ func (w *Writer) WriteRow(row Row) error {
 	if w.rowCount == math.MaxUint64 {
 		return fmt.Errorf("ORC row count overflows uint64")
 	}
-	for name := range row {
-		if _, exists := w.columnByName[name]; !exists {
-			return fmt.Errorf("unknown ORC field %q", name)
-		}
-	}
+	return nil
+}
 
+func (w *Writer) writeValue(value any) error {
 	pending := make([][]any, len(w.columns))
-	root := w.types[0]
-	for i, subtype := range root.Subtypes {
-		name := root.FieldNames[i]
-		if err := w.collectValue(subtype, row[name], name, pending); err != nil {
-			return err
-		}
+	if err := w.collectValue(0, value, "root", pending); err != nil {
+		return err
 	}
-	for id := 1; id < len(w.columns); id++ {
+	for id := range w.columns {
 		w.columns[id].values = append(w.columns[id].values, pending[id]...)
 	}
 	w.rowCount++

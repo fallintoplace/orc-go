@@ -85,9 +85,6 @@ func validateTypes(types []Type) error {
 	if len(types) == 0 {
 		return fmt.Errorf("ORC footer has no types")
 	}
-	if types[0].Kind != TypeKindStruct {
-		return fmt.Errorf("ORC root type is %s, want STRUCT", types[0].Kind)
-	}
 
 	for i, typ := range types {
 		for _, subtype := range typ.Subtypes {

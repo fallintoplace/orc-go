@@ -43,8 +43,9 @@ const (
 	columnEncodingDictionaryV2 uint32 = 3
 )
 
-// Row contains one ORC root-struct row. Nested STRUCT values also use Row,
-// LIST values use slices, MAP values use []MapEntry, and UNION values use
+// Row contains one ORC root-struct value. A nil Row represents a null root
+// STRUCT. Nested STRUCT values also use Row, LIST values use slices, MAP
+// values use []MapEntry, and UNION values use
 // UnionValue. Primitive values use bool for BOOLEAN, the matching integer
 // width for integer columns, time.Time for DATE and timestamps, Decimal for
 // DECIMAL, float32 or float64 for FLOAT or DOUBLE, string for STRING, CHAR, or
@@ -92,9 +93,9 @@ type stripeEncryptionVariant struct {
 	encodings []columnEncoding
 }
 
-// ReadRows calls yield for each row in file order. It keeps decoded column
-// values for one stripe in memory at a time. Returning an error from yield
-// stops the read and returns that error.
+// ReadRows calls yield for each root STRUCT value in file order. A null root
+// STRUCT is returned as a nil Row. It keeps decoded values for one stripe in
+// memory at a time. Returning an error from yield stops the read.
 func (r *Reader) ReadRows(yield func(Row) error) error {
 	return r.readRows(nil, false, yield)
 }
@@ -103,6 +104,19 @@ func (r *Reader) ReadRows(yield func(Row) error) error {
 // file row numbers. Stripes outside the range are not read.
 func (r *Reader) ReadRowsRange(start, end uint64, yield func(Row) error) error {
 	return r.readRowsRange(start, end, nil, false, yield)
+}
+
+// ReadValues calls yield for each value of the root type in file order. It
+// keeps decoded values for one stripe in memory at a time. Root STRUCT values
+// are returned as Row; other values use the Go type for their ORC type.
+func (r *Reader) ReadValues(yield func(any) error) error {
+	return r.readValuesRange(0, r.NumRows(), nil, false, yield)
+}
+
+// ReadValuesRange reads root values from the zero-based range [start, end).
+// Stripes outside the range are skipped.
+func (r *Reader) ReadValuesRange(start, end uint64, yield func(any) error) error {
+	return r.readValuesRange(start, end, nil, false, yield)
 }
 
 // ReadRowsWithColumns calls yield with only the named root fields. Selecting a
@@ -127,6 +141,26 @@ func (r *Reader) ReadAllRangeWithColumns(start, end uint64, names []string) ([]R
 	return r.readAllRange(start, end, names, true)
 }
 
+// ReadAllValues reads all values of the root type into memory. Use ReadValues
+// for large files.
+func (r *Reader) ReadAllValues() ([]any, error) {
+	return r.ReadAllValuesRange(0, r.NumRows())
+}
+
+// ReadAllValuesRange reads root values from the zero-based range [start, end)
+// into memory.
+func (r *Reader) ReadAllValuesRange(start, end uint64) ([]any, error) {
+	values := make([]any, 0)
+	err := r.ReadValuesRange(start, end, func(value any) error {
+		values = append(values, value)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
 func (r *Reader) readAllRange(start, end uint64, names []string, projected bool) ([]Row, error) {
 	rows := make([]Row, 0)
 	err := r.readRowsRange(start, end, names, projected, func(row Row) error {
@@ -147,25 +181,58 @@ func (r *Reader) readRowsRange(start, end uint64, names []string, projected bool
 	if yield == nil {
 		return errors.New("ORC row callback is nil")
 	}
+	if r.footer.types[0].Kind != TypeKindStruct {
+		return fmt.Errorf("ORC root type is %s; ReadRows requires STRUCT, use ReadValues", r.footer.types[0].Kind)
+	}
+	return r.readValuesRange(start, end, names, projected, func(value any) error {
+		if value == nil {
+			return yield(nil)
+		}
+		row, ok := value.(Row)
+		if !ok {
+			return fmt.Errorf("ORC root STRUCT decoded as %T", value)
+		}
+		return yield(row)
+	})
+}
+
+func (r *Reader) readValuesRange(start, end uint64, names []string, projected bool, yield func(any) error) error {
+	if yield == nil {
+		return errors.New("ORC value callback is nil")
+	}
 	if start > end {
-		return fmt.Errorf("ORC row range start %d exceeds end %d", start, end)
+		return fmt.Errorf("ORC value range start %d exceeds end %d", start, end)
 	}
 	if end > r.footer.numberOfRows {
-		return fmt.Errorf("ORC row range end %d exceeds file row count %d", end, r.footer.numberOfRows)
+		return fmt.Errorf("ORC value range end %d exceeds file row count %d", end, r.footer.numberOfRows)
 	}
-	columns, err := r.rowColumns()
-	if err != nil {
-		return err
+	root := r.footer.types[0]
+	if projected && root.Kind != TypeKindStruct {
+		return fmt.Errorf("ORC root type is %s; field selection requires STRUCT", root.Kind)
 	}
+	var columns []rowColumn
+	var err error
 	if projected {
+		columns, err = r.rowColumns()
+		if err != nil {
+			return err
+		}
 		columns, err = selectRootColumns(columns, names)
 		if err != nil {
 			return err
 		}
+	} else {
+		if err := validateStructFieldNames(r.footer.types); err != nil {
+			return err
+		}
+		columns = []rowColumn{{id: 0, name: "root", kind: root.Kind, calendar: r.calendar}}
 	}
 	wanted := make(map[streamKey]bool, len(r.footer.types)*5)
 	for _, column := range columns {
 		addSubtreeStreams(r.footer.types, column.id, wanted)
+	}
+	if projected {
+		wanted[streamKey{kind: streamKindPresent, column: 0}] = true
 	}
 
 	var previousEncryptionStripeID uint64
@@ -208,10 +275,23 @@ func (r *Reader) readRowsRange(start, end uint64, names []string, projected bool
 		}
 
 		values := make([][]any, len(columns))
-		for i, column := range columns {
-			values[i], err = decodeColumn(stripe.NumberOfRows, column, r.footer.types, footer.encodings, streams, footer.writerTimezone)
+		var rootPresent []bool
+		rootValueCount := 0
+		if projected {
+			rootPresent, rootValueCount, err = decodeColumnPresence(stripe.NumberOfRows, rowColumn{id: 0, kind: TypeKindStruct}, footer.encodings, streams)
 			if err != nil {
-				return fmt.Errorf("stripe %d column %q (id %d): %w", stripeIndex, column.name, column.id, err)
+				return fmt.Errorf("stripe %d root column (id 0): %w", stripeIndex, err)
+			}
+			for i, column := range columns {
+				values[i], err = decodeColumn(uint64(rootValueCount), column, r.footer.types, footer.encodings, streams, footer.writerTimezone)
+				if err != nil {
+					return fmt.Errorf("stripe %d column %q (id %d): %w", stripeIndex, column.name, column.id, err)
+				}
+			}
+		} else {
+			values[0], err = decodeColumn(stripe.NumberOfRows, columns[0], r.footer.types, footer.encodings, streams, footer.writerTimezone)
+			if err != nil {
+				return fmt.Errorf("stripe %d root column (id 0): %w", stripeIndex, err)
 			}
 		}
 
@@ -223,12 +303,32 @@ func (r *Reader) readRowsRange(start, end uint64, names []string, projected bool
 		if end < stripeRowEnd {
 			rowEnd = int(end - stripeRowStart)
 		}
-		for rowIndex := rowStart; rowIndex < rowEnd; rowIndex++ {
-			row := make(Row, len(columns))
-			for columnIndex, column := range columns {
-				row[column.name] = values[columnIndex][rowIndex]
+		rootValueIndex := 0
+		if projected {
+			for rowIndex := 0; rowIndex < rowStart; rowIndex++ {
+				if rootPresent[rowIndex] {
+					rootValueIndex++
+				}
 			}
-			if err := yield(row); err != nil {
+		}
+		for rowIndex := rowStart; rowIndex < rowEnd; rowIndex++ {
+			var value any
+			if projected {
+				if rootPresent[rowIndex] {
+					row := make(Row, len(columns))
+					for columnIndex, column := range columns {
+						if rootValueIndex >= len(values[columnIndex]) {
+							return fmt.Errorf("stripe %d root STRUCT has too few decoded field values", stripeIndex)
+						}
+						row[column.name] = values[columnIndex][rootValueIndex]
+					}
+					rootValueIndex++
+					value = row
+				}
+			} else {
+				value = values[0][rowIndex]
+			}
+			if err := yield(value); err != nil {
 				return err
 			}
 		}
@@ -305,26 +405,15 @@ func addSubtreeStreams(types []Type, root uint32, wanted map[streamKey]bool) {
 
 func (r *Reader) rowColumns() ([]rowColumn, error) {
 	root := r.footer.types[0]
-	for typeID, typ := range r.footer.types {
-		if typ.Kind != TypeKindStruct || typeID == 0 {
-			continue
-		}
-		seen := make(map[string]struct{}, len(typ.FieldNames))
-		for _, name := range typ.FieldNames {
-			if _, exists := seen[name]; exists {
-				return nil, fmt.Errorf("%w: duplicate field name %q in STRUCT type %d cannot be represented in Row", ErrUnsupportedType, name, typeID)
-			}
-			seen[name] = struct{}{}
-		}
+	if root.Kind != TypeKindStruct {
+		return nil, fmt.Errorf("ORC root type is %s; field names require STRUCT", root.Kind)
+	}
+	if err := validateStructFieldNames(r.footer.types); err != nil {
+		return nil, err
 	}
 	columns := make([]rowColumn, len(root.Subtypes))
-	seenNames := make(map[string]struct{}, len(root.FieldNames))
 	for i, subtype := range root.Subtypes {
 		name := root.FieldNames[i]
-		if _, exists := seenNames[name]; exists {
-			return nil, fmt.Errorf("%w: duplicate root field name %q cannot be represented in Row", ErrUnsupportedType, name)
-		}
-		seenNames[name] = struct{}{}
 		typ := r.footer.types[subtype]
 		switch typ.Kind {
 		case TypeKindBoolean, TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindBinary, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal, TypeKindChar, TypeKindVarchar, TypeKindStruct, TypeKindList, TypeKindMap, TypeKindUnion:
@@ -334,6 +423,56 @@ func (r *Reader) rowColumns() ([]rowColumn, error) {
 		columns[i] = rowColumn{id: subtype, name: name, kind: typ.Kind, calendar: r.calendar, precision: typ.Precision, scale: typ.Scale, maxLength: typ.MaxLength}
 	}
 	return columns, nil
+}
+
+func validateStructFieldNames(types []Type) error {
+	for typeID, typ := range types {
+		if typ.Kind != TypeKindStruct {
+			continue
+		}
+		seen := make(map[string]struct{}, len(typ.FieldNames))
+		for _, name := range typ.FieldNames {
+			if _, exists := seen[name]; exists {
+				return fmt.Errorf("%w: duplicate field name %q in STRUCT type %d cannot be represented in Row", ErrUnsupportedType, name, typeID)
+			}
+			seen[name] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func decodeColumnPresence(rowCount uint64, column rowColumn, encodings []columnEncoding, streams map[streamKey][]byte) ([]bool, int, error) {
+	if uint64(column.id) >= uint64(len(encodings)) {
+		return nil, 0, fmt.Errorf("column %d has no stripe encoding", column.id)
+	}
+	encoding := encodings[column.id]
+	if !supportsRowEncoding(column.kind, encoding.kind) {
+		return nil, 0, fmt.Errorf("%w: column %d type %s encoding %d", ErrUnsupportedEncoding, column.id, column.kind, encoding.kind)
+	}
+	rows, err := checkedSliceLength(rowCount)
+	if err != nil {
+		return nil, 0, err
+	}
+	presentStream, hasPresent := streams[streamKey{kind: streamKindPresent, column: column.id}]
+	var present []bool
+	if hasPresent {
+		present, err = decodePresent(presentStream, rows)
+		if err != nil {
+			return nil, 0, fmt.Errorf("decode PRESENT stream: %w", err)
+		}
+	} else {
+		present = make([]bool, rows)
+		for i := range present {
+			present[i] = true
+		}
+	}
+	valueCount := 0
+	for _, isPresent := range present {
+		if isPresent {
+			valueCount++
+		}
+	}
+	return present, valueCount, nil
 }
 
 func supportsRowEncoding(kind TypeKind, encoding uint32) bool {

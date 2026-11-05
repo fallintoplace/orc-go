@@ -31,7 +31,7 @@ var (
 	ErrUnsupportedCalendar = errors.New("unsupported ORC calendar")
 )
 
-// Reader reads ORC file metadata and decodes rows from its stripes.
+// Reader reads ORC file metadata and decodes root values from its stripes.
 type Reader struct {
 	source           io.ReaderAt
 	size             int64

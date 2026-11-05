@@ -1,6 +1,6 @@
 # orc-go
 
-Read and write [Apache ORC](https://orc.apache.org/) files in Go. Rows are Go maps, and nested ORC types use Go values. The package also supports compression, streaming reads, indexes, bloom filters, and column encryption.
+Read and write [Apache ORC](https://orc.apache.org/) files in Go. Use named rows for the usual `STRUCT` root, or read and write values directly when a file has a scalar or compound root. The package also supports nested types, compression, streaming reads, indexes, bloom filters, and column encryption.
 
 The project is still in progress, so its API may change. It requires Go 1.22 or newer.
 
@@ -12,7 +12,7 @@ go get github.com/fallintoplace/orc-go
 
 ## Quick start
 
-Each file has a schema. The first type must be a root `STRUCT`; its `Subtypes` list points to the types for each field.
+Each file has a schema, and the first type is its root. This example uses a `STRUCT` root; its `Subtypes` list points to the types for each field.
 
 This example writes a row to `people.orc`, then reads it back:
 
@@ -65,7 +65,7 @@ func main() {
 }
 ```
 
-`WriteRow` accepts field names from the schema. Missing fields and `nil` values are stored as ORC nulls. Call `writer.Close()` to finish the file and write its footer; it does not close the destination file.
+`WriteRow` accepts field names from the schema. Use `WriteValue` for a non-`STRUCT` root or to write a null root value. Missing fields and `nil` values are stored as ORC nulls. Call `writer.Close()` to finish the file and write its footer; it does not close the destination file.
 
 ## Read rows
 
@@ -82,6 +82,8 @@ Other read options:
 
 - Use `ReadRowsWithColumns` or `ReadAllWithColumns` to select top-level fields. A selected nested field is returned in full.
 - Use `ReadRowsRange` or `ReadAllRange` to read rows from a zero-based range `[start, end)`. The start is included; the end is not. Stripes outside the range are skipped.
+
+For a non-`STRUCT` root, use `ReadValues` to stream values or `ReadAllValues` to collect them in memory. `ReadValuesRange` and `ReadAllValuesRange` read a row range. A `STRUCT` root value is returned as `orc.Row`; other root values use the Go type shown below.
 
 ## Go values
 
