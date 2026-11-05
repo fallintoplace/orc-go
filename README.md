@@ -84,6 +84,11 @@ For reads that select fields, `ReadRowsValuesWithColumns` and
 `RowValues.Get` to look up a field by name, or `RowValues.Field` to read fields
 in the order requested.
 
+For higher-throughput scans, `ReadRowBatches` and
+`ReadRowBatchesWithColumns` return up to 1,024 rows as named columns without
+building a map for each row. Use `RowBatch.Column` to process a whole field at
+once, or `RowBatch.Get` to read a single value.
+
 ## What's supported
 
 - Standard ORC types, including nested structs, lists, maps, and unions.
