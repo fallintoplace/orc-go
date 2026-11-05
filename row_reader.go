@@ -1418,7 +1418,7 @@ func decodeVariableLengthColumn(present []bool, valueCount int, column rowColumn
 		}
 		length := lengths[valueIndex]
 		dataEnd := dataOffset + int(length)
-		values[rowIndex] = variableColumnValue(column, data[dataOffset:dataEnd])
+		values[rowIndex] = directVariableColumnValue(column, data[dataOffset:dataEnd])
 		dataOffset = dataEnd
 		valueIndex++
 	}
@@ -1464,6 +1464,21 @@ func variableColumnValue(column rowColumn, data []byte) any {
 		return normalizeReadStringTypeValue(value.(string), column.kind, column.maxLength)
 	}
 	return value
+}
+
+// Direct byte values can use their disjoint ranges in the reader-owned DATA
+// stream. Dictionary values keep using variableColumnValue because multiple
+// rows can refer to the same dictionary entry.
+func directVariableColumnValue(column rowColumn, data []byte) any {
+	switch column.kind {
+	case TypeKindBinary, TypeKindGeometry, TypeKindGeography:
+		if data == nil {
+			return []byte{}
+		}
+		return data
+	default:
+		return variableColumnValue(column, data)
+	}
 }
 
 func decodePresent(data []byte, rowCount int) ([]bool, error) {
