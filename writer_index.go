@@ -49,7 +49,7 @@ func (w *Writer) encodeColumnGroups(column writerColumn, ranges []writerValueRan
 		streams = append(streams, stream)
 		streamKinds[streamKindPresent] = true
 	}
-	if column.kind == TypeKindBoolean && hasWriterNonNull(column.values) {
+	if column.kind == TypeKindBoolean {
 		stream := makeBooleanDataStream(column.id, column.values, ranges)
 		streams = append(streams, stream)
 		streamKinds[streamKindData] = true
