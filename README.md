@@ -134,7 +134,7 @@ Bloom filters can quickly rule out a value. A possible match still needs to be c
 
 ## Inspect a file
 
-`Reader` exposes the schema, stripe locations, row and stripe counts, file and stripe statistics, row indexes, bloom-filter indexes, and user metadata. Use `AddUserMetadata(name, value)` on the writer to add application-defined metadata.
+`Reader` exposes the schema, including type attributes, stripe locations, row and stripe counts, file and stripe statistics, row indexes, bloom-filter indexes, and user metadata. Use `AddUserMetadata(name, value)` on the writer to add application-defined file metadata.
 
 ## Encrypt columns
 

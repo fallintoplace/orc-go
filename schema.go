@@ -46,10 +46,18 @@ type Type struct {
 	Kind       TypeKind
 	Subtypes   []uint32
 	FieldNames []string
+	// Attributes contains ORC key/value annotations for this type.
+	Attributes []TypeAttribute
 	// MaxLength limits CHAR and VARCHAR values in Unicode code points.
 	MaxLength uint32
 	Precision uint32
 	Scale     uint32
+}
+
+// TypeAttribute is a key/value annotation stored on an ORC type.
+type TypeAttribute struct {
+	Key   string
+	Value string
 }
 
 // StripeInfo contains the byte ranges and row count for one stripe.
@@ -67,6 +75,7 @@ func cloneTypes(types []Type) []Type {
 		cloned[i] = typ
 		cloned[i].Subtypes = append([]uint32(nil), typ.Subtypes...)
 		cloned[i].FieldNames = append([]string(nil), typ.FieldNames...)
+		cloned[i].Attributes = append([]TypeAttribute(nil), typ.Attributes...)
 	}
 	return cloned
 }

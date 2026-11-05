@@ -143,6 +143,16 @@ func parseType(data []byte) (Type, error) {
 			result.Precision, err = readUint32Field(field)
 		case 6:
 			result.Scale, err = readUint32Field(field)
+		case 7:
+			var data []byte
+			data, err = fieldBytes(field)
+			if err == nil {
+				var attribute TypeAttribute
+				attribute, err = parseTypeAttribute(data)
+				if err == nil {
+					result.Attributes = append(result.Attributes, attribute)
+				}
+			}
 		}
 		if err != nil {
 			return Type{}, err
@@ -150,6 +160,26 @@ func parseType(data []byte) (Type, error) {
 	}
 	if !hasKind {
 		return Type{}, fmt.Errorf("ORC type has no kind")
+	}
+	return result, nil
+}
+
+func parseTypeAttribute(data []byte) (TypeAttribute, error) {
+	fields, err := wire.Fields(data)
+	if err != nil {
+		return TypeAttribute{}, fmt.Errorf("decode ORC type attribute: %w", err)
+	}
+	var result TypeAttribute
+	for _, field := range fields {
+		switch field.Number {
+		case 1:
+			result.Key, err = fieldString(field)
+		case 2:
+			result.Value, err = fieldString(field)
+		}
+		if err != nil {
+			return TypeAttribute{}, err
+		}
 	}
 	return result, nil
 }
