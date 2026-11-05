@@ -67,12 +67,11 @@ func (w *Writer) encodeColumnGroups(column writerColumn, ranges []writerValueRan
 			continue
 		}
 		segments := make([][]byte, len(ranges))
-		var data []byte
+		// The next step encodes these segments directly, so avoid joining them here.
 		for group := range ranges {
 			segments[group] = groupStreams[group][kind]
-			data = append(data, segments[group]...)
 		}
-		streams = append(streams, writerStream{kind: kind, column: column.id, data: data, segments: segments})
+		streams = append(streams, writerStream{kind: kind, column: column.id, segments: segments})
 	}
 	sort.Slice(streams, func(i, j int) bool { return streams[i].kind < streams[j].kind })
 	return streams, encoding, nil
