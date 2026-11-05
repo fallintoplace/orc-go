@@ -42,7 +42,7 @@ func (r *Reader) readIndexedVariableRangeStripe(
 	end uint64,
 	columns []rowColumn,
 	projected bool,
-	yield func(any) error,
+	output rowRangeOutput,
 ) (bool, error) {
 	if r.footer.encryption != nil || r.footer.rowIndexStride == 0 || stripe.NumberOfRows == 0 {
 		return false, nil
@@ -318,11 +318,7 @@ func (r *Reader) readIndexedVariableRangeStripe(
 
 	for _, group := range groups {
 		for rowIndex := group.keepFrom; rowIndex < group.keepTo; rowIndex++ {
-			row := make(Row, len(columns))
-			for columnIndex, column := range columns {
-				row[column.name] = group.values[columnIndex][rowIndex]
-			}
-			if err := yield(row); err != nil {
+			if err := output.yieldProjected(columns, group.values, rowIndex); err != nil {
 				return true, err
 			}
 		}
