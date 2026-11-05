@@ -6,8 +6,7 @@ Use `orc.Row` for rows with named fields. `ReadRows` streams a file; `ReadAll`
 loads it into memory. The writer supports nested data, compression, indexes,
 metadata, and encrypted columns.
 
-Requires Go 1.22 or newer. The project is under development, so its API may
-change.
+Built for Go 1.22 or newer.
 
 ## Install
 
