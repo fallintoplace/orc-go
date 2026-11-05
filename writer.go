@@ -63,6 +63,9 @@ type WriterOptions struct {
 	// EncryptionKeyProvider wraps local keys using a provider-specific format,
 	// such as an external KMS integration. Set this instead of KeyProvider.
 	EncryptionKeyProvider EncryptionKeyProvider
+	// SoftwareVersion adds a descriptive writer version to the ORC footer.
+	// Empty omits the field.
+	SoftwareVersion string
 }
 
 // Writer writes ORC files for primitive or nested root values. It buffers
@@ -164,6 +167,9 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 		if !utf8.ValidString(typ.CRS) {
 			return nil, fmt.Errorf("ORC coordinate reference system in type %d is not valid UTF-8", typeID)
 		}
+	}
+	if !utf8.ValidString(options.SoftwareVersion) {
+		return nil, errors.New("ORC software version is not valid UTF-8")
 	}
 
 	switch options.Compression {
@@ -561,6 +567,9 @@ func (w *Writer) encodeFileTail() ([]byte, error) {
 		footer = appendProtoBytesField(footer, 10, encodeFileEncryption(w.fileEncryption))
 	}
 	footer = appendProtoVarintField(footer, 11, uint64(CalendarKindProlepticGregorian))
+	if w.options.SoftwareVersion != "" {
+		footer = appendProtoBytesField(footer, 12, []byte(w.options.SoftwareVersion))
+	}
 	encodedFooter, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, footer)
 	if err != nil {
 		return nil, fmt.Errorf("compress ORC footer: %w", err)
