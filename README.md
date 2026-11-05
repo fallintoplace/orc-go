@@ -79,6 +79,11 @@ the full result fits in memory. Range methods read selected rows; column
 methods read selected fields. For files whose root is a scalar, list, or map,
 use `ReadValues` or `ReadAllValues` to read, and `WriteValue` to write.
 
+For reads that select fields, `ReadRowsValuesWithColumns` and
+`ReadRowsRangeValuesWithColumns` avoid a map allocation for each row. Use
+`RowValues.Get` to look up a field by name, or `RowValues.Field` to read fields
+in the order requested.
+
 ## What's supported
 
 - Standard ORC types, including nested structs, lists, maps, and unions.

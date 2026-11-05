@@ -124,10 +124,10 @@ func TestReadRowsRangeFallsBackWhenExternalIndexStartsInsideRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	stripe := reader.Stripes()[0]
-	handled, err := reader.readIndexedNumericRangeStripe(stripe, 0, 0, stripe.NumberOfRows, 2500, 2600, selected, true, func(any) error {
+	handled, err := reader.readIndexedNumericRangeStripe(stripe, 0, 0, stripe.NumberOfRows, 2500, 2600, selected, true, rowRangeOutput{row: func(any) error {
 		t.Fatal("unaligned Apache row-index position unexpectedly used the fast path")
 		return nil
-	})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}

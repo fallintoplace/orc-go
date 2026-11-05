@@ -103,6 +103,159 @@ func TestReadRowsRangeVariableFastPathFallsBackForNulls(t *testing.T) {
 	}
 }
 
+func TestReadRowsRangeValuesWithColumns(t *testing.T) {
+	data := makeIndexedVariableRangeFile(t, CompressionZlib, true, false, true, false)
+	reader, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var rows []RowValues
+	if err := reader.ReadRowsRangeValuesWithColumns(2100, 2150, []string{"payload", "name"}, func(row RowValues) error {
+		rows = append(rows, row)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 50 {
+		t.Fatalf("ReadRowsRangeValuesWithColumns() returned %d rows, want 50", len(rows))
+	}
+
+	first := rows[0]
+	if first.Len() != 2 || first.IsNull() {
+		t.Fatalf("first row has Len() = %d and IsNull() = %v, want 2 and false", first.Len(), first.IsNull())
+	}
+	name, value, ok := first.Field(0)
+	if !ok || name != "payload" || !reflect.DeepEqual(value, []byte{byte(2100 % 251), byte(2100 * 7 % 251)}) {
+		t.Fatalf("Field(0) = (%q, %#v, %v), want payload and first payload", name, value, ok)
+	}
+	name, value, ok = first.Field(1)
+	if !ok || name != "name" || value != "customer-04" {
+		t.Fatalf("Field(1) = (%q, %#v, %v), want name and customer-04", name, value, ok)
+	}
+	if _, _, ok := first.Field(-1); ok {
+		t.Fatal("Field(-1) succeeded")
+	}
+	if _, _, ok := first.Field(first.Len()); ok {
+		t.Fatal("Field(Len()) succeeded")
+	}
+	if _, ok := first.Get("missing"); ok {
+		t.Fatal("Get(missing) succeeded")
+	}
+	if got, ok := first.Get("name"); !ok || got != "customer-04" {
+		t.Fatalf("Get(name) = (%#v, %v), want customer-04 and true", got, ok)
+	}
+
+	// The selected name is null at absolute row 2134. This is a null field,
+	// not a null root row.
+	nullField := rows[34]
+	if nullField.IsNull() {
+		t.Fatal("row with a null name field reported a null root")
+	}
+	if got, ok := nullField.Get("name"); !ok || got != nil {
+		t.Fatalf("Get(name) for a null field = (%#v, %v), want nil and true", got, ok)
+	}
+	if name, got, ok := nullField.Field(1); !ok || name != "name" || got != nil {
+		t.Fatalf("Field(1) for a null field = (%q, %#v, %v), want name, nil, true", name, got, ok)
+	}
+
+	// Values remain usable after the callback returns.
+	lastName, ok := rows[len(rows)-1].Get("name")
+	if !ok || lastName != "customer-05" {
+		t.Fatalf("last row name = (%#v, %v), want customer-05 and true", lastName, ok)
+	}
+
+	emptyProjectionRows := 0
+	if err := reader.ReadRowsRangeValuesWithColumns(2100, 2103, nil, func(row RowValues) error {
+		if row.Len() != 0 {
+			return fmt.Errorf("empty projection has %d fields, want 0", row.Len())
+		}
+		emptyProjectionRows++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if emptyProjectionRows != 3 {
+		t.Fatalf("empty projection returned %d rows, want 3", emptyProjectionRows)
+	}
+
+	streamedRows := 0
+	if err := reader.ReadRowsValuesWithColumns([]string{"name"}, func(row RowValues) error {
+		if row.Len() != 1 {
+			return fmt.Errorf("streamed row has %d fields, want 1", row.Len())
+		}
+		streamedRows++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if streamedRows != 8000 {
+		t.Fatalf("ReadRowsValuesWithColumns() returned %d rows, want 8000", streamedRows)
+	}
+
+	stop := errors.New("stop after first row")
+	if err := reader.ReadRowsRangeValuesWithColumns(0, 1, []string{"name"}, func(RowValues) error { return stop }); !errors.Is(err, stop) {
+		t.Fatalf("ReadRowsRangeValuesWithColumns() error = %v, want %v", err, stop)
+	}
+	if err := reader.ReadRowsRangeValuesWithColumns(0, 1, nil, nil); err == nil {
+		t.Fatal("ReadRowsRangeValuesWithColumns() accepted a nil callback")
+	}
+	if err := reader.ReadRowsRangeValuesWithColumns(0, 1, []string{"missing"}, func(RowValues) error { return nil }); err == nil {
+		t.Fatal("ReadRowsRangeValuesWithColumns() accepted an unknown field")
+	}
+}
+
+func TestReadRowsRangeValuesWithColumnsPreservesNullRoot(t *testing.T) {
+	schema := []Type{
+		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"count"}},
+		{Kind: TypeKindLong},
+	}
+	var output bytes.Buffer
+	writer, err := NewWriter(&output, schema, WriterOptions{Compression: CompressionZlib})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteValue(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteRow(Row{"count": int64(7)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []RowValues
+	if err := reader.ReadRowsRangeValuesWithColumns(0, 2, []string{"count"}, func(row RowValues) error {
+		rows = append(rows, row)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("ReadRowsRangeValuesWithColumns() returned %d rows, want 2", len(rows))
+	}
+	if !rows[0].IsNull() {
+		t.Fatal("first row is not marked as a null root")
+	}
+	if name, value, ok := rows[0].Field(0); !ok || name != "count" || value != nil {
+		t.Fatalf("null root Field(0) = (%q, %#v, %v), want count, nil, true", name, value, ok)
+	}
+	if value, ok := rows[0].Get("count"); !ok || value != nil {
+		t.Fatalf("null root Get(count) = (%#v, %v), want nil and true", value, ok)
+	}
+	if rows[1].IsNull() {
+		t.Fatal("second row is marked as a null root")
+	}
+	if value, ok := rows[1].Get("count"); !ok || value != int64(7) {
+		t.Fatalf("second row Get(count) = (%#v, %v), want 7 and true", value, ok)
+	}
+}
+
 func TestReadRowsRangeVariableFastPathFallsBackForExternalPositions(t *testing.T) {
 	reader := openApacheFixture(t, "apache-row-index.orc")
 	columns, err := reader.rowColumns()
@@ -114,10 +267,10 @@ func TestReadRowsRangeVariableFastPathFallsBackForExternalPositions(t *testing.T
 		t.Fatal(err)
 	}
 	stripe := reader.Stripes()[0]
-	handled, err := reader.readIndexedVariableRangeStripe(stripe, 0, 0, stripe.NumberOfRows, 2500, 2600, selected, true, func(any) error {
+	handled, err := reader.readIndexedVariableRangeStripe(stripe, 0, 0, stripe.NumberOfRows, 2500, 2600, selected, true, rowRangeOutput{row: func(any) error {
 		t.Fatal("unaligned Apache string positions unexpectedly used the fast path")
 		return nil
-	})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,24 +386,52 @@ func BenchmarkReaderReadRowsRangeString(b *testing.B) {
 			}
 			data := output.Bytes()
 
-			b.ReportAllocs()
-			b.SetBytes(1000 * 16)
-			b.ResetTimer()
-			for iteration := 0; iteration < b.N; iteration++ {
-				reader, err := NewReader(bytes.NewReader(data), int64(len(data)))
-				if err != nil {
-					b.Fatal(err)
-				}
-				readRows := 0
-				if err := reader.ReadRowsRangeWithColumns(150_000, 151_000, []string{"name"}, func(Row) error {
-					readRows++
-					return nil
-				}); err != nil {
-					b.Fatal(err)
-				}
-				if readRows != 1000 {
-					b.Fatalf("ReadRowsRangeWithColumns() returned %d rows, want 1000", readRows)
-				}
+			for _, api := range []struct {
+				name string
+				read func(*Reader, func(string) error) error
+			}{
+				{name: "map", read: func(reader *Reader, yield func(string) error) error {
+					return reader.ReadRowsRangeWithColumns(150_000, 151_000, []string{"name"}, func(row Row) error {
+						return yield(row["name"].(string))
+					})
+				}},
+				{name: "values", read: func(reader *Reader, yield func(string) error) error {
+					return reader.ReadRowsRangeValuesWithColumns(150_000, 151_000, []string{"name"}, func(row RowValues) error {
+						value, ok := row.Get("name")
+						if !ok {
+							return errors.New("name field is missing")
+						}
+						name, ok := value.(string)
+						if !ok {
+							return fmt.Errorf("name field has type %T", value)
+						}
+						return yield(name)
+					})
+				}},
+			} {
+				b.Run(api.name, func(b *testing.B) {
+					b.ReportAllocs()
+					b.SetBytes(1000 * 11)
+					b.ResetTimer()
+					for iteration := 0; iteration < b.N; iteration++ {
+						reader, err := NewReader(bytes.NewReader(data), int64(len(data)))
+						if err != nil {
+							b.Fatal(err)
+						}
+						readRows := 0
+						nameBytes := 0
+						if err := api.read(reader, func(name string) error {
+							readRows++
+							nameBytes += len(name)
+							return nil
+						}); err != nil {
+							b.Fatal(err)
+						}
+						if readRows != 1000 || nameBytes != 11_000 {
+							b.Fatalf("range read returned %d rows with %d name bytes, want 1000 rows and 11000 bytes", readRows, nameBytes)
+						}
+					}
+				})
 			}
 		})
 	}

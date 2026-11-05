@@ -133,6 +133,25 @@ func (r *Reader) ReadRowsRangeWithColumns(start, end uint64, names []string, yie
 	return r.readRowsRange(start, end, names, true, yield)
 }
 
+// ReadRowsValuesWithColumns reads all root STRUCT rows and yields only the
+// named fields as RowValues. It avoids allocating a map for every row.
+func (r *Reader) ReadRowsValuesWithColumns(names []string, yield func(RowValues) error) error {
+	return r.ReadRowsRangeValuesWithColumns(0, r.NumRows(), names, yield)
+}
+
+// ReadRowsRangeValuesWithColumns reads [start, end) and yields selected root
+// fields as RowValues. It avoids allocating a map for every row. Fields follow
+// the order in names, and values remain available after the callback returns.
+func (r *Reader) ReadRowsRangeValuesWithColumns(start, end uint64, names []string, yield func(RowValues) error) error {
+	if yield == nil {
+		return errors.New("ORC row values callback is nil")
+	}
+	if r.footer.types[0].Kind != TypeKindStruct {
+		return fmt.Errorf("ORC root type is %s; field selection requires STRUCT", r.footer.types[0].Kind)
+	}
+	return r.readValuesRangeWithOutput(start, end, names, true, rowRangeOutput{rowValues: yield})
+}
+
 // ReadAllRange reads the rows in [start, end) into memory.
 func (r *Reader) ReadAllRange(start, end uint64) ([]Row, error) {
 	return r.readAllRange(start, end, nil, false)
@@ -202,6 +221,13 @@ func (r *Reader) readValuesRange(start, end uint64, names []string, projected bo
 	if yield == nil {
 		return errors.New("ORC value callback is nil")
 	}
+	return r.readValuesRangeWithOutput(start, end, names, projected, rowRangeOutput{row: yield})
+}
+
+func (r *Reader) readValuesRangeWithOutput(start, end uint64, names []string, projected bool, output rowRangeOutput) error {
+	if output.row == nil && output.rowValues == nil {
+		return errors.New("ORC value callback is nil")
+	}
 	if start > end {
 		return fmt.Errorf("ORC value range start %d exceeds end %d", start, end)
 	}
@@ -228,6 +254,9 @@ func (r *Reader) readValuesRange(start, end uint64, names []string, projected bo
 			return err
 		}
 		columns = []rowColumn{{id: 0, name: "root", kind: root.Kind, calendar: r.calendar}}
+	}
+	if output.rowValues != nil {
+		output.valueSchema = newRowValuesSchema(columns)
 	}
 	var wanted map[streamKey]bool
 
@@ -265,7 +294,7 @@ func (r *Reader) readValuesRange(start, end uint64, names []string, projected bo
 		if err != nil {
 			return fmt.Errorf("stripe %d row count: %w", stripeIndex, err)
 		}
-		handled, err := r.readIndexedVariableRangeStripe(stripe, stripeIndex, stripeRowStart, stripeRowEnd, start, end, columns, projected, yield)
+		handled, err := r.readIndexedVariableRangeStripe(stripe, stripeIndex, stripeRowStart, stripeRowEnd, start, end, columns, projected, output)
 		if err != nil {
 			return err
 		}
@@ -273,7 +302,7 @@ func (r *Reader) readValuesRange(start, end uint64, names []string, projected bo
 			stripeRowStart = stripeRowEnd
 			continue
 		}
-		handled, err = r.readIndexedNumericRangeStripe(stripe, stripeIndex, stripeRowStart, stripeRowEnd, start, end, columns, projected, yield)
+		handled, err = r.readIndexedNumericRangeStripe(stripe, stripeIndex, stripeRowStart, stripeRowEnd, start, end, columns, projected, output)
 		if err != nil {
 			return err
 		}
@@ -333,23 +362,23 @@ func (r *Reader) readValuesRange(start, end uint64, names []string, projected bo
 			}
 		}
 		for rowIndex := rowStart; rowIndex < rowEnd; rowIndex++ {
-			var value any
+			var err error
 			if projected {
 				if rootPresent[rowIndex] {
-					row := make(Row, len(columns))
-					for columnIndex, column := range columns {
+					for columnIndex := range columns {
 						if rootValueIndex >= len(values[columnIndex]) {
 							return fmt.Errorf("stripe %d root STRUCT has too few decoded field values", stripeIndex)
 						}
-						row[column.name] = values[columnIndex][rootValueIndex]
 					}
+					err = output.yieldProjected(columns, values, rootValueIndex)
 					rootValueIndex++
-					value = row
+				} else {
+					err = output.yieldNullRoot()
 				}
 			} else {
-				value = values[0][rowIndex]
+				err = output.yieldValue(values[0][rowIndex])
 			}
-			if err := yield(value); err != nil {
+			if err != nil {
 				return err
 			}
 		}
