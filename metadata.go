@@ -13,6 +13,18 @@ type UserMetadataItem struct {
 	Value []byte
 }
 
+// WriterMetadata identifies the writer declared in an ORC file footer.
+type WriterMetadata struct {
+	// ImplementationID is the registered ORC writer ID, when present.
+	ImplementationID uint32
+	// HasImplementationID reports whether the footer includes a writer ID.
+	HasImplementationID bool
+	// SoftwareVersion is the writer's descriptive version string, when present.
+	SoftwareVersion string
+	// HasSoftwareVersion reports whether the footer includes a software version.
+	HasSoftwareVersion bool
+}
+
 func parseUserMetadataItem(data []byte) (UserMetadataItem, error) {
 	fields, err := wire.Fields(data)
 	if err != nil {

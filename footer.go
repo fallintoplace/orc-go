@@ -7,18 +7,22 @@ import (
 )
 
 type fileFooter struct {
-	headerLength     uint64
-	contentLength    uint64
-	numberOfRows     uint64
-	hasNumberOfRows  bool
-	rowIndexStride   uint64
-	calendar         CalendarKind
-	stripes          []StripeInfo
-	stripeEncryption []stripeEncryptionInfo
-	types            []Type
-	statistics       []ColumnStatistics
-	userMetadata     []UserMetadataItem
-	encryption       *fileEncryption
+	headerLength       uint64
+	contentLength      uint64
+	numberOfRows       uint64
+	hasNumberOfRows    bool
+	rowIndexStride     uint64
+	writerID           uint32
+	hasWriterID        bool
+	softwareVersion    string
+	hasSoftwareVersion bool
+	calendar           CalendarKind
+	stripes            []StripeInfo
+	stripeEncryption   []stripeEncryptionInfo
+	types              []Type
+	statistics         []ColumnStatistics
+	userMetadata       []UserMetadataItem
+	encryption         *fileEncryption
 }
 
 func parseFooter(data []byte) (fileFooter, error) {
@@ -80,6 +84,9 @@ func parseFooter(data []byte) (fileFooter, error) {
 			}
 		case 8:
 			result.rowIndexStride, err = fieldVarint(field)
+		case 9:
+			result.writerID, err = readUint32Field(field)
+			result.hasWriterID = err == nil
 		case 11:
 			var value uint64
 			value, err = fieldVarint(field)
@@ -99,6 +106,9 @@ func parseFooter(data []byte) (fileFooter, error) {
 					result.encryption = &encryption
 				}
 			}
+		case 12:
+			result.softwareVersion, err = fieldString(field)
+			result.hasSoftwareVersion = err == nil
 		}
 		if err != nil {
 			return fileFooter{}, err

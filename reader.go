@@ -213,6 +213,17 @@ func (r *Reader) FormatVersion() []uint32 {
 	return append([]uint32(nil), r.postScript.version...)
 }
 
+// WriterMetadata returns the writer ID and software version stored in the
+// footer, preserving whether each optional field was present.
+func (r *Reader) WriterMetadata() WriterMetadata {
+	return WriterMetadata{
+		ImplementationID:    r.footer.writerID,
+		HasImplementationID: r.footer.hasWriterID,
+		SoftwareVersion:     r.footer.softwareVersion,
+		HasSoftwareVersion:  r.footer.hasSoftwareVersion,
+	}
+}
+
 // CalendarKind reports the calendar used to interpret DATE and TIMESTAMP
 // values. A known footer value takes priority; otherwise the reader uses the
 // configured fallback or Julian/Gregorian by default.
