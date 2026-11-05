@@ -260,7 +260,7 @@ func (f BloomFilter) mightContain(hash uint64) bool {
 
 func supportsWriterBloomFilter(kind TypeKind) bool {
 	switch kind {
-	case TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindChar, TypeKindVarchar, TypeKindBinary:
+	case TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong, TypeKindFloat, TypeKindDouble, TypeKindString, TypeKindChar, TypeKindVarchar, TypeKindBinary, TypeKindGeometry, TypeKindGeography:
 		return true
 	default:
 		return false
@@ -288,7 +288,7 @@ func buildWriterBloomFilter(values []any, kind TypeKind, fpp float64, expectedEn
 			hash = thomasWangBloomHash(math.Float64bits(value.(float64)))
 		case TypeKindString, TypeKindChar, TypeKindVarchar:
 			hash = murmur3BloomHash64([]byte(value.(string)))
-		case TypeKindBinary:
+		case TypeKindBinary, TypeKindGeometry, TypeKindGeography:
 			hash = murmur3BloomHash64(value.([]byte))
 		default:
 			return BloomFilter{}, fmt.Errorf("ORC bloom filters do not support type %s", kind)

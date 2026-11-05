@@ -116,7 +116,7 @@ func parseType(data []byte) (Type, error) {
 		return Type{}, fmt.Errorf("decode ORC type: %w", err)
 	}
 	var result Type
-	var hasKind bool
+	var hasKind, hasCRS bool
 	for _, field := range fields {
 		switch field.Number {
 		case 1:
@@ -153,6 +153,15 @@ func parseType(data []byte) (Type, error) {
 					result.Attributes = append(result.Attributes, attribute)
 				}
 			}
+		case 8:
+			result.CRS, err = fieldString(field)
+			hasCRS = err == nil
+		case 9:
+			var value uint32
+			value, err = readUint32Field(field)
+			if err == nil {
+				result.EdgeInterpolation = EdgeInterpolationAlgorithm(value)
+			}
 		}
 		if err != nil {
 			return Type{}, err
@@ -160,6 +169,9 @@ func parseType(data []byte) (Type, error) {
 	}
 	if !hasKind {
 		return Type{}, fmt.Errorf("ORC type has no kind")
+	}
+	if !hasCRS && (result.Kind == TypeKindGeometry || result.Kind == TypeKindGeography) {
+		result.CRS = defaultGeospatialCRS
 	}
 	return result, nil
 }
