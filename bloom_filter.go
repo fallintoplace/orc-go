@@ -58,7 +58,10 @@ func (f BloomFilter) MightContainFloat64(value float64) bool {
 // ColumnBloomFilterIndex contains row-group bloom filters for one ORC type id.
 type ColumnBloomFilterIndex struct {
 	ColumnID uint32
-	Filters  []BloomFilter
+	// BloomEncoding is 0 for original filters and 1 for UTC timestamp filters.
+	// Other values are preserved for forward compatibility.
+	BloomEncoding uint32
+	Filters       []BloomFilter
 }
 
 // StripeBloomFilterIndexes contains the bloom filter indexes found in one
@@ -98,7 +101,7 @@ func (r *Reader) BloomFilterIndexes() ([]StripeBloomFilterIndexes, error) {
 				return nil, fmt.Errorf("stripe %d has no complete encrypted local keys", stripeIndex)
 			}
 		}
-		streams, _, err := r.readStripeStreamsAt(stripe, wanted, stripeIndex, encryptionStripeID, encryptedLocalKeys)
+		streams, stripeFooter, err := r.readStripeStreamsAt(stripe, wanted, stripeIndex, encryptionStripeID, encryptedLocalKeys)
 		if err != nil {
 			return nil, fmt.Errorf("read stripe %d bloom filters: %w", stripeIndex, err)
 		}
@@ -107,6 +110,9 @@ func (r *Reader) BloomFilterIndexes() ([]StripeBloomFilterIndexes, error) {
 		for key, data := range streams {
 			if key.kind != legacyBloomFilterStream && key.kind != utf8BloomFilterStream {
 				continue
+			}
+			if uint64(key.column) >= uint64(len(stripeFooter.encodings)) {
+				return nil, fmt.Errorf("stripe %d has no encoding for bloom-filter column %d", stripeIndex, key.column)
 			}
 			filters, err := parseBloomFilterIndex(data)
 			if err != nil {
@@ -125,6 +131,7 @@ func (r *Reader) BloomFilterIndexes() ([]StripeBloomFilterIndexes, error) {
 			}
 			column := columns[key.column]
 			column.ColumnID = key.column
+			column.BloomEncoding = stripeFooter.encodings[key.column].bloomEncoding
 			if key.kind == utf8BloomFilterStream || len(column.Filters) == 0 {
 				column.Filters = filters
 			}

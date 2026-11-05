@@ -830,6 +830,9 @@ func appendStripeEncoding(footer []byte, encoding columnEncoding) []byte {
 	if encoding.dictionarySize > 0 {
 		message = appendProtoVarintField(message, 2, uint64(encoding.dictionarySize))
 	}
+	if encoding.bloomEncoding > 0 {
+		message = appendProtoVarintField(message, 3, uint64(encoding.bloomEncoding))
+	}
 	return appendProtoBytesField(footer, 2, message)
 }
 

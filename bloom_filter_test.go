@@ -86,6 +86,11 @@ func TestWriterBloomFilterIndexes(t *testing.T) {
 		if len(stripe.Columns) != 10 {
 			t.Fatalf("stripe %d has %d bloom-filter columns, want 10", stripeIndex, len(stripe.Columns))
 		}
+		for _, column := range stripe.Columns {
+			if column.BloomEncoding != 0 {
+				t.Fatalf("stripe %d column %d bloom encoding = %d, want default 0", stripeIndex, column.ColumnID, column.BloomEncoding)
+			}
+		}
 		start := stripeIndex * 1000
 		end := start + 1000
 		if end > len(rows) {
