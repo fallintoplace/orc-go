@@ -160,7 +160,7 @@ A stripe is a group of rows stored together in an ORC file. These options contro
 
 Use `Reader` to inspect a file without reading all of its values. It exposes the schema, type attributes, stripe locations, row and stripe counts, file and stripe statistics, row indexes, bloom-filter indexes, and user metadata. For example, call `Schema()`, `NumRows()`, `NumStripes()`, or `FileStatistics()` on a reader. Use `AddUserMetadata(name, value)` to add application-defined metadata when writing.
 
-String statistics include exact minimum and maximum values when available. For long strings, they can include lower and upper bounds instead. Geospatial statistics include bounding boxes and WKB type codes when the file stores them.
+String statistics include exact minimum and maximum values when available. For long strings, they can include lower and upper bounds instead. LIST and MAP statistics report child counts, and geospatial statistics include bounding boxes and WKB type codes when the file stores them.
 
 ## Encrypt columns
 

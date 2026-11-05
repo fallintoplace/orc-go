@@ -17,6 +17,9 @@ type ColumnStatistics struct {
 	HasNull bool
 	// HasNullSet reports whether the file explicitly stores the hasNull field.
 	HasNullSet bool
+	// BytesOnDisk is the encoded size recorded for this column, when available.
+	BytesOnDisk    uint64
+	HasBytesOnDisk bool
 	// The type-specific statistics below are nil when the file does not include
 	// the corresponding statistic.
 	Integer    *IntegerStatistics
@@ -27,6 +30,7 @@ type ColumnStatistics struct {
 	Date       *DateStatistics
 	Binary     *BinaryStatistics
 	Timestamp  *TimestampStatistics
+	Collection *CollectionStatistics
 	Geospatial *GeospatialStatistics
 }
 
@@ -108,6 +112,17 @@ type TimestampStatistics struct {
 	HasMinimumUTC bool
 	MaximumUTC    int64
 	HasMaximumUTC bool
+}
+
+// CollectionStatistics describes the number of children in LIST and MAP values.
+// Has fields distinguish an omitted count from a valid zero count.
+type CollectionStatistics struct {
+	MinimumChildren    uint64
+	HasMinimumChildren bool
+	MaximumChildren    uint64
+	HasMaximumChildren bool
+	TotalChildren      uint64
+	HasTotalChildren   bool
 }
 
 // GeospatialStatistics describes the values in a GEOMETRY or GEOGRAPHY column.
@@ -230,6 +245,17 @@ func parseColumnStatistics(data []byte) (ColumnStatistics, error) {
 				result.HasNull = value == 1
 				result.HasNullSet = true
 			}
+		case 11:
+			result.BytesOnDisk, err = fieldVarint(field)
+			result.HasBytesOnDisk = err == nil
+		case 12:
+			var value []byte
+			value, err = fieldBytes(field)
+			if err == nil {
+				var stats CollectionStatistics
+				stats, err = parseCollectionStatistics(value)
+				result.Collection = &stats
+			}
 		case 13:
 			var value []byte
 			value, err = fieldBytes(field)
@@ -241,6 +267,32 @@ func parseColumnStatistics(data []byte) (ColumnStatistics, error) {
 		}
 		if err != nil {
 			return ColumnStatistics{}, err
+		}
+	}
+	return result, nil
+}
+
+func parseCollectionStatistics(data []byte) (CollectionStatistics, error) {
+	fields, err := wire.Fields(data)
+	if err != nil {
+		return CollectionStatistics{}, fmt.Errorf("decode ORC collection statistics: %w", err)
+	}
+	var result CollectionStatistics
+	for _, field := range fields {
+		if field.Number < 1 || field.Number > 3 {
+			continue
+		}
+		value, err := fieldVarint(field)
+		if err != nil {
+			return CollectionStatistics{}, err
+		}
+		switch field.Number {
+		case 1:
+			result.MinimumChildren, result.HasMinimumChildren = value, true
+		case 2:
+			result.MaximumChildren, result.HasMaximumChildren = value, true
+		case 3:
+			result.TotalChildren, result.HasTotalChildren = value, true
 		}
 	}
 	return result, nil
@@ -657,6 +709,10 @@ func cloneColumnStatistics(stats []ColumnStatistics) []ColumnStatistics {
 		if stat.Timestamp != nil {
 			value := *stat.Timestamp
 			result[i].Timestamp = &value
+		}
+		if stat.Collection != nil {
+			value := *stat.Collection
+			result[i].Collection = &value
 		}
 		if stat.Geospatial != nil {
 			value := *stat.Geospatial
