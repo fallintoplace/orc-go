@@ -104,12 +104,17 @@ func (o rowRangeOutput) yieldValue(value any) error {
 func (o rowRangeOutput) yieldBatches(stripeIndex int, columns []rowColumn, values [][]any, rootPresent []bool, rowStart, rowEnd, rootValueIndex int) error {
 	for batchStart := rowStart; batchStart < rowEnd; {
 		batchEnd := min(batchStart+defaultRowBatchSize, rowEnd)
-		batchPresent := append([]bool(nil), rootPresent[batchStart:batchEnd]...)
+		var batchPresent []bool
 		batchColumns := make([][]any, len(columns))
 		batchValueEnd := rootValueIndex
-		for rowIndex := batchStart; rowIndex < batchEnd; rowIndex++ {
-			if rootPresent[rowIndex] {
-				batchValueEnd++
+		if rootPresent == nil {
+			batchValueEnd += batchEnd - batchStart
+		} else {
+			batchPresent = append([]bool(nil), rootPresent[batchStart:batchEnd]...)
+			for rowIndex := batchStart; rowIndex < batchEnd; rowIndex++ {
+				if rootPresent[rowIndex] {
+					batchValueEnd++
+				}
 			}
 		}
 		for columnIndex := range columns {
@@ -117,20 +122,32 @@ func (o rowRangeOutput) yieldBatches(stripeIndex int, columns []rowColumn, value
 				return fmt.Errorf("stripe %d has too few decoded root columns", stripeIndex)
 			}
 			columnValues := make([]any, batchEnd-batchStart)
-			valueIndex := rootValueIndex
-			for rowIndex := batchStart; rowIndex < batchEnd; rowIndex++ {
-				if !rootPresent[rowIndex] {
-					continue
-				}
-				if valueIndex >= len(values[columnIndex]) {
+			if batchValueEnd-rootValueIndex == batchEnd-batchStart {
+				if batchValueEnd > len(values[columnIndex]) {
 					return fmt.Errorf("stripe %d root STRUCT has too few decoded field values", stripeIndex)
 				}
-				columnValues[rowIndex-batchStart] = values[columnIndex][valueIndex]
-				valueIndex++
+				copy(columnValues, values[columnIndex][rootValueIndex:batchValueEnd])
+			} else {
+				valueIndex := rootValueIndex
+				for rowIndex := batchStart; rowIndex < batchEnd; rowIndex++ {
+					if !rootPresent[rowIndex] {
+						continue
+					}
+					if valueIndex >= len(values[columnIndex]) {
+						return fmt.Errorf("stripe %d root STRUCT has too few decoded field values", stripeIndex)
+					}
+					columnValues[rowIndex-batchStart] = values[columnIndex][valueIndex]
+					valueIndex++
+				}
 			}
 			batchColumns[columnIndex] = columnValues
 		}
-		if err := o.rowBatch(RowBatch{schema: o.valueSchema, columns: batchColumns, rootPresent: batchPresent}); err != nil {
+		if err := o.rowBatch(RowBatch{
+			schema:      o.valueSchema,
+			columns:     batchColumns,
+			rowCount:    batchEnd - batchStart,
+			rootPresent: batchPresent,
+		}); err != nil {
 			return err
 		}
 		rootValueIndex = batchValueEnd

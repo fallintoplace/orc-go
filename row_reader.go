@@ -386,7 +386,7 @@ func (r *Reader) readValuesRangeWithOutput(start, end uint64, names []string, pr
 		rootValueIndex := 0
 		if projected {
 			for rowIndex := 0; rowIndex < rowStart; rowIndex++ {
-				if rootPresent[rowIndex] {
+				if rootPresent == nil || rootPresent[rowIndex] {
 					rootValueIndex++
 				}
 			}
@@ -401,7 +401,7 @@ func (r *Reader) readValuesRangeWithOutput(start, end uint64, names []string, pr
 		for rowIndex := rowStart; rowIndex < rowEnd; rowIndex++ {
 			var err error
 			if projected {
-				if rootPresent[rowIndex] {
+				if rootPresent == nil || rootPresent[rowIndex] {
 					for columnIndex := range columns {
 						if rootValueIndex >= len(values[columnIndex]) {
 							return fmt.Errorf("stripe %d root STRUCT has too few decoded field values", stripeIndex)
@@ -548,10 +548,7 @@ func decodeColumnPresence(rowCount uint64, column rowColumn, encodings []columnE
 			return nil, 0, fmt.Errorf("decode PRESENT stream: %w", err)
 		}
 	} else {
-		present = make([]bool, rows)
-		for i := range present {
-			present[i] = true
-		}
+		return nil, rows, nil
 	}
 	valueCount := 0
 	for _, isPresent := range present {
@@ -1028,7 +1025,6 @@ func decodeColumn(rowCount uint64, column rowColumn, types []Type, encodings []c
 	}
 	dataStream := streams[streamKey{kind: streamKindData, column: column.id}]
 
-	values := make([]any, rows)
 	switch column.kind {
 	case TypeKindBoolean:
 		byteCount := valueCount / 8
@@ -1039,6 +1035,7 @@ func decodeColumn(rowCount uint64, column rowColumn, types []Type, encodings []c
 		if err != nil {
 			return nil, fmt.Errorf("decode DATA boolean RLE: %w", err)
 		}
+		values := make([]any, rows)
 		valueIndex := 0
 		for rowIndex, isPresent := range present {
 			if !isPresent {
@@ -1052,6 +1049,7 @@ func decodeColumn(rowCount uint64, column rowColumn, types []Type, encodings []c
 		if err := checkRawDataLength(dataStream, valueCount, 4); err != nil {
 			return nil, fmt.Errorf("decode DATA float stream: %w", err)
 		}
+		values := make([]any, rows)
 		valueIndex := 0
 		for rowIndex, isPresent := range present {
 			if !isPresent {
@@ -1066,6 +1064,7 @@ func decodeColumn(rowCount uint64, column rowColumn, types []Type, encodings []c
 		if err := checkRawDataLength(dataStream, valueCount, 8); err != nil {
 			return nil, fmt.Errorf("decode DATA double stream: %w", err)
 		}
+		values := make([]any, rows)
 		valueIndex := 0
 		for rowIndex, isPresent := range present {
 			if !isPresent {
@@ -1095,6 +1094,7 @@ func decodeColumn(rowCount uint64, column rowColumn, types []Type, encodings []c
 		if err != nil {
 			return nil, fmt.Errorf("decode DATA byte RLE: %w", err)
 		}
+		values := make([]any, rows)
 		valueIndex := 0
 		for rowIndex, isPresent := range present {
 			if isPresent {
@@ -1118,6 +1118,7 @@ func decodeColumn(rowCount uint64, column rowColumn, types []Type, encodings []c
 	if err != nil {
 		return nil, fmt.Errorf("decode DATA stream: %w", err)
 	}
+	values := make([]any, rows)
 	valueIndex := 0
 	for rowIndex, isPresent := range present {
 		if !isPresent {
