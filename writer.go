@@ -464,22 +464,28 @@ func cloneWriterBytes(value any) any {
 func estimateWriterBufferedValues(columns []writerColumn, pending [][]any) uint64 {
 	var estimate uint64
 	for id, values := range pending {
-		kind := columns[id].kind
-		for _, value := range values {
-			estimate = addWriterBufferEstimate(estimate, bufferedValueOverheadEstimate)
-			if value == nil {
-				continue
-			}
-			switch kind {
-			case TypeKindString, TypeKindChar, TypeKindVarchar:
+		slotEstimate := uint64(len(values))
+		if slotEstimate > math.MaxUint64/bufferedValueOverheadEstimate {
+			slotEstimate = math.MaxUint64
+		} else {
+			slotEstimate *= bufferedValueOverheadEstimate
+		}
+		estimate = addWriterBufferEstimate(estimate, slotEstimate)
+		switch columns[id].kind {
+		case TypeKindString, TypeKindChar, TypeKindVarchar:
+			for _, value := range values {
 				if text, ok := value.(string); ok {
 					estimate = addWriterBufferEstimate(estimate, uint64(len(text)))
 				}
-			case TypeKindBinary, TypeKindGeometry, TypeKindGeography:
+			}
+		case TypeKindBinary, TypeKindGeometry, TypeKindGeography:
+			for _, value := range values {
 				if data, ok := value.([]byte); ok {
 					estimate = addWriterBufferEstimate(estimate, uint64(len(data)))
 				}
-			case TypeKindDecimal:
+			}
+		case TypeKindDecimal:
+			for _, value := range values {
 				if decimal, ok := value.(encodedDecimal); ok && decimal.coefficient != nil {
 					coefficientBytes := uint64((decimal.coefficient.BitLen() + 7) / 8)
 					estimate = addWriterBufferEstimate(estimate, coefficientBytes)
@@ -565,8 +571,44 @@ func (w *Writer) collectValue(id uint32, value any, path *[]writerPathSegment, p
 		if !ok {
 			return fmt.Errorf("ORC field %q expects LIST, got %T", formatWriterValuePath(*path), value)
 		}
-		pending[id] = append(pending[id], uint64(len(items)))
-		for i, item := range items {
+		itemCount := items.Len()
+		pending[id] = append(pending[id], uint64(itemCount))
+		switch items := value.(type) {
+		case []any:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []bool:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []int8:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []int16:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []int32:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []int64:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []float32:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []float64:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []string:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []Decimal:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []time.Time:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case [][]byte:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []Row:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []map[string]any:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []MapEntry:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		case []UnionValue:
+			return collectWriterListItems(w, typ.Subtypes[0], items, path, pending)
+		}
+		for i := 0; i < itemCount; i++ {
+			item := items.Index(i).Interface()
 			if err := w.collectValueAt(typ.Subtypes[0], item, writerPathSegment{kind: writerPathIndex, index: i}, path, pending); err != nil {
 				return err
 			}
@@ -639,6 +681,15 @@ func (w *Writer) collectValue(id uint32, value any, path *[]writerPathSegment, p
 		pending[id] = append(pending[id], value)
 		return nil
 	}
+}
+
+func collectWriterListItems[T any](writer *Writer, subtype uint32, items []T, path *[]writerPathSegment, pending [][]any) error {
+	for index, item := range items {
+		if err := writer.collectValueAt(subtype, item, writerPathSegment{kind: writerPathIndex, index: index}, path, pending); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *Writer) collectValueAt(id uint32, value any, segment writerPathSegment, path *[]writerPathSegment, pending [][]any) error {

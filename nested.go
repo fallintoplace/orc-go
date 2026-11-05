@@ -27,16 +27,12 @@ func structValues(value any) (map[string]any, bool) {
 	}
 }
 
-func listValues(value any) ([]any, bool) {
+func listValues(value any) (reflect.Value, bool) {
 	reflected := reflect.ValueOf(value)
 	if !reflected.IsValid() || (reflected.Kind() != reflect.Slice && reflected.Kind() != reflect.Array) {
-		return nil, false
+		return reflect.Value{}, false
 	}
-	values := make([]any, reflected.Len())
-	for i := range values {
-		values[i] = reflected.Index(i).Interface()
-	}
-	return values, true
+	return reflected, true
 }
 
 func isNilValue(value any) bool {
