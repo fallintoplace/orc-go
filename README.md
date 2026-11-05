@@ -166,7 +166,9 @@ Use `AddUserMetadata(name, value)` on the writer to store application-defined me
 
 ## Encrypt columns
 
-`EncryptColumns` encrypts a selected top-level field and its nested fields. Pass the same key provider to the writer and reader. Use a 16-byte master key for AES-CTR 128 or a 32-byte master key for AES-CTR 256.
+`EncryptColumns` encrypts a selected top-level field and its nested fields. For Hadoop key wrapping, pass the same `KeyProvider` to the writer and reader. Use a 16-byte master key for AES-CTR 128 or a 32-byte master key for AES-CTR 256.
+
+To connect AWS, GCP, or Azure KMS, implement `EncryptionKeyProvider` and set it on both options. The interface keeps cloud SDKs outside this package. Its `Kind` must match the ORC key format used to wrap local keys.
 
 ORC files store wrapped local encryption keys; they do not store the master key.
 

@@ -23,18 +23,18 @@ var (
 )
 
 const (
-	streamKindPresent         uint32 = 0
-	streamKindData            uint32 = 1
-	streamKindLength          uint32 = 2
-	streamKindDictionaryData  uint32 = 3
-	streamKindSecondary       uint32 = 5
-	streamKindRowIndex        uint32 = 6
-	streamKindBloomFilter     uint32 = 7
-	streamKindBloomFilterUTF8 uint32 = 8
-	streamKindEncryptedIndex  uint32 = 9
-	streamKindEncryptedData   uint32 = 10
+	streamKindPresent          uint32 = 0
+	streamKindData             uint32 = 1
+	streamKindLength           uint32 = 2
+	streamKindDictionaryData   uint32 = 3
+	streamKindSecondary        uint32 = 5
+	streamKindRowIndex         uint32 = 6
+	streamKindBloomFilter      uint32 = 7
+	streamKindBloomFilterUTF8  uint32 = 8
+	streamKindEncryptedIndex   uint32 = 9
+	streamKindEncryptedData    uint32 = 10
 	streamKindStripeStatistics uint32 = 100
-	streamKindFileStatistics  uint32 = 101
+	streamKindFileStatistics   uint32 = 101
 )
 
 const (
@@ -463,7 +463,7 @@ func (r *Reader) decryptStripeVariants(streams map[streamKey][]byte, footer *str
 	if dataTotal != encryptedDataLength || (dataTotal > 0) != hasEncryptedData {
 		return fmt.Errorf("encrypted data directory covers %d bytes, virtual stream covers %d", dataTotal, encryptedDataLength)
 	}
-	if r.options.KeyProvider == nil {
+	if isNilProvider(r.options.KeyProvider) && isNilProvider(r.options.EncryptionKeyProvider) {
 		return nil
 	}
 	if len(encryptedLocalKeys) != len(r.footer.encryption.variants) {
@@ -504,12 +504,12 @@ func (r *Reader) decryptStripeVariants(streams map[streamKey][]byte, footer *str
 			}
 			continue
 		}
-		if r.footer.encryption.keyProvider != 1 {
-			return fmt.Errorf("%w: key provider kind %d", ErrUnsupportedEncryption, r.footer.encryption.keyProvider)
-		}
 		keyDescription := r.footer.encryption.keys[fileVariant.key]
-		masterKey, err := r.options.KeyProvider.GetKey(keyDescription.name, keyDescription.version)
-		if errors.Is(err, ErrKeyUnavailable) || (err == nil && len(masterKey) == 0) {
+		localKey, unavailable, err := r.decryptLocalKey(keyDescription, encryptedLocalKeys[variantIndex])
+		if err != nil {
+			return fmt.Errorf("resolve key for encrypted column %d: %w", fileVariant.root, err)
+		}
+		if unavailable {
 			for _, stream := range variantFooter.streams {
 				if isIndexStreamKind(stream.kind) {
 					indexPosition += stream.length
@@ -518,13 +518,6 @@ func (r *Reader) decryptStripeVariants(streams map[streamKey][]byte, footer *str
 				}
 			}
 			continue
-		}
-		if err != nil {
-			return fmt.Errorf("resolve ORC master key %q version %d: %w", keyDescription.name, keyDescription.version, err)
-		}
-		localKey, err := unwrapLocalKey(masterKey, keyDescription.algorithm, encryptedLocalKeys[variantIndex])
-		if err != nil {
-			return fmt.Errorf("unwrap ORC local key for column %d: %w", fileVariant.root, err)
 		}
 		if int(last-fileVariant.root)+1 != len(variantFooter.encodings) {
 			return fmt.Errorf("encrypted variant for column %d has %d encodings, want %d", fileVariant.root, len(variantFooter.encodings), last-fileVariant.root+1)
