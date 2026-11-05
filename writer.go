@@ -153,6 +153,14 @@ func NewWriter(destination io.Writer, schema []Type, options WriterOptions) (*Wr
 				}
 			}
 		}
+		for _, attribute := range typ.Attributes {
+			if !utf8.ValidString(attribute.Key) {
+				return nil, fmt.Errorf("ORC type attribute key in type %d is not valid UTF-8", typeID)
+			}
+			if !utf8.ValidString(attribute.Value) {
+				return nil, fmt.Errorf("ORC type attribute value in type %d is not valid UTF-8", typeID)
+			}
+		}
 	}
 
 	switch options.Compression {
@@ -1229,6 +1237,11 @@ func encodeType(typ Type) []byte {
 	}
 	if typ.Scale != 0 {
 		message = appendProtoVarintField(message, 6, uint64(typ.Scale))
+	}
+	for _, attribute := range typ.Attributes {
+		attributeMessage := appendProtoBytesField(nil, 1, []byte(attribute.Key))
+		attributeMessage = appendProtoBytesField(attributeMessage, 2, []byte(attribute.Value))
+		message = appendProtoBytesField(message, 7, attributeMessage)
 	}
 	return message
 }
