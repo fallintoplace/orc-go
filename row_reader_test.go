@@ -317,11 +317,12 @@ func TestReadAllReadsDirectBinaryColumns(t *testing.T) {
 		rows:     3,
 		encoding: []uint32{columnEncodingDirect, columnEncodingDirectV2},
 		streams: []integerTestStream{
-			{kind: streamKindData, column: 1, data: []byte{0x00, 0xff}},
-			{kind: streamKindLength, column: 1, data: rlev2.EncodeUnsigned([]uint64{2, 0})},
+			{kind: streamKindData, column: 1, data: []byte{0x00, 0xff, 0x07}},
+			{kind: streamKindLength, column: 1, data: rlev2.EncodeUnsigned([]uint64{2, 1})},
 			{kind: streamKindPresent, column: 1, data: byteLiteralTestStream([]byte{0xc0})},
 		},
 	}})
+	originalFile := append([]byte(nil), data...)
 	reader, err := NewReader(byteReaderAt(data), int64(len(data)))
 	if err != nil {
 		t.Fatal(err)
@@ -330,9 +331,23 @@ func TestReadAllReadsDirectBinaryColumns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Row{{"payload": []byte{0x00, 0xff}}, {"payload": []byte{}}, {"payload": nil}}
+	want := []Row{{"payload": []byte{0x00, 0xff}}, {"payload": []byte{0x07}}, {"payload": nil}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+	}
+	got[0]["payload"].([]byte)[0] = 0x55
+	if got[1]["payload"].([]byte)[0] != 0x07 {
+		t.Fatalf("mutating one binary value changed the next value: %v", got[1]["payload"])
+	}
+	if !reflect.DeepEqual(data, originalFile) {
+		t.Fatal("mutating a decoded binary value changed the source file")
+	}
+	got, err = reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadAll() after mutating decoded bytes = %#v, want %#v", got, want)
 	}
 }
 
