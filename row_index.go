@@ -103,6 +103,59 @@ func parseRowIndex(data []byte) ([]RowIndexEntry, error) {
 	return result, nil
 }
 
+// parseRowIndexPositions decodes only the stream positions needed by range
+// seeking. Row-index statistics can be large and are not needed to find a row.
+func parseRowIndexPositions(data []byte, expected uint64) ([]RowIndexEntry, error) {
+	limit, err := checkedSliceLength(expected)
+	if err != nil {
+		return nil, fmt.Errorf("row index entry count: %w", err)
+	}
+	capacity := min(limit, 256)
+	result := make([]RowIndexEntry, 0, capacity)
+	err = wire.Walk(data, func(field wire.Field) error {
+		if field.Number != 1 {
+			return nil
+		}
+		if len(result) >= limit {
+			return fmt.Errorf("row index has more than %d entries", limit)
+		}
+		entryData, err := fieldBytes(field)
+		if err != nil {
+			return err
+		}
+		positions := make([]uint64, 0, 5)
+		err = wire.Walk(entryData, func(entryField wire.Field) error {
+			if entryField.Number != 1 {
+				return nil
+			}
+			appendPosition := func(value uint64) error {
+				if len(positions) == 5 {
+					return fmt.Errorf("row-index entry has more than 5 positions")
+				}
+				positions = append(positions, value)
+				return nil
+			}
+			switch entryField.Type {
+			case 0:
+				return appendPosition(entryField.Varint)
+			case 2:
+				return wire.WalkVarints(entryField.Bytes, appendPosition)
+			default:
+				return fmt.Errorf("protobuf field %d has wire type %d, want packed varints", entryField.Number, entryField.Type)
+			}
+		})
+		if err != nil {
+			return fmt.Errorf("decode ORC row index entry: %w", err)
+		}
+		result = append(result, RowIndexEntry{Positions: positions})
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("decode ORC row index: %w", err)
+	}
+	return result, nil
+}
+
 func parseRowIndexEntry(data []byte) (RowIndexEntry, error) {
 	fields, err := wire.Fields(data)
 	if err != nil {
@@ -135,9 +188,13 @@ func appendUint64Values(dst []uint64, field wire.Field) ([]uint64, error) {
 	if field.Type != 2 {
 		return nil, fmt.Errorf("protobuf field %d has wire type %d, want packed varints", field.Number, field.Type)
 	}
-	values, err := wire.Varints(field.Bytes)
+	values := dst
+	err := wire.WalkVarints(field.Bytes, func(value uint64) error {
+		values = append(values, value)
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("decode protobuf field %d: %w", field.Number, err)
 	}
-	return append(dst, values...), nil
+	return values, nil
 }

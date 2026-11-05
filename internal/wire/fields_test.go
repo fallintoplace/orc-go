@@ -35,6 +35,40 @@ func TestFieldsReadsKnownWireTypesAndPreservesFixedValues(t *testing.T) {
 	}
 }
 
+func TestWalkVisitsTheSameFieldsAsFields(t *testing.T) {
+	data := []byte{0x08, 0x96, 0x01, 0x12, 0x03, 'o', 'r', 'c', 0x19}
+	data = binary.LittleEndian.AppendUint64(data, 0x8877665544332211)
+	data = append(data, 0x25)
+	data = binary.LittleEndian.AppendUint32(data, 0x44332211)
+
+	want, err := Fields(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []Field
+	err = Walk(data, func(field Field) error {
+		got = append(got, field)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Walk() fields = %#v, want %#v", got, want)
+	}
+}
+
+func TestWalkPropagatesVisitorError(t *testing.T) {
+	want := errors.New("stop")
+	err := Walk([]byte{0x08, 0x01, 0x10, 0x02}, func(Field) error { return want })
+	if !errors.Is(err, want) {
+		t.Fatalf("Walk() error = %v, want %v", err, want)
+	}
+	if err := Walk(nil, nil); err == nil {
+		t.Fatal("Walk() accepted a nil visitor")
+	}
+}
+
 func TestVarintsReadsPackedValues(t *testing.T) {
 	values, err := Varints([]byte{0, 12, 255, 1})
 	if err != nil {
@@ -42,6 +76,30 @@ func TestVarintsReadsPackedValues(t *testing.T) {
 	}
 	if want := []uint64{0, 12, 255}; !reflect.DeepEqual(values, want) {
 		t.Fatalf("got %v, want %v", values, want)
+	}
+	var walked []uint64
+	if err := WalkVarints([]byte{0, 12, 255, 1}, func(value uint64) error {
+		walked = append(walked, value)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(walked, values) {
+		t.Fatalf("WalkVarints() = %v, want %v", walked, values)
+	}
+}
+
+func TestWalkVarintsPropagatesErrors(t *testing.T) {
+	want := errors.New("stop")
+	err := WalkVarints([]byte{0x01, 0x02}, func(uint64) error { return want })
+	if !errors.Is(err, want) {
+		t.Fatalf("WalkVarints() error = %v, want %v", err, want)
+	}
+	if err := WalkVarints(nil, nil); err == nil {
+		t.Fatal("WalkVarints() accepted a nil visitor")
+	}
+	if err := WalkVarints([]byte{0x80}, func(uint64) error { return nil }); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("WalkVarints() malformed input error = %v, want %v", err, io.ErrUnexpectedEOF)
 	}
 }
 

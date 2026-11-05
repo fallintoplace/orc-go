@@ -152,7 +152,7 @@ func (r *Reader) readIndexedNumericRangeStripe(
 		if !exists {
 			return false, nil
 		}
-		entries, err := parseRowIndex(indexData)
+		entries, err := parseRowIndexPositions(indexData, groupCount)
 		delete(streams, indexKey)
 		if err != nil || uint64(len(entries)) != groupCount {
 			return false, nil

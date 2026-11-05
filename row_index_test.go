@@ -555,6 +555,73 @@ func TestParseORCRowIndex(t *testing.T) {
 	})
 }
 
+func TestParseORCRowIndexPositions(t *testing.T) {
+	t.Run("packed and unpacked positions skip statistics", func(t *testing.T) {
+		packed := appendProtoVarint(nil, 3)
+		packed = appendProtoVarint(packed, math.MaxUint64)
+		entry := appendProtoBytesField(nil, 1, packed)
+		entry = appendProtoVarintField(entry, 1, 5)
+		entry = appendProtoBytesField(entry, 2, []byte{0x0a, 0x03, 0x01})
+		message := appendProtoBytesField(nil, 1, entry)
+
+		got, err := parseRowIndexPositions(message, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []RowIndexEntry{{Positions: []uint64{3, math.MaxUint64, 5}}}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("parseRowIndexPositions() = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("empty index", func(t *testing.T) {
+		got, err := parseRowIndexPositions(nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("parseRowIndexPositions(empty) = %#v, want no entries", got)
+		}
+	})
+
+	t.Run("fewer entries than expected", func(t *testing.T) {
+		message := appendProtoBytesField(nil, 1, nil)
+		got, err := parseRowIndexPositions(message, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("parseRowIndexPositions() returned %d entries, want 1", len(got))
+		}
+	})
+
+	t.Run("malformed positions", func(t *testing.T) {
+		truncatedPositions := appendProtoBytesField(nil, 1, []byte{0x80})
+		badWireType := appendTestFixed64Field(nil, 1, 1)
+		var tooManyPositions []byte
+		for value := uint64(0); value < 6; value++ {
+			tooManyPositions = appendProtoVarint(tooManyPositions, value)
+		}
+		tooManyPositions = appendProtoBytesField(nil, 1, tooManyPositions)
+		cases := map[string][]byte{
+			"truncated row index":       {0x0a, 0x03, 0x01},
+			"position has wrong type":   appendProtoBytesField(nil, 1, badWireType),
+			"truncated packed position": appendProtoBytesField(nil, 1, truncatedPositions),
+			"too many positions":        appendProtoBytesField(nil, 1, tooManyPositions),
+			"more entries than expected": appendProtoBytesField(
+				appendProtoBytesField(nil, 1, nil), 1, nil,
+			),
+		}
+		for name, message := range cases {
+			t.Run(name, func(t *testing.T) {
+				if _, err := parseRowIndexPositions(message, 1); err == nil {
+					t.Fatal("parseRowIndexPositions() accepted malformed input")
+				}
+			})
+		}
+	})
+}
+
 func findColumnRowIndex(t *testing.T, indexes []StripeRowIndexes, columnID uint32) ColumnRowIndex {
 	t.Helper()
 	for _, stripe := range indexes {

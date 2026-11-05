@@ -10,7 +10,7 @@ import (
 
 const maxFieldNumber = (1 << 29) - 1
 
-// Field is one Protocol Buffers field. Bytes aliases the input passed to Fields.
+// Field is one Protocol Buffers field. Bytes aliases the input message.
 type Field struct {
 	Number  int
 	Type    uint8
@@ -23,17 +23,33 @@ type Field struct {
 // Fields decodes protobuf wire fields and skips unknown fixed-width values.
 func Fields(data []byte) ([]Field, error) {
 	fields := make([]Field, 0)
+	err := Walk(data, func(field Field) error {
+		fields = append(fields, field)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return fields, nil
+}
+
+// Walk visits protobuf wire fields without allocating a slice for the fields.
+// Field.Bytes aliases data and is valid only while data remains available.
+func Walk(data []byte, visit func(Field) error) error {
+	if visit == nil {
+		return errors.New("protobuf field visitor is nil")
+	}
 	for len(data) > 0 {
 		tag, n, err := readVarint(data)
 		if err != nil {
-			return nil, fmt.Errorf("read protobuf tag: %w", err)
+			return fmt.Errorf("read protobuf tag: %w", err)
 		}
 		data = data[n:]
 
 		fieldNumber := tag >> 3
 		wireType := uint8(tag & 7)
 		if fieldNumber == 0 || fieldNumber > maxFieldNumber {
-			return nil, fmt.Errorf("invalid protobuf field number %d", fieldNumber)
+			return fmt.Errorf("invalid protobuf field number %d", fieldNumber)
 		}
 
 		field := Field{Number: int(fieldNumber), Type: wireType}
@@ -41,12 +57,12 @@ func Fields(data []byte) ([]Field, error) {
 		case 0:
 			field.Varint, n, err = readVarint(data)
 			if err != nil {
-				return nil, fmt.Errorf("read protobuf field %d: %w", fieldNumber, err)
+				return fmt.Errorf("read protobuf field %d: %w", fieldNumber, err)
 			}
 			data = data[n:]
 		case 1:
 			if len(data) < 8 {
-				return nil, io.ErrUnexpectedEOF
+				return io.ErrUnexpectedEOF
 			}
 			field.Fixed64 = uint64(data[0]) |
 				uint64(data[1])<<8 |
@@ -60,17 +76,17 @@ func Fields(data []byte) ([]Field, error) {
 		case 2:
 			length, n, err := readVarint(data)
 			if err != nil {
-				return nil, fmt.Errorf("read protobuf field %d length: %w", fieldNumber, err)
+				return fmt.Errorf("read protobuf field %d length: %w", fieldNumber, err)
 			}
 			data = data[n:]
 			if length > uint64(len(data)) {
-				return nil, io.ErrUnexpectedEOF
+				return io.ErrUnexpectedEOF
 			}
 			field.Bytes = data[:int(length)]
 			data = data[int(length):]
 		case 5:
 			if len(data) < 4 {
-				return nil, io.ErrUnexpectedEOF
+				return io.ErrUnexpectedEOF
 			}
 			field.Fixed32 = uint32(data[0]) |
 				uint32(data[1])<<8 |
@@ -78,25 +94,44 @@ func Fields(data []byte) ([]Field, error) {
 				uint32(data[3])<<24
 			data = data[4:]
 		default:
-			return nil, fmt.Errorf("unsupported protobuf wire type %d", wireType)
+			return fmt.Errorf("unsupported protobuf wire type %d", wireType)
 		}
-		fields = append(fields, field)
+		if err := visit(field); err != nil {
+			return err
+		}
 	}
-	return fields, nil
+	return nil
 }
 
 // Varints decodes a packed repeated uint32 or uint64 field.
 func Varints(data []byte) ([]uint64, error) {
 	values := make([]uint64, 0)
+	err := WalkVarints(data, func(value uint64) error {
+		values = append(values, value)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+// WalkVarints visits packed protobuf varints without allocating a result slice.
+func WalkVarints(data []byte, visit func(uint64) error) error {
+	if visit == nil {
+		return errors.New("protobuf varint visitor is nil")
+	}
 	for len(data) > 0 {
 		value, n, err := readVarint(data)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		values = append(values, value)
+		if err := visit(value); err != nil {
+			return err
+		}
 		data = data[n:]
 	}
-	return values, nil
+	return nil
 }
 
 func readVarint(data []byte) (uint64, int, error) {
