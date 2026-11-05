@@ -341,11 +341,6 @@ func (w *Writer) WriteRow(row Row) error {
 	if row == nil {
 		row = Row{}
 	}
-	for name := range row {
-		if _, exists := w.columnByName[name]; !exists {
-			return fmt.Errorf("unknown ORC field %q", name)
-		}
-	}
 	return w.writeValue(row)
 }
 
@@ -555,6 +550,9 @@ func (w *Writer) collectValue(id uint32, value any, path *[]writerPathSegment, p
 		}
 		for name := range fields {
 			if _, exists := w.structFieldNames[id][name]; !exists {
+				if len(*path) == 1 {
+					return fmt.Errorf("unknown ORC field %q", name)
+				}
 				return fmt.Errorf("unknown ORC field %q.%s", formatWriterValuePath(*path), name)
 			}
 		}

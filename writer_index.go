@@ -214,6 +214,16 @@ func (w *Writer) encodeSegmentedWriterStream(stream writerStream) (writerStream,
 	}
 	stream.groupOffsets = make([]uint64, len(stream.segments))
 	var encoded []byte
+	if w.options.Compression == CompressionNone {
+		// Uncompressed segments have an exact combined size; reserve it once.
+		encodedLength := 0
+		for _, segment := range stream.segments {
+			encodedLength += len(segment)
+		}
+		if encodedLength > 0 {
+			encoded = make([]byte, 0, encodedLength)
+		}
+	}
 	for group, segment := range stream.segments {
 		stream.groupOffsets[group] = uint64(len(encoded))
 		part, err := encodeSection(w.options.Compression, w.options.CompressionBlockSize, segment)
@@ -406,40 +416,40 @@ func (w *Writer) encodeStripeWithIndexes(offset, rows uint64) ([]byte, []byte, [
 		}
 	}
 
-	var indexBytes, dataBytes []byte
+	var indexLength, dataLength int
 	var streamFooter []byte
 	for _, stream := range unencryptedIndexes {
-		indexBytes = append(indexBytes, stream.data...)
+		indexLength += len(stream.data)
 		streamFooter = appendStripeStream(streamFooter, stream, uint64(len(stream.data)))
 	}
-	var encryptedIndexes []byte
+	var encryptedIndexLength int
 	for _, streams := range variantIndexes {
 		for _, stream := range streams {
-			encryptedIndexes = append(encryptedIndexes, stream.data...)
+			encryptedIndexLength += len(stream.data)
 		}
 	}
-	if len(encryptedIndexes) > 0 {
+	if encryptedIndexLength > 0 {
 		virtualStream := appendProtoVarintField(nil, 1, uint64(streamKindEncryptedIndex))
-		virtualStream = appendProtoVarintField(virtualStream, 3, uint64(len(encryptedIndexes)))
+		virtualStream = appendProtoVarintField(virtualStream, 3, uint64(encryptedIndexLength))
 		streamFooter = appendProtoBytesField(streamFooter, 1, virtualStream)
-		indexBytes = append(indexBytes, encryptedIndexes...)
 	}
+	indexLength += encryptedIndexLength
 	for _, stream := range unencryptedData {
-		dataBytes = append(dataBytes, stream.data...)
+		dataLength += len(stream.data)
 		streamFooter = appendStripeStream(streamFooter, stream, uint64(len(stream.data)))
 	}
-	var encryptedData []byte
+	var encryptedDataLength int
 	for _, streams := range variantData {
 		for _, stream := range streams {
-			encryptedData = append(encryptedData, stream.data...)
+			encryptedDataLength += len(stream.data)
 		}
 	}
-	if len(encryptedData) > 0 {
+	if encryptedDataLength > 0 {
 		virtualStream := appendProtoVarintField(nil, 1, uint64(streamKindEncryptedData))
-		virtualStream = appendProtoVarintField(virtualStream, 3, uint64(len(encryptedData)))
+		virtualStream = appendProtoVarintField(virtualStream, 3, uint64(encryptedDataLength))
 		streamFooter = appendProtoBytesField(streamFooter, 1, virtualStream)
-		dataBytes = append(dataBytes, encryptedData...)
 	}
+	dataLength += encryptedDataLength
 
 	for variantIndex := range w.encryption {
 		variantFooter := make([]byte, 0)
@@ -468,8 +478,8 @@ func (w *Writer) encodeStripeWithIndexes(offset, rows uint64) ([]byte, []byte, [
 		return nil, nil, nil, fmt.Errorf("compress stripe footer: %w", err)
 	}
 	stripeInfo := appendProtoVarintField(nil, 1, offset)
-	stripeInfo = appendProtoVarintField(stripeInfo, 2, uint64(len(indexBytes)))
-	stripeInfo = appendProtoVarintField(stripeInfo, 3, uint64(len(dataBytes)))
+	stripeInfo = appendProtoVarintField(stripeInfo, 2, uint64(indexLength))
+	stripeInfo = appendProtoVarintField(stripeInfo, 3, uint64(dataLength))
 	stripeInfo = appendProtoVarintField(stripeInfo, 4, uint64(len(stripeFooter)))
 	stripeInfo = appendProtoVarintField(stripeInfo, 5, rows)
 	if len(w.encryption) > 0 && len(w.stripeInfos) == 0 {
@@ -478,9 +488,24 @@ func (w *Writer) encodeStripeWithIndexes(offset, rows uint64) ([]byte, []byte, [
 			stripeInfo = appendProtoBytesField(stripeInfo, 7, variant.encryptedKey)
 		}
 	}
-	stripe := make([]byte, 0, len(indexBytes)+len(dataBytes)+len(stripeFooter))
-	stripe = append(stripe, indexBytes...)
-	stripe = append(stripe, dataBytes...)
+	// Write stream bytes straight into the final stripe to avoid temporary joins.
+	stripe := make([]byte, 0, indexLength+dataLength+len(stripeFooter))
+	for _, stream := range unencryptedIndexes {
+		stripe = append(stripe, stream.data...)
+	}
+	for _, streams := range variantIndexes {
+		for _, stream := range streams {
+			stripe = append(stripe, stream.data...)
+		}
+	}
+	for _, stream := range unencryptedData {
+		stripe = append(stripe, stream.data...)
+	}
+	for _, streams := range variantData {
+		for _, stream := range streams {
+			stripe = append(stripe, stream.data...)
+		}
+	}
 	stripe = append(stripe, stripeFooter...)
 	return stripe, stripeInfo, stripeStats, nil
 }
