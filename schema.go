@@ -231,23 +231,23 @@ func validateWriterTypes(types []Type) error {
 		}
 	}
 
-	visited := make([]bool, len(types))
+	// ORC type IDs follow a preorder traversal of the schema tree.
+	nextTypeID := 0
 	stack := []uint32{0}
-	visited[0] = true
 	for len(stack) > 0 {
 		typeID := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		for _, child := range types[typeID].Subtypes {
-			if !visited[child] {
-				visited[child] = true
-				stack = append(stack, child)
-			}
+		if int(typeID) != nextTypeID {
+			return fmt.Errorf("ORC writer type IDs must be in preorder: got type %d, want %d", typeID, nextTypeID)
+		}
+		nextTypeID++
+		children := types[typeID].Subtypes
+		for i := len(children) - 1; i >= 0; i-- {
+			stack = append(stack, children[i])
 		}
 	}
-	for typeID, seen := range visited {
-		if !seen {
-			return fmt.Errorf("ORC writer schema has unreachable type %d", typeID)
-		}
+	if nextTypeID != len(types) {
+		return fmt.Errorf("ORC writer schema has %d reachable types, want %d", nextTypeID, len(types))
 	}
 	return nil
 }

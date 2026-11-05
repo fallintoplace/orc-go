@@ -352,38 +352,6 @@ func TestValidateTypesRejectsCycles(t *testing.T) {
 	}
 }
 
-func TestWriterAcceptsSubtypeIDsOutsideDFSOrder(t *testing.T) {
-	schema := []Type{
-		{Kind: TypeKindStruct, Subtypes: []uint32{2, 1}, FieldNames: []string{"label", "id"}},
-		{Kind: TypeKindInt},
-		{Kind: TypeKindString},
-	}
-	var output bytes.Buffer
-	writer, err := NewWriter(&output, schema, WriterOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.WriteRow(Row{"label": "row", "id": int32(7)}); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reader, err := NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
-	rows, err := reader.ReadAll()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []Row{{"label": "row", "id": int32(7)}}
-	if !reflect.DeepEqual(rows, want) {
-		t.Fatalf("ReadAll() = %#v, want %#v", rows, want)
-	}
-}
-
 func TestDecodeUnionRejectsOutOfRangeTag(t *testing.T) {
 	types := []Type{
 		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"value"}},
