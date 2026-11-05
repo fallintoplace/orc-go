@@ -30,14 +30,14 @@ func TestReadDateColumnsWithRLEv1AndRLEv2(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			data := makeIntegerORCFile(t, CompressionNone, []string{"date"}, []TypeKind{TypeKindDate}, []integerTestStripe{{
+			data := makeIntegerORCFileWithCalendar(t, CompressionNone, []string{"date"}, []TypeKind{TypeKindDate}, []integerTestStripe{{
 				rows:     6,
 				encoding: []uint32{columnEncodingDirect, tc.encoding},
 				streams: []integerTestStream{
 					{kind: streamKindPresent, column: 1, data: byteLiteralTestStream([]byte{0xdc})},
 					{kind: streamKindData, column: 1, data: tc.data},
 				},
-			}})
+			}}, CalendarKindProlepticGregorian)
 			reader, err := NewReader(byteReaderAt(data), int64(len(data)))
 			if err != nil {
 				t.Fatal(err)

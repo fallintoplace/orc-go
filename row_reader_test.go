@@ -682,6 +682,10 @@ func TestReadRowsRejectsMalformedVariableLengthStreams(t *testing.T) {
 }
 
 func makeIntegerORCFile(t *testing.T, compression CompressionKind, names []string, kinds []TypeKind, stripes []integerTestStripe) []byte {
+	return makeIntegerORCFileWithCalendar(t, compression, names, kinds, stripes, CalendarKindUnknown)
+}
+
+func makeIntegerORCFileWithCalendar(t *testing.T, compression CompressionKind, names []string, kinds []TypeKind, stripes []integerTestStripe, calendar CalendarKind) []byte {
 	t.Helper()
 	if len(names) != len(kinds) {
 		t.Fatal("test schema field names and kinds have different lengths")
@@ -748,6 +752,9 @@ func makeIntegerORCFile(t *testing.T, compression CompressionKind, names []strin
 		footer = appendBytesField(footer, 4, appendVarintField(nil, 1, uint64(kind)))
 	}
 	footer = appendVarintField(footer, 6, totalRows)
+	if calendar != CalendarKindUnknown {
+		footer = appendVarintField(footer, 11, uint64(calendar))
+	}
 
 	blockSize := uint64(0)
 	encodedFooter := footer

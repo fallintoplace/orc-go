@@ -27,6 +27,8 @@ var (
 	ErrInvalidFile = errors.New("invalid ORC file")
 	// ErrUnsupportedCompression is returned for an ORC compression codec that is not supported.
 	ErrUnsupportedCompression = errors.New("unsupported ORC compression")
+	// ErrUnsupportedCalendar is returned for an ORC calendar kind that is not supported.
+	ErrUnsupportedCalendar = errors.New("unsupported ORC calendar")
 )
 
 // Reader reads ORC file metadata and decodes rows from its stripes.
@@ -37,6 +39,7 @@ type Reader struct {
 	options          ReaderOptions
 	postScript       postScript
 	footer           fileFooter
+	calendar         CalendarKind
 	stripeStatistics []stripeStatistics
 	metadataAt       int64
 	stripeStatsAt    int64
@@ -48,7 +51,7 @@ func Open(path string) (*Reader, error) {
 	return OpenWithOptions(path, ReaderOptions{})
 }
 
-// OpenWithOptions opens a file with options for reading encrypted columns.
+// OpenWithOptions opens a file with reader options.
 func OpenWithOptions(path string, options ReaderOptions) (*Reader, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -79,6 +82,9 @@ func NewReader(source io.ReaderAt, size int64) (*Reader, error) {
 func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions) (*Reader, error) {
 	if source == nil {
 		return nil, fmt.Errorf("%w: nil source", ErrInvalidFile)
+	}
+	if !supportedCalendarKind(options.DefaultCalendar) {
+		return nil, fmt.Errorf("%w: default calendar kind %d", ErrUnsupportedCalendar, options.DefaultCalendar)
 	}
 	if size < int64(len(fileMagic))+1 {
 		return nil, fmt.Errorf("%w: file is too short", ErrInvalidFile)
@@ -134,8 +140,9 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 	}
 	footer, err := parseFooter(footerBytes)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidFile, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidFile, err)
 	}
+	calendar := effectiveCalendarKind(footer.calendar, options.DefaultCalendar)
 	var stripeStatistics []stripeStatistics
 	if postScript.metadataLength > 0 {
 		metadataBytes, err := readSection(source, metadataAt, postScript.metadataLength)
@@ -168,6 +175,7 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 		options:          options,
 		postScript:       postScript,
 		footer:           footer,
+		calendar:         calendar,
 		stripeStatistics: stripeStatistics,
 		metadataAt:       metadataAt,
 		stripeStatsAt:    stripeStatsAt,
@@ -203,6 +211,13 @@ func (r *Reader) Compression() CompressionKind {
 // FormatVersion returns the ORC file version declared by the postscript.
 func (r *Reader) FormatVersion() []uint32 {
 	return append([]uint32(nil), r.postScript.version...)
+}
+
+// CalendarKind reports the calendar used to interpret DATE and TIMESTAMP
+// values. A known footer value takes priority; otherwise the reader uses the
+// configured fallback or Julian/Gregorian by default.
+func (r *Reader) CalendarKind() CalendarKind {
+	return r.calendar
 }
 
 // RowIndexStride returns the row group size declared by the file footer.

@@ -12,6 +12,7 @@ type fileFooter struct {
 	numberOfRows     uint64
 	hasNumberOfRows  bool
 	rowIndexStride   uint64
+	calendar         CalendarKind
 	stripes          []StripeInfo
 	stripeEncryption []stripeEncryptionInfo
 	types            []Type
@@ -79,6 +80,15 @@ func parseFooter(data []byte) (fileFooter, error) {
 			}
 		case 8:
 			result.rowIndexStride, err = fieldVarint(field)
+		case 11:
+			var value uint64
+			value, err = fieldVarint(field)
+			if err == nil && value > uint64(CalendarKindProlepticGregorian) {
+				err = fmt.Errorf("%w: calendar kind %d", ErrUnsupportedCalendar, value)
+			}
+			if err == nil {
+				result.calendar = CalendarKind(value)
+			}
 		case 10:
 			var data []byte
 			data, err = fieldBytes(field)

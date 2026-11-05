@@ -18,7 +18,7 @@ type encodedTimestamp struct {
 	nanos   uint64
 }
 
-func decodeTimestampColumn(present []bool, valueCount int, column rowColumn, streams map[streamKey][]byte, encoding columnEncoding, writerTimezone string) ([]any, error) {
+func decodeTimestampColumn(present []bool, valueCount int, column rowColumn, streams map[streamKey][]byte, encoding columnEncoding, writerTimezone string, calendar CalendarKind) ([]any, error) {
 	data := streams[streamKey{kind: streamKindData, column: column.id}]
 	secondary := streams[streamKey{kind: streamKindSecondary, column: column.id}]
 	var seconds []int64
@@ -50,7 +50,7 @@ func decodeTimestampColumn(present []bool, valueCount int, column rowColumn, str
 		if !isPresent {
 			continue
 		}
-		value, err := decodeTimestampValue(seconds[valueIndex], nanos[valueIndex], column.kind, location)
+		value, err := decodeTimestampValue(seconds[valueIndex], nanos[valueIndex], column.kind, location, calendar)
 		if err != nil {
 			return nil, fmt.Errorf("timestamp value %d: %w", valueIndex, err)
 		}
@@ -60,7 +60,7 @@ func decodeTimestampColumn(present []bool, valueCount int, column rowColumn, str
 	return values, nil
 }
 
-func decodeTimestampValue(seconds int64, packedNanos uint64, kind TypeKind, location *time.Location) (time.Time, error) {
+func decodeTimestampValue(seconds int64, packedNanos uint64, kind TypeKind, location *time.Location, calendar CalendarKind) (time.Time, error) {
 	nanos, err := decodeTimestampNanos(packedNanos)
 	if err != nil {
 		return time.Time{}, err
@@ -73,6 +73,7 @@ func decodeTimestampValue(seconds int64, packedNanos uint64, kind TypeKind, loca
 		return time.Time{}, fmt.Errorf("seconds from epoch overflow int64")
 	}
 	value := time.Unix(base+seconds, nanos)
+	value = timestampInProlepticCalendar(value, calendar)
 	if kind == TypeKindTimestampInstant {
 		return value.UTC(), nil
 	}

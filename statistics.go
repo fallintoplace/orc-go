@@ -75,7 +75,8 @@ type DecimalStatistics struct {
 	HasSum     bool
 }
 
-// DateStatistics stores the minimum and maximum days since 1970-01-01 UTC.
+// DateStatistics stores the minimum and maximum day counts since 1970-01-01.
+// The calendar used to interpret those counts is reported by Reader.CalendarKind.
 type DateStatistics struct {
 	Minimum    int32
 	HasMinimum bool
