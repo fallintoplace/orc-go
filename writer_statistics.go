@@ -159,6 +159,28 @@ func buildWriterColumnStatistics(column writerColumn, values []any, rows uint64)
 			result.Sum += int64(length)
 		}
 		stats.Binary = result
+	case TypeKindList, TypeKindMap:
+		result := &CollectionStatistics{HasTotalChildren: true}
+		for _, value := range values {
+			if value == nil {
+				continue
+			}
+			children := value.(uint64)
+			if !result.HasMinimumChildren || children < result.MinimumChildren {
+				result.MinimumChildren, result.HasMinimumChildren = children, true
+			}
+			if !result.HasMaximumChildren || children > result.MaximumChildren {
+				result.MaximumChildren, result.HasMaximumChildren = children, true
+			}
+			if result.HasTotalChildren {
+				if children > math.MaxUint64-result.TotalChildren {
+					result.HasTotalChildren = false
+				} else {
+					result.TotalChildren += children
+				}
+			}
+		}
+		stats.Collection = result
 	case TypeKindDecimal:
 		// Align values to one scale before comparing coefficients or adding them.
 		var commonScale int64
@@ -346,6 +368,8 @@ func mergeWriterColumnStatistics(kind TypeKind, destination, source ColumnStatis
 		mergeDecimalStatistics(&destination.Decimal, source.Decimal)
 	case TypeKindBinary:
 		mergeBinaryStatistics(&destination.Binary, source.Binary)
+	case TypeKindList, TypeKindMap:
+		mergeCollectionStatistics(&destination.Collection, source.Collection)
 	case TypeKindTimestamp, TypeKindTimestampInstant:
 		mergeTimestampStatistics(&destination.Timestamp, source.Timestamp)
 	}
@@ -661,6 +685,35 @@ func mergeBinaryStatistics(destination **BinaryStatistics, source *BinaryStatist
 	}
 }
 
+func mergeCollectionStatistics(destination **CollectionStatistics, source *CollectionStatistics) {
+	if source == nil {
+		return
+	}
+	if *destination == nil {
+		copy := *source
+		*destination = &copy
+		return
+	}
+	result := *destination
+	mergeUintBounds(&result.MinimumChildren, &result.HasMinimumChildren, source.MinimumChildren, source.HasMinimumChildren, true)
+	mergeUintBounds(&result.MaximumChildren, &result.HasMaximumChildren, source.MaximumChildren, source.HasMaximumChildren, false)
+	if result.HasTotalChildren && source.HasTotalChildren && source.TotalChildren <= math.MaxUint64-result.TotalChildren {
+		result.TotalChildren += source.TotalChildren
+	} else {
+		result.HasTotalChildren = false
+	}
+}
+
+func mergeUintBounds(destination *uint64, hasDestination *bool, source uint64, hasSource bool, minimum bool) {
+	if !*hasDestination || !hasSource {
+		*hasDestination = false
+		return
+	}
+	if (minimum && source < *destination) || (!minimum && source > *destination) {
+		*destination = source
+	}
+}
+
 func mergeTimestampStatistics(destination **TimestampStatistics, source *TimestampStatistics) {
 	if source == nil {
 		return
@@ -787,6 +840,29 @@ func encodeColumnStatistics(statistics ColumnStatistics) []byte {
 		}
 		result = appendProtoBytesField(result, 9, values)
 	}
+	if statistics.HasNullSet {
+		value := uint64(0)
+		if statistics.HasNull {
+			value = 1
+		}
+		result = appendProtoVarintField(result, 10, value)
+	}
+	if statistics.HasBytesOnDisk {
+		result = appendProtoVarintField(result, 11, statistics.BytesOnDisk)
+	}
+	if statistics.Collection != nil {
+		var values []byte
+		if statistics.Collection.HasMinimumChildren {
+			values = appendProtoVarintField(values, 1, statistics.Collection.MinimumChildren)
+		}
+		if statistics.Collection.HasMaximumChildren {
+			values = appendProtoVarintField(values, 2, statistics.Collection.MaximumChildren)
+		}
+		if statistics.Collection.HasTotalChildren {
+			values = appendProtoVarintField(values, 3, statistics.Collection.TotalChildren)
+		}
+		result = appendProtoBytesField(result, 12, values)
+	}
 	if statistics.Geospatial != nil {
 		var values []byte
 		if statistics.Geospatial.BoundingBox != nil {
@@ -826,13 +902,6 @@ func encodeColumnStatistics(statistics ColumnStatistics) []byte {
 			values = appendProtoBytesField(values, 2, typeCodes)
 		}
 		result = appendProtoBytesField(result, 13, values)
-	}
-	if statistics.HasNullSet {
-		value := uint64(0)
-		if statistics.HasNull {
-			value = 1
-		}
-		result = appendProtoVarintField(result, 10, value)
 	}
 	return result
 }
