@@ -45,18 +45,16 @@ func DecodeUnsigned(data []byte, count int) ([]uint64, error) {
 	return decode(data, count, false)
 }
 
-// EncodeSigned encodes signed values using valid SHORT_REPEAT and DIRECT runs.
+// EncodeSigned encodes signed values using the RLEv2 run mode that best fits
+// each input sequence.
 func EncodeSigned(values []int64) []byte {
-	encoded := make([]uint64, len(values))
-	for i, value := range values {
-		encoded[i] = zigzagEncode(value)
-	}
-	return encode(encoded)
+	return encodeSignedValues(values)
 }
 
-// EncodeUnsigned encodes unsigned values using valid SHORT_REPEAT and DIRECT runs.
+// EncodeUnsigned encodes unsigned values using the RLEv2 run mode that best
+// fits each input sequence.
 func EncodeUnsigned(values []uint64) []byte {
-	return encode(values)
+	return encodeUnsignedValues(values)
 }
 
 func decode(data []byte, expected int, signed bool) ([]uint64, error) {
@@ -163,9 +161,6 @@ func decodePatchedBase(first byte, payload []byte, remaining int, signed bool) (
 	patchCount := int(fourth & 0x1f)
 	if patchWidth+gapWidth > 64 {
 		return nil, 0, fmt.Errorf("RLEv2 patch entry width %d exceeds 64 bits", patchWidth+gapWidth)
-	}
-	if patchWidth+width > 64 {
-		return nil, 0, fmt.Errorf("RLEv2 patched value width %d exceeds 64 bits", patchWidth+width)
 	}
 	patchEntryWidth, err := closestFixedWidth(patchWidth + gapWidth)
 	if err != nil {
@@ -566,40 +561,6 @@ func readBigEndian(data []byte) uint64 {
 
 func tooManyValues(run, remaining int) error {
 	return fmt.Errorf("RLEv2 run has %d values, only %d remain", run, remaining)
-}
-
-func encode(values []uint64) []byte {
-	var output bytes.Buffer
-	for position := 0; position < len(values); {
-		runLength := equalRunLength(values[position:])
-		if runLength >= minRepeat {
-			for runLength >= minRepeat {
-				count := runLength
-				if count > maxShortRepeat {
-					count = maxShortRepeat
-				}
-				writeShortRepeat(&output, values[position], count)
-				position += count
-				runLength -= count
-			}
-			if runLength > 0 {
-				writeDirect(&output, values[position:position+runLength])
-				position += runLength
-			}
-			continue
-		}
-
-		start := position
-		position++
-		for position < len(values) && position-start < maxRun {
-			if equalRunLength(values[position:]) >= minRepeat {
-				break
-			}
-			position++
-		}
-		writeDirect(&output, values[start:position])
-	}
-	return output.Bytes()
 }
 
 func equalRunLength(values []uint64) int {
