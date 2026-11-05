@@ -14,22 +14,18 @@ const (
 	maxLiteral = 128
 )
 
+type decodedInteger interface {
+	~int64 | ~uint64
+}
+
 // DecodeSigned decodes exactly count zigzag-encoded signed values.
 func DecodeSigned(data []byte, count int) ([]int64, error) {
-	encoded, err := decode(data, count, true)
-	if err != nil {
-		return nil, err
-	}
-	values := make([]int64, len(encoded))
-	for i, value := range encoded {
-		values[i] = int64(value)
-	}
-	return values, nil
+	return decode[int64](data, count, true)
 }
 
 // DecodeUnsigned decodes exactly count unsigned values.
 func DecodeUnsigned(data []byte, count int) ([]uint64, error) {
-	return decode(data, count, false)
+	return decode[uint64](data, count, false)
 }
 
 // EncodeSigned encodes signed values as delta runs and zigzag literals.
@@ -84,11 +80,11 @@ func EncodeUnsigned(values []uint64) []byte {
 	return output.Bytes()
 }
 
-func decode(data []byte, expected int, signed bool) ([]uint64, error) {
+func decode[T decodedInteger](data []byte, expected int, signed bool) ([]T, error) {
 	if expected < 0 {
 		return nil, fmt.Errorf("negative RLEv1 value count %d", expected)
 	}
-	values := make([]uint64, 0, expected)
+	values := make([]T, 0, expected)
 	for len(data) > 0 {
 		control := int8(data[0])
 		data = data[1:]
@@ -110,7 +106,7 @@ func decode(data []byte, expected int, signed bool) ([]uint64, error) {
 			if signed {
 				value := zigzagDecode(encoded)
 				for i := 0; i < count; i++ {
-					values = append(values, uint64(value))
+					values = append(values, T(value))
 					if i+1 < count {
 						value, err = addSignedDelta(value, delta)
 						if err != nil {
@@ -121,7 +117,7 @@ func decode(data []byte, expected int, signed bool) ([]uint64, error) {
 			} else {
 				value := encoded
 				for i := 0; i < count; i++ {
-					values = append(values, value)
+					values = append(values, T(value))
 					if i+1 < count {
 						value, err = addUnsignedDelta(value, delta)
 						if err != nil {
@@ -144,9 +140,9 @@ func decode(data []byte, expected int, signed bool) ([]uint64, error) {
 			}
 			data = data[consumed:]
 			if signed {
-				values = append(values, uint64(zigzagDecode(encoded)))
+				values = append(values, T(zigzagDecode(encoded)))
 			} else {
-				values = append(values, encoded)
+				values = append(values, T(encoded))
 			}
 		}
 	}

@@ -165,6 +165,28 @@ func TestDecodeRLEv1RejectsArithmeticOverflow(t *testing.T) {
 	}
 }
 
+func BenchmarkDecodeSignedSequential(b *testing.B) {
+	const valueCount = 40_000
+	values := make([]int64, valueCount)
+	for index := range values {
+		values[index] = int64(index)
+	}
+	encoded := EncodeSigned(values)
+
+	b.ReportAllocs()
+	b.SetBytes(valueCount * 8)
+	b.ResetTimer()
+	for range b.N {
+		decoded, err := DecodeSigned(encoded, valueCount)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(decoded) != valueCount || decoded[valueCount-1] != values[valueCount-1] {
+			b.Fatalf("decoded values do not match the %d-value input", valueCount)
+		}
+	}
+}
+
 func appendTestVarint(data []byte, value uint64) []byte {
 	for value >= 0x80 {
 		data = append(data, byte(value)|0x80)
