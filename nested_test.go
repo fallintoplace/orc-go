@@ -51,6 +51,51 @@ func TestWriterRoundTripsNestedRows(t *testing.T) {
 	}
 }
 
+func TestWriterAndReaderPreserveNullMapKeys(t *testing.T) {
+	schema := []Type{
+		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"items"}},
+		{Kind: TypeKindMap, Subtypes: []uint32{2, 3}},
+		{Kind: TypeKindString},
+		{Kind: TypeKindInt},
+	}
+	var typedNilKey *string
+	input := Row{"items": []MapEntry{
+		{Key: "present", Value: int32(1)},
+		{Key: nil, Value: int32(2)},
+		{Key: typedNilKey, Value: int32(3)},
+	}}
+	want := []Row{{"items": []MapEntry{
+		{Key: "present", Value: int32(1)},
+		{Key: nil, Value: int32(2)},
+		{Key: nil, Value: int32(3)},
+	}}}
+
+	var output bytes.Buffer
+	writer, err := NewWriter(&output, schema, WriterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteRow(input); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := NewReader(bytes.NewReader(output.Bytes()), int64(output.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	got, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+	}
+}
+
 func TestWriterWritesStringDictionaries(t *testing.T) {
 	schema := []Type{
 		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"text"}},
