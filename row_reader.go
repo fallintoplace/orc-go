@@ -1307,6 +1307,18 @@ func decodeVariableLengthColumn(present []bool, valueCount int, column rowColumn
 		if err != nil {
 			return nil, fmt.Errorf("decode DICTIONARY_DATA stream: %w", err)
 		}
+		var dictionaryValues []any
+		switch column.kind {
+		case TypeKindString, TypeKindChar, TypeKindVarchar:
+			dictionaryCount := len(dictionary)
+			// Avoid the cache allocation when there are too few repeated values.
+			if dictionaryCount < valueCount && valueCount-dictionaryCount > dictionaryCount {
+				dictionaryValues = make([]any, dictionaryCount)
+				for index, value := range dictionary {
+					dictionaryValues[index] = variableColumnValue(column, value)
+				}
+			}
+		}
 		indices, err := decodeUnsignedIntegerStream(data, valueCount, version2)
 		if err != nil {
 			return nil, fmt.Errorf("decode dictionary DATA stream: %w", err)
@@ -1321,7 +1333,11 @@ func decodeVariableLengthColumn(present []bool, valueCount int, column rowColumn
 			if index >= uint64(len(dictionary)) {
 				return nil, fmt.Errorf("dictionary index %d exceeds dictionary size %d", index, len(dictionary))
 			}
-			values[rowIndex] = variableColumnValue(column, dictionary[index])
+			if dictionaryValues != nil {
+				values[rowIndex] = dictionaryValues[index]
+			} else {
+				values[rowIndex] = variableColumnValue(column, dictionary[index])
+			}
 			valueIndex++
 		}
 		return values, nil
@@ -1334,17 +1350,28 @@ func decodeVariableLengthColumn(present []bool, valueCount int, column rowColumn
 	if err != nil {
 		return nil, fmt.Errorf("decode LENGTH stream: %w", err)
 	}
-	valuesData, err := splitVariableData(data, lengths)
-	if err != nil {
-		return nil, fmt.Errorf("decode DATA stream: %w", err)
+	dataOffset := 0
+	for index, length := range lengths {
+		remaining := len(data) - dataOffset
+		if length > uint64(remaining) {
+			return nil, fmt.Errorf("decode DATA stream: value %d length %d exceeds remaining DATA bytes %d", index, length, remaining)
+		}
+		dataOffset += int(length)
+	}
+	if dataOffset != len(data) {
+		return nil, fmt.Errorf("decode DATA stream: DATA stream has %d unreferenced bytes", len(data)-dataOffset)
 	}
 	values := make([]any, len(present))
 	valueIndex := 0
+	dataOffset = 0
 	for rowIndex, isPresent := range present {
 		if !isPresent {
 			continue
 		}
-		values[rowIndex] = variableColumnValue(column, valuesData[valueIndex])
+		length := lengths[valueIndex]
+		dataEnd := dataOffset + int(length)
+		values[rowIndex] = variableColumnValue(column, data[dataOffset:dataEnd])
+		dataOffset = dataEnd
 		valueIndex++
 	}
 	return values, nil
