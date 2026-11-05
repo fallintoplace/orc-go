@@ -101,6 +101,42 @@ func TestReadSameRootEncryptionVariants(t *testing.T) {
 	}
 }
 
+func TestUnknownEncryptionAlgorithmUsesMaskedData(t *testing.T) {
+	masterKey := bytes.Repeat([]byte{0x41}, 16)
+	data := writeVariantTestFile(t, "primary", 1, masterKey)
+	reader, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryption := *reader.footer.encryption
+	encryption.keys = append([]encryptionKeyDescription(nil), encryption.keys...)
+	encryption.keys[0].algorithm = 0 // UNKNOWN_ENCRYPTION
+	data = rewriteVariantTestEncryption(t, reader, &encryption)
+
+	keyless, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader() rejected UNKNOWN_ENCRYPTION: %v", err)
+	}
+	got, err := keyless.ReadAll()
+	if err != nil {
+		t.Fatalf("keyless ReadAll() error = %v", err)
+	}
+	want := []Row{{"secret": nil}, {"secret": nil}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("keyless ReadAll() = %#v, want masked rows %#v", got, want)
+	}
+
+	keyed, err := NewReaderWithOptions(bytes.NewReader(data), int64(len(data)), ReaderOptions{
+		KeyProvider: KeyProviderFunc(func(string, uint32) ([]byte, error) { return masterKey, nil }),
+	})
+	if err != nil {
+		t.Fatalf("NewReaderWithOptions() error = %v", err)
+	}
+	if _, err := keyed.ReadAll(); !errors.Is(err, ErrUnsupportedEncryption) {
+		t.Fatalf("keyed ReadAll() error = %v, want ErrUnsupportedEncryption", err)
+	}
+}
+
 func combineEncryptionVariants(t *testing.T, primaryData, secondaryData []byte) []byte {
 	t.Helper()
 	primary, err := NewReader(bytes.NewReader(primaryData), int64(len(primaryData)))
@@ -214,28 +250,62 @@ func combineEncryptionVariants(t *testing.T, primaryData, secondaryData []byte) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	postScript := appendProtoVarintField(nil, 1, uint64(len(encodedFooter)))
-	postScript = appendProtoVarintField(postScript, 2, uint64(CompressionNone))
-	var version []byte
-	for _, value := range primary.postScript.version {
-		version = appendProtoVarint(version, uint64(value))
-	}
-	if len(version) > 0 {
-		postScript = appendProtoBytesField(postScript, 4, version)
-	}
-	if len(metadata) > 0 {
-		postScript = appendProtoVarintField(postScript, 5, uint64(len(metadata)))
-	}
-	if primary.postScript.hasWriterVersion {
-		postScript = appendProtoVarintField(postScript, 6, uint64(primary.postScript.writerVersion))
-	}
-	postScript = appendProtoVarintField(postScript, 7, uint64(len(stripeStatistics)))
+	postScript := encodeVariantTestPostScript(primary, uint64(len(encodedFooter)), uint64(len(metadata)), uint64(len(stripeStatistics)))
 	file = append(file, stripeStatistics...)
 	file = append(file, metadata...)
 	file = append(file, encodedFooter...)
 	file = append(file, postScript...)
 	file = append(file, byte(len(postScript)))
 	return file
+}
+
+func rewriteVariantTestEncryption(t *testing.T, reader *Reader, encryption *fileEncryption) []byte {
+	t.Helper()
+	if len(reader.footer.stripes) != 1 || reader.postScript.compression != CompressionNone {
+		t.Fatal("variant test rewrite expects one uncompressed stripe")
+	}
+	stripe := reader.footer.stripes[0]
+	contentLength := stripe.Offset + stripe.IndexLength + stripe.DataLength + stripe.FooterLength
+	body := mustReadSection(t, reader.source, 0, contentLength)
+	stripeStatistics := mustReadSection(t, reader.source, uint64(reader.stripeStatsAt), reader.postScript.stripeStatisticsLength)
+	metadata := mustReadSection(t, reader.source, uint64(reader.metadataAt), reader.postScript.metadataLength)
+	footer := encodeVariantTestFooter(reader, stripe, reader.footer.stripeEncryption[0], encryption, contentLength)
+	encodedFooter, err := encodeSection(CompressionNone, 0, footer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postScript := encodeVariantTestPostScript(reader, uint64(len(encodedFooter)), uint64(len(metadata)), uint64(len(stripeStatistics)))
+	file := append(body, stripeStatistics...)
+	file = append(file, metadata...)
+	file = append(file, encodedFooter...)
+	file = append(file, postScript...)
+	file = append(file, byte(len(postScript)))
+	return file
+}
+
+func encodeVariantTestPostScript(reader *Reader, footerLength, metadataLength, stripeStatisticsLength uint64) []byte {
+	postScript := appendProtoVarintField(nil, 1, footerLength)
+	postScript = appendProtoVarintField(postScript, 2, uint64(reader.postScript.compression))
+	if reader.postScript.compression != CompressionNone {
+		postScript = appendProtoVarintField(postScript, 3, reader.postScript.compressionBlockSize)
+	}
+	var version []byte
+	for _, value := range reader.postScript.version {
+		version = appendProtoVarint(version, uint64(value))
+	}
+	if len(version) > 0 {
+		postScript = appendProtoBytesField(postScript, 4, version)
+	}
+	if metadataLength > 0 {
+		postScript = appendProtoVarintField(postScript, 5, metadataLength)
+	}
+	if reader.postScript.hasWriterVersion {
+		postScript = appendProtoVarintField(postScript, 6, uint64(reader.postScript.writerVersion))
+	}
+	if stripeStatisticsLength > 0 {
+		postScript = appendProtoVarintField(postScript, 7, stripeStatisticsLength)
+	}
+	return postScript
 }
 
 func writeVariantTestFile(t *testing.T, keyName string, keyVersion uint32, masterKey []byte) []byte {
