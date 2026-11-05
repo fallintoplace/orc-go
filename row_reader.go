@@ -229,13 +229,7 @@ func (r *Reader) readValuesRange(start, end uint64, names []string, projected bo
 		}
 		columns = []rowColumn{{id: 0, name: "root", kind: root.Kind, calendar: r.calendar}}
 	}
-	wanted := make(map[streamKey]bool, len(r.footer.types)*5)
-	for _, column := range columns {
-		addSubtreeStreams(r.footer.types, column.id, wanted)
-	}
-	if projected {
-		wanted[streamKey{kind: streamKindPresent, column: 0}] = true
-	}
+	var wanted map[streamKey]bool
 
 	var previousEncryptionStripeID uint64
 	var encryptedLocalKeys [][]byte
@@ -271,13 +265,30 @@ func (r *Reader) readValuesRange(start, end uint64, names []string, projected bo
 		if err != nil {
 			return fmt.Errorf("stripe %d row count: %w", stripeIndex, err)
 		}
-		handled, err := r.readIndexedNumericRangeStripe(stripe, stripeIndex, stripeRowStart, stripeRowEnd, start, end, columns, projected, yield)
+		handled, err := r.readIndexedVariableRangeStripe(stripe, stripeIndex, stripeRowStart, stripeRowEnd, start, end, columns, projected, yield)
 		if err != nil {
 			return err
 		}
 		if handled {
 			stripeRowStart = stripeRowEnd
 			continue
+		}
+		handled, err = r.readIndexedNumericRangeStripe(stripe, stripeIndex, stripeRowStart, stripeRowEnd, start, end, columns, projected, yield)
+		if err != nil {
+			return err
+		}
+		if handled {
+			stripeRowStart = stripeRowEnd
+			continue
+		}
+		if wanted == nil {
+			wanted = make(map[streamKey]bool, len(r.footer.types)*5)
+			for _, column := range columns {
+				addSubtreeStreams(r.footer.types, column.id, wanted)
+			}
+			if projected {
+				wanted[streamKey{kind: streamKindPresent, column: 0}] = true
+			}
 		}
 		streams, footer, err := r.readStripeStreamsAt(stripe, wanted, stripeIndex, encryptionStripeID, encryptedLocalKeys)
 		if err != nil {
