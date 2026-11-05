@@ -137,6 +137,174 @@ func TestUnknownEncryptionAlgorithmUsesMaskedData(t *testing.T) {
 	}
 }
 
+func TestReadMergedEncryptedFilesWithResetStripeIDs(t *testing.T) {
+	masterKey := bytes.Repeat([]byte{0x51}, 16)
+	firstData := writeMergedEncryptionSourceFile(t, masterKey, []string{"first-one", "first-two"})
+	secondData := writeMergedEncryptionSourceFile(t, masterKey, []string{"second-one", "second-two"})
+	data := mergeEncryptedStripeTestFiles(t, firstData, secondData)
+	reader, err := NewReaderWithOptions(bytes.NewReader(data), int64(len(data)), ReaderOptions{
+		KeyProvider: KeyProviderFunc(func(string, uint32) ([]byte, error) { return masterKey, nil }),
+	})
+	if err != nil {
+		t.Fatalf("NewReaderWithOptions() rejected merged encryption stripe IDs: %v", err)
+	}
+	stripeEncryption := reader.footer.stripeEncryption
+	if len(stripeEncryption) != 4 || !stripeEncryption[0].hasStripeID || stripeEncryption[0].stripeID != 1 || stripeEncryption[1].hasStripeID || !stripeEncryption[2].hasStripeID || stripeEncryption[2].stripeID != 1 || stripeEncryption[3].hasStripeID {
+		t.Fatalf("merged stripe encryption IDs = %#v, want 1, inferred, 1, inferred", stripeEncryption)
+	}
+	if len(stripeEncryption[0].localKeys) != 1 || len(stripeEncryption[2].localKeys) != 1 || bytes.Equal(stripeEncryption[0].localKeys[0], stripeEncryption[2].localKeys[0]) {
+		t.Fatalf("merged source files should have distinct first-stripe local keys: %#v", stripeEncryption)
+	}
+	got, err := reader.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	want := []Row{
+		{"secret": "first-one"},
+		{"secret": "first-two"},
+		{"secret": "second-one"},
+		{"secret": "second-two"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadAll() = %#v, want %#v", got, want)
+	}
+	indexes, err := reader.RowIndexes()
+	if err != nil {
+		t.Fatalf("RowIndexes() error = %v", err)
+	}
+	if len(indexes) != len(want) {
+		t.Fatalf("RowIndexes() returned %d stripes, want %d", len(indexes), len(want))
+	}
+	for stripeIndex, row := range want {
+		secret := findColumnRowIndex(t, indexes[stripeIndex:stripeIndex+1], 1)
+		if len(secret.Entries) != 1 || secret.Entries[0].Statistics.String == nil || secret.Entries[0].Statistics.String.Minimum != row["secret"] {
+			t.Fatalf("stripe %d encrypted row-index statistics = %+v, want %q", stripeIndex, secret.Entries, row["secret"])
+		}
+	}
+}
+
+func writeMergedEncryptionSourceFile(t *testing.T, masterKey []byte, values []string) []byte {
+	t.Helper()
+	schema := []Type{
+		{Kind: TypeKindStruct, Subtypes: []uint32{1}, FieldNames: []string{"secret"}},
+		{Kind: TypeKindString},
+	}
+	var output bytes.Buffer
+	writer, err := NewWriter(&output, schema, WriterOptions{
+		MaxRowsPerStripe: 1,
+		EncryptColumns:   []EncryptionRule{{Column: "secret", KeyName: "merged", KeyVersion: 1, Algorithm: EncryptionAESCTR128}},
+		KeyProvider:      KeyProviderFunc(func(string, uint32) ([]byte, error) { return masterKey, nil }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range values {
+		if err := writer.WriteRow(Row{"secret": value}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return append([]byte(nil), output.Bytes()...)
+}
+
+func mergeEncryptedStripeTestFiles(t *testing.T, firstData, secondData []byte) []byte {
+	t.Helper()
+	type sourceFile struct {
+		data   []byte
+		reader *Reader
+	}
+	sources := make([]sourceFile, 2)
+	for i, data := range [][]byte{firstData, secondData} {
+		reader, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reader.postScript.compression != CompressionNone || len(reader.footer.stripes) != 2 || reader.footer.encryption == nil {
+			t.Fatal("merged encryption test sources must have two uncompressed encrypted stripes")
+		}
+		sources[i] = sourceFile{data: data, reader: reader}
+	}
+	first := sources[0].reader
+	second := sources[1].reader
+	if !reflect.DeepEqual(first.footer.types, second.footer.types) || !reflect.DeepEqual(first.footer.encryption.keys, second.footer.encryption.keys) {
+		t.Fatal("merged encryption test sources must have matching schemas and keys")
+	}
+
+	file := append([]byte(nil), fileMagic...)
+	var stripes []StripeInfo
+	var stripeEncryption []stripeEncryptionInfo
+	var totalRows uint64
+	for _, source := range sources {
+		for stripeIndex, stripe := range source.reader.footer.stripes {
+			stripeLength := stripe.IndexLength + stripe.DataLength + stripe.FooterLength
+			stripeEnd := stripe.Offset + stripeLength
+			if stripeEnd < stripe.Offset || stripeEnd > uint64(len(source.data)) {
+				t.Fatal("source stripe exceeds its ORC file")
+			}
+			stripe.Offset = uint64(len(file))
+			file = append(file, source.data[source.reader.footer.stripes[stripeIndex].Offset:stripeEnd]...)
+			stripes = append(stripes, stripe)
+			metadata := source.reader.footer.stripeEncryption[stripeIndex]
+			metadata.localKeys = cloneByteSlices(metadata.localKeys)
+			stripeEncryption = append(stripeEncryption, metadata)
+			totalRows += stripe.NumberOfRows
+		}
+	}
+
+	encryption := *first.footer.encryption
+	encryption.variants = append([]fileEncryptionVariant(nil), encryption.variants...)
+	encryption.variants[0].fileStatistics = nil
+	encryption.variants[0].stripeStatistics = nil
+	contentLength := uint64(len(file))
+	footer := encodeMergedEncryptionTestFooter(first, stripes, stripeEncryption, &encryption, contentLength, totalRows)
+	encodedFooter, err := encodeSection(CompressionNone, 0, footer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postScript := encodeVariantTestPostScript(first, uint64(len(encodedFooter)), 0, 0)
+	file = append(file, encodedFooter...)
+	file = append(file, postScript...)
+	file = append(file, byte(len(postScript)))
+	return file
+}
+
+func encodeMergedEncryptionTestFooter(reader *Reader, stripes []StripeInfo, stripeEncryption []stripeEncryptionInfo, encryption *fileEncryption, contentLength, totalRows uint64) []byte {
+	footer := appendProtoVarintField(nil, 1, uint64(len(fileMagic)))
+	footer = appendProtoVarintField(footer, 2, contentLength)
+	for i, stripe := range stripes {
+		stripeInfo := appendProtoVarintField(nil, 1, stripe.Offset)
+		stripeInfo = appendProtoVarintField(stripeInfo, 2, stripe.IndexLength)
+		stripeInfo = appendProtoVarintField(stripeInfo, 3, stripe.DataLength)
+		stripeInfo = appendProtoVarintField(stripeInfo, 4, stripe.FooterLength)
+		stripeInfo = appendProtoVarintField(stripeInfo, 5, stripe.NumberOfRows)
+		if stripeEncryption[i].hasStripeID {
+			stripeInfo = appendProtoVarintField(stripeInfo, 6, stripeEncryption[i].stripeID)
+		}
+		for _, key := range stripeEncryption[i].localKeys {
+			stripeInfo = appendProtoBytesField(stripeInfo, 7, key)
+		}
+		footer = appendProtoBytesField(footer, 3, stripeInfo)
+	}
+	for _, typ := range reader.footer.types {
+		footer = appendProtoBytesField(footer, 4, encodeType(typ))
+	}
+	footer = appendProtoVarintField(footer, 6, totalRows)
+	footer = appendProtoVarintField(footer, 8, reader.footer.rowIndexStride)
+	if reader.footer.hasWriterID {
+		footer = appendProtoVarintField(footer, 9, uint64(reader.footer.writerID))
+	}
+	footer = appendProtoBytesField(footer, 10, encodeFileEncryption(*encryption))
+	if reader.footer.calendar != CalendarKindUnknown {
+		footer = appendProtoVarintField(footer, 11, uint64(reader.footer.calendar))
+	}
+	if reader.footer.hasSoftwareVersion {
+		footer = appendProtoBytesField(footer, 12, []byte(reader.footer.softwareVersion))
+	}
+	return footer
+}
+
 func combineEncryptionVariants(t *testing.T, primaryData, secondaryData []byte) []byte {
 	t.Helper()
 	primary, err := NewReader(bytes.NewReader(primaryData), int64(len(primaryData)))

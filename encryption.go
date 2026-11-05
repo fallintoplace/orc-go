@@ -799,21 +799,11 @@ func validateFileEncryption(encryption *fileEncryption, types []Type, stripes []
 	}
 	var previousEncryptStripeID uint64
 	for i, stripe := range stripeEncryption {
-		if stripe.hasStripeID {
-			if stripe.stripeID == 0 || stripe.stripeID > 0xffffff {
-				return fmt.Errorf("stripe %d has invalid encryption stripe id %d", i, stripe.stripeID)
-			}
-			if i > 0 && stripe.stripeID != previousEncryptStripeID+1 {
-				return fmt.Errorf("stripe %d has encryption stripe id %d, want %d", i, stripe.stripeID, previousEncryptStripeID+1)
-			}
-			previousEncryptStripeID = stripe.stripeID
-		} else if i == 0 && len(encryption.variants) > 0 {
-			return fmt.Errorf("first ORC stripe is missing its encryption stripe id")
-		} else if previousEncryptStripeID < 0xffffff {
-			previousEncryptStripeID++
-		} else {
-			return fmt.Errorf("stripe %d encryption stripe id exceeds the ORC limit", i)
+		stripeID, err := checkedEncryptionStripeID(i, stripe, previousEncryptStripeID)
+		if err != nil {
+			return fmt.Errorf("stripe %d: %w", i, err)
 		}
+		previousEncryptStripeID = stripeID
 		keys := stripe.localKeys
 		if len(keys) > 0 && len(keys) != len(encryption.variants) {
 			return fmt.Errorf("stripe %d has %d encrypted local keys for %d variants", i, len(keys), len(encryption.variants))
