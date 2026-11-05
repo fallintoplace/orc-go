@@ -1,8 +1,8 @@
 # orc-go
 
-Read and write [Apache ORC](https://orc.apache.org/) files in Go.
+Read and write [Apache ORC](https://orc.apache.org/) files in Go. Rows are Go maps, and nested ORC types use Go values. The package also supports compression, streaming reads, indexes, bloom filters, and column encryption.
 
-The API works with Go rows and supports nested columns, streaming reads, compression, indexes, bloom filters, and column encryption. This project is still in progress, so the API may change. It requires Go 1.22 or newer.
+The project is still in progress, so its API may change. It requires Go 1.22 or newer.
 
 ## Install
 
@@ -12,9 +12,9 @@ go get github.com/fallintoplace/orc-go
 
 ## Quick start
 
-An ORC file has a schema. The first type in the schema is the root `STRUCT`; its `Subtypes` refer to the other types by their positions in the slice.
+Each file has a schema. The first type must be a root `STRUCT`; its `Subtypes` list points to the types for each field.
 
-This example writes one row, opens the file, and reads the row back:
+This example writes a row to `people.orc`, then reads it back:
 
 ```go
 package main
@@ -32,12 +32,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer file.Close()
 
 	schema := []orc.Type{
 		{Kind: orc.TypeKindStruct, Subtypes: []uint32{1, 2}, FieldNames: []string{"id", "name"}},
 		{Kind: orc.TypeKindLong},
 		{Kind: orc.TypeKindString},
 	}
+
 	writer, err := orc.NewWriter(file, schema, orc.WriterOptions{})
 	if err != nil {
 		log.Fatal(err)
@@ -46,9 +48,6 @@ func main() {
 		log.Fatal(err)
 	}
 	if err := writer.Close(); err != nil {
-		log.Fatal(err)
-	}
-	if err := file.Close(); err != nil {
 		log.Fatal(err)
 	}
 
@@ -66,19 +65,27 @@ func main() {
 }
 ```
 
-`Writer.Close` writes the final stripe and file footer. It does not close the destination, so close the file separately. Missing fields and `nil` values are written as ORC nulls.
+`WriteRow` accepts field names from the schema. Missing fields and `nil` values are stored as ORC nulls. Call `writer.Close()` to finish the file and write its footer; it does not close the destination file.
 
 ## Read rows
 
-For large files, use `ReadRows` to process one stripe at a time. Use `ReadAll` when you want all rows in memory.
+`ReadAll` puts every row in memory. For larger files, `ReadRows` processes rows a stripe at a time:
 
-To read only some top-level fields, use `ReadRowsWithColumns` or `ReadAllWithColumns`. Selecting a field that contains nested data returns the whole value for that field.
+```go
+err := reader.ReadRows(func(row orc.Row) error {
+	fmt.Println(row["name"])
+	return nil
+})
+```
 
-To read part of a file, use `ReadRowsRange` or `ReadAllRange`. Row numbers start at zero, and the range includes `start` but not `end` (`[start, end)`). Stripes outside the range are skipped.
+Other read options:
+
+- Use `ReadRowsWithColumns` or `ReadAllWithColumns` to select top-level fields. A selected nested field is returned in full.
+- Use `ReadRowsRange` or `ReadAllRange` to read rows from a zero-based range `[start, end)`. The start is included; the end is not. Stripes outside the range are skipped.
 
 ## Go values
 
-Rows are `orc.Row` values, which are maps from field names to Go values. Use these Go types for ORC columns:
+Rows are `orc.Row` maps from field names to values. Use these Go types for ORC columns:
 
 | ORC type | Go value |
 | --- | --- |
@@ -94,7 +101,7 @@ Rows are `orc.Row` values, which are maps from field names to Go values. Use the
 | MAP | `[]orc.MapEntry` |
 | UNION | `orc.UnionValue` |
 
-For example, a row with nested values can look like this:
+Nested values use the same Go types:
 
 ```go
 row := orc.Row{
@@ -106,45 +113,43 @@ row := orc.Row{
 
 `[]orc.MapEntry` supports map keys of any ORC type.
 
-For `DECIMAL`, pass `orc.Decimal` values. Set `Precision` and `Scale` for fixed-scale columns; the legacy zero/zero schema keeps each value's scale and has no precision limit. Fixed-scale values are rescaled without rounding.
+For `DECIMAL`, pass `orc.Decimal` values. Set `Precision` and `Scale` for fixed-scale columns. A legacy schema with both set to zero keeps each value's scale and has no precision limit. Fixed-scale values are rescaled without rounding.
 
-DATE uses the calendar date from the input `time.Time` and returns dates in UTC. TIMESTAMP keeps the calendar and clock fields using the stripe's writer timezone. TIMESTAMP_INSTANT keeps the instant. CHAR values are truncated and padded when written, then trailing spaces are removed when read. VARCHAR values are truncated when written. CHAR and VARCHAR lengths count Unicode code points.
+Date and time behavior:
 
-The writer marks files as using Go's proleptic Gregorian calendar. When reading files written with the older Julian/Gregorian calendar, the reader keeps the date and clock fields when Go can represent them. A Julian-only leap day, such as February 29, 1500, is normalized to the next valid Gregorian date. If a file does not name a calendar, the reader assumes Julian/Gregorian. Set `ReaderOptions.DefaultCalendar` to choose a different fallback.
+- `DATE` uses the date from the input `time.Time` and returns dates in UTC.
+- `TIMESTAMP` keeps calendar and clock fields using the stripe's writer timezone. `TIMESTAMP_INSTANT` keeps the instant.
+- `CHAR` values are truncated and padded when written, then trailing spaces are removed when read. `VARCHAR` values are truncated when written. Both lengths count Unicode code points.
 
-## Options
+The writer uses Go's proleptic Gregorian calendar. When reading older files that use the Julian/Gregorian calendar, the reader keeps date and clock fields when Go can represent them. A Julian-only leap day, such as February 29, 1500, is normalized to the next valid Gregorian date. If a file does not name its calendar, the reader assumes Julian/Gregorian; set `ReaderOptions.DefaultCalendar` to choose another fallback.
 
-The reader and writer support NONE, ZLIB, SNAPPY, LZO, LZ4, ZSTD, and BROTLI compression. The writer uses no compression by default.
+## Compression and writer options
+
+The reader and writer support NONE, ZLIB, SNAPPY, LZO, LZ4, ZSTD, and BROTLI compression. The writer uses NONE by default.
 
 The reader handles RLEv1 and RLEv2 for integer, date, timestamp, and decimal streams. The writer uses RLEv1 by default; set `UseRLEv2` to write RLEv2. The reader handles direct and dictionary encodings for STRING, CHAR, and VARCHAR. The writer uses direct encoding by default; set `UseDictionary` to use a per-stripe dictionary. BINARY columns use direct encoding.
 
-Useful `WriterOptions` fields:
+Common `WriterOptions`:
 
-| Option | What it does |
-| --- | --- |
-| `Compression` | Chooses the compression codec. Defaults to NONE. |
-| `CompressionBlockSize` | Sets the maximum uncompressed chunk size. Zero uses the ORC default. |
-| `MaxRowsPerStripe` | Starts a new stripe after this many rows. Zero writes one stripe on `Close`. |
-| `RowIndexStride` | Sets the maximum rows per row-index entry. Defaults to 10,000; values below 1,000 are not supported. |
-| `DisableRowIndexes` | Omits row indexes. Bloom filters need row indexes. |
-| `UseRLEv2` | Writes RLEv2 for supported integer, date, timestamp, decimal, and length streams. |
-| `UseDictionary` | Writes STRING, CHAR, and VARCHAR values with a dictionary. |
-| `BloomFilterColumns` | Adds bloom filters to selected top-level integer, floating-point, string, or binary fields. |
-| `EncryptColumns` | Encrypts selected top-level fields and their nested fields. |
-
-Bloom filters can quickly rule out a value. A possible match still needs to be checked against the data because bloom filters can return false positives. The default false-positive probability is `0.01`; set `BloomFilterFPP` to change it. `LegacyBloomFilterEncoding` writes the older fixed64 bitset format.
+- `MaxRowsPerStripe` starts a stripe after the chosen number of rows. Zero writes one stripe when `Close` is called.
+- `RowIndexStride` sets the maximum rows per row-index entry. The default is 10,000; values below 1,000 are not supported.
+- `DisableRowIndexes` omits row indexes. Bloom filters require row indexes.
+- `BloomFilterColumns` adds filters to selected top-level integer, floating-point, string, or binary fields. A filter can return false positives, so check possible matches against the data. The default false-positive probability is `0.01`; use `BloomFilterFPP` to change it.
+- `LegacyBloomFilterEncoding` writes the older fixed64 bitset format.
+- `CompressionBlockSize` sets the maximum uncompressed chunk size. Zero uses the ORC default.
+- `EncryptColumns` encrypts selected top-level fields and their nested fields; see [Encrypt columns](#encrypt-columns).
 
 ## Inspect a file
 
-`Reader` exposes the schema, including type attributes, stripe locations, row and stripe counts, file and stripe statistics, row indexes, bloom-filter indexes, and user metadata. `StringStatistics` provides exact minimum and maximum values when available, plus lower and upper bounds for long values. Use `AddUserMetadata(name, value)` on the writer to add application-defined file metadata.
+`Reader` exposes the schema and type attributes, stripe locations, row and stripe counts, file and stripe statistics, row indexes, bloom-filter indexes, and user metadata. `StringStatistics` includes exact minimum and maximum values when available, plus lower and upper bounds for long values. Use `AddUserMetadata(name, value)` to add application-defined metadata when writing.
 
 ## Encrypt columns
 
-Set `EncryptColumns` to encrypt a top-level field and its nested fields. With Hadoop key wrapping, pass the same `KeyProvider` to the writer and reader. The master key must be 16 bytes for AES-CTR 128 or 32 bytes for AES-CTR 256.
+Set `EncryptColumns` to encrypt a top-level field and all its nested fields. The reader and writer must use the same key provider. With Hadoop key wrapping, the master key must be 16 bytes for AES-CTR 128 or 32 bytes for AES-CTR 256.
 
-To use AWS, GCP, or Azure KMS, implement `EncryptionKeyProvider` and set it on both options. The package does not include cloud SDKs. Its `Kind` must match the ORC key-provider format used to wrap local keys. ORC files store wrapped local keys, not the master key.
+Use `KeyProvider` for Hadoop key wrapping. For AWS, GCP, Azure, or another KMS, implement `EncryptionKeyProvider`; this package does not include cloud SDKs. Its provider format must match the one recorded in the ORC file. ORC files store wrapped local keys, not the master key.
 
-Inside a function that returns an error, with `file` open for writing and `schema` containing a top-level field called `email`, configure the key provider and writer like this. The key below is for demonstration only; load production keys from secure storage.
+With `file` open and a `schema` that contains a top-level `email` field, configure a Hadoop key provider like this. This key is for demonstration only; load production keys from secure storage.
 
 ```go
 masterKey := []byte("0123456789abcdef") // 16 bytes for AES-CTR 128
@@ -162,19 +167,15 @@ writer, err := orc.NewWriter(file, schema, orc.WriterOptions{
 	}},
 	KeyProvider: keys,
 })
-if err != nil {
-	return err
-}
-// Write rows, then call writer.Close().
-
-reader, err := orc.OpenWithOptions(path, orc.ReaderOptions{KeyProvider: keys})
-if err != nil {
-	return err
-}
-defer reader.Close()
 ```
 
-Without a key, the reader returns the file's unencrypted fallback values. Files written by this package use nulls as fallback values, and file and stripe statistics show those values. With a key, `EncryptionStatistics("email")` returns statistics for the encrypted field and its nested fields. The reader also uses encrypted row indexes and bloom filters when available. User metadata is not encrypted.
+Pass the same provider when opening the file:
+
+```go
+reader, err := orc.OpenWithOptions(path, orc.ReaderOptions{KeyProvider: keys})
+```
+
+Without a key, encrypted columns use the unencrypted fallback values. Files written by this package use nulls for that fallback, and file and stripe statistics show those values. With a key, `EncryptionStatistics("email")` returns statistics for the encrypted field and its nested fields. The reader also uses encrypted row indexes and bloom filters when available. User metadata is not encrypted.
 
 AES-CTR does not detect tampering. Verify file integrity separately if you need tamper detection.
 
