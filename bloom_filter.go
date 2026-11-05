@@ -52,7 +52,15 @@ func (f BloomFilter) MightContainInt64(value int64) bool {
 // MightContainFloat64 reports whether a floating-point value may be present
 // in this filter.
 func (f BloomFilter) MightContainFloat64(value float64) bool {
-	return f.mightContain(thomasWangBloomHash(math.Float64bits(value)))
+	return f.mightContain(thomasWangBloomHash(bloomFloat64Bits(value)))
+}
+
+// Match Java Double.doubleToLongBits, which canonicalizes all NaN payloads.
+func bloomFloat64Bits(value float64) uint64 {
+	if math.IsNaN(value) {
+		return 0x7ff8000000000000
+	}
+	return math.Float64bits(value)
 }
 
 // ColumnBloomFilterIndex contains row-group bloom filters for one ORC type id.
@@ -290,9 +298,9 @@ func buildWriterBloomFilter(values []any, kind TypeKind, fpp float64, expectedEn
 		case TypeKindByte, TypeKindShort, TypeKindInt, TypeKindLong:
 			hash = thomasWangBloomHash(uint64(writerIntegerValue(kind, value)))
 		case TypeKindFloat:
-			hash = thomasWangBloomHash(math.Float64bits(float64(value.(float32))))
+			hash = thomasWangBloomHash(bloomFloat64Bits(float64(value.(float32))))
 		case TypeKindDouble:
-			hash = thomasWangBloomHash(math.Float64bits(value.(float64)))
+			hash = thomasWangBloomHash(bloomFloat64Bits(value.(float64)))
 		case TypeKindString, TypeKindChar, TypeKindVarchar:
 			hash = murmur3BloomHash64([]byte(value.(string)))
 		case TypeKindBinary, TypeKindGeometry, TypeKindGeography:
