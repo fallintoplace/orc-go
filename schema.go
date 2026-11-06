@@ -94,8 +94,8 @@ type StripeInfo struct {
 
 func cloneTypes(types []Type) []Type {
 	cloned := make([]Type, len(types))
+	copy(cloned, types)
 	for i, typ := range types {
-		cloned[i] = typ
 		cloned[i].Subtypes = append([]uint32(nil), typ.Subtypes...)
 		cloned[i].FieldNames = append([]string(nil), typ.FieldNames...)
 		cloned[i].Attributes = append([]TypeAttribute(nil), typ.Attributes...)
