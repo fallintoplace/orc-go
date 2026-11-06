@@ -6,9 +6,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/fallintoplace/orc-go/internal/rlev1"
-	"github.com/fallintoplace/orc-go/internal/rlev2"
 )
 
 const orcTimestampEpoch int64 = 1420070400 // 2015-01-01 00:00:00 UTC
@@ -21,13 +18,7 @@ type encodedTimestamp struct {
 func decodeTimestampColumn(present []bool, valueCount int, column rowColumn, streams map[streamKey][]byte, encoding columnEncoding, writerTimezone string, calendar CalendarKind) ([]any, error) {
 	data := streams[streamKey{kind: streamKindData, column: column.id}]
 	secondary := streams[streamKey{kind: streamKindSecondary, column: column.id}]
-	var seconds []int64
-	var err error
-	if encoding.kind == columnEncodingDirectV2 {
-		seconds, err = rlev2.DecodeSigned(data, valueCount)
-	} else {
-		seconds, err = rlev1.DecodeSigned(data, valueCount)
-	}
+	seconds, err := decodeSignedIntegerStream(data, valueCount, encoding.kind == columnEncodingDirectV2)
 	if err != nil {
 		return nil, fmt.Errorf("decode timestamp DATA stream: %w", err)
 	}

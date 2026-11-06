@@ -168,12 +168,7 @@ func decodeColumn(rowCount uint64, column rowColumn, types []Type, encodings []c
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedType, column.kind)
 	}
 
-	var encodedValues []int64
-	if encoding.kind == columnEncodingDirectV2 {
-		encodedValues, err = rlev2.DecodeSigned(dataStream, valueCount)
-	} else {
-		encodedValues, err = rlev1.DecodeSigned(dataStream, valueCount)
-	}
+	encodedValues, err := decodeSignedIntegerStream(dataStream, valueCount, encoding.kind == columnEncodingDirectV2)
 	if err != nil {
 		return nil, fmt.Errorf("decode DATA stream: %w", err)
 	}
@@ -406,12 +401,7 @@ func decodeDecimalColumn(present []bool, valueCount int, column rowColumn, strea
 	if valueCount > 0 && !ok {
 		return nil, fmt.Errorf("missing SECONDARY stream for %d decimal values", valueCount)
 	}
-	var scales []int64
-	if encoding.kind == columnEncodingDirectV2 {
-		scales, err = rlev2.DecodeSigned(secondary, valueCount)
-	} else {
-		scales, err = rlev1.DecodeSigned(secondary, valueCount)
-	}
+	scales, err := decodeSignedIntegerStream(secondary, valueCount, encoding.kind == columnEncodingDirectV2)
 	if err != nil {
 		return nil, fmt.Errorf("decode decimal SECONDARY stream: %w", err)
 	}
@@ -558,6 +548,13 @@ func decodeVariableLengthColumn(present []bool, valueCount int, column rowColumn
 		valueIndex++
 	}
 	return values, nil
+}
+
+func decodeSignedIntegerStream(data []byte, expected int, version2 bool) ([]int64, error) {
+	if version2 {
+		return rlev2.DecodeSigned(data, expected)
+	}
+	return rlev1.DecodeSigned(data, expected)
 }
 
 func decodeUnsignedIntegerStream(data []byte, expected int, version2 bool) ([]uint64, error) {
