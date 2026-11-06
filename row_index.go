@@ -1,8 +1,8 @@
 package orc
 
 import (
-	"fmt"
 	"cmp"
+	"fmt"
 	"slices"
 
 	"github.com/fallintoplace/orc-go/internal/wire"
