@@ -561,18 +561,13 @@ func decodeColumnPresence(rowCount uint64, column rowColumn, encodings []columnE
 
 func supportsRowEncoding(kind TypeKind, encoding uint32) bool {
 	switch kind {
-	case TypeKindShort, TypeKindInt, TypeKindLong, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal:
+	case TypeKindShort, TypeKindInt, TypeKindLong, TypeKindDate, TypeKindTimestamp, TypeKindTimestampInstant, TypeKindDecimal,
+		TypeKindBinary, TypeKindGeometry, TypeKindGeography, TypeKindList, TypeKindMap:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
 	case TypeKindString, TypeKindChar, TypeKindVarchar:
 		return encoding == columnEncodingDirect || encoding == columnEncodingDictionary || encoding == columnEncodingDirectV2 || encoding == columnEncodingDictionaryV2
-	case TypeKindBinary, TypeKindGeometry, TypeKindGeography:
-		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
-	case TypeKindBoolean, TypeKindByte, TypeKindFloat, TypeKindDouble:
+	case TypeKindBoolean, TypeKindByte, TypeKindFloat, TypeKindDouble, TypeKindStruct, TypeKindUnion:
 		return encoding == columnEncodingDirect
-	case TypeKindStruct, TypeKindUnion:
-		return encoding == columnEncodingDirect
-	case TypeKindList, TypeKindMap:
-		return encoding == columnEncodingDirect || encoding == columnEncodingDirectV2
 	default:
 		return false
 	}
