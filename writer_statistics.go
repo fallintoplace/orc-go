@@ -1,6 +1,7 @@
 package orc
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"math/big"
@@ -416,6 +417,10 @@ func mergeIntegerStatistics(destination **IntegerStatistics, source *IntegerStat
 }
 
 func mergeIntBounds(destination *int64, hasDestination *bool, source int64, hasSource bool, minimum bool) {
+	mergeOrderedBounds(destination, hasDestination, source, hasSource, minimum)
+}
+
+func mergeOrderedBounds[T cmp.Ordered](destination *T, hasDestination *bool, source T, hasSource bool, minimum bool) {
 	if !*hasDestination || !hasSource {
 		*hasDestination = false
 		return
@@ -474,13 +479,7 @@ func mergeDoubleStatistics(destination **DoubleStatistics, source *DoubleStatist
 }
 
 func mergeFloatBounds(destination *float64, hasDestination *bool, source float64, hasSource bool, minimum bool) {
-	if !*hasDestination || !hasSource {
-		*hasDestination = false
-		return
-	}
-	if (minimum && source < *destination) || (!minimum && source > *destination) {
-		*destination = source
-	}
+	mergeOrderedBounds(destination, hasDestination, source, hasSource, minimum)
 }
 
 func mergeStringStatistics(destination **StringStatistics, source *StringStatistics) {
@@ -720,13 +719,7 @@ func mergeCollectionStatistics(destination **CollectionStatistics, source *Colle
 }
 
 func mergeUintBounds(destination *uint64, hasDestination *bool, source uint64, hasSource bool, minimum bool) {
-	if !*hasDestination || !hasSource {
-		*hasDestination = false
-		return
-	}
-	if (minimum && source < *destination) || (!minimum && source > *destination) {
-		*destination = source
-	}
+	mergeOrderedBounds(destination, hasDestination, source, hasSource, minimum)
 }
 
 func mergeTimestampStatistics(destination **TimestampStatistics, source *TimestampStatistics) {
