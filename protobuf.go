@@ -42,15 +42,25 @@ func appendUint32Values(dst []uint32, field wire.Field) ([]uint32, error) {
 	if field.Type != 2 {
 		return nil, fmt.Errorf("protobuf field %d has wire type %d, want packed varints", field.Number, field.Type)
 	}
-	values, err := wire.Varints(field.Bytes)
+	values := dst
+	var overflowErr error
+	err := wire.WalkVarints(field.Bytes, func(value uint64) error {
+		if value > uint64(^uint32(0)) {
+			if overflowErr == nil {
+				overflowErr = fmt.Errorf("protobuf field %d value %d overflows uint32", field.Number, value)
+			}
+			return nil
+		}
+		if overflowErr == nil {
+			values = append(values, uint32(value))
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("decode protobuf field %d: %w", field.Number, err)
 	}
-	for _, value := range values {
-		if value > uint64(^uint32(0)) {
-			return nil, fmt.Errorf("protobuf field %d value %d overflows uint32", field.Number, value)
-		}
-		dst = append(dst, uint32(value))
+	if overflowErr != nil {
+		return nil, overflowErr
 	}
-	return dst, nil
+	return values, nil
 }
