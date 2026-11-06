@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
-	"sort"
+	"cmp"
+	"slices"
 
 	"github.com/fallintoplace/orc-go/internal/wire"
 )
@@ -154,7 +155,9 @@ func (r *Reader) BloomFilterIndexes() ([]StripeBloomFilterIndexes, error) {
 }
 
 func sortColumnBloomFilterIndexes(columns []ColumnBloomFilterIndex) {
-	sort.Slice(columns, func(i, j int) bool { return columns[i].ColumnID < columns[j].ColumnID })
+	slices.SortFunc(columns, func(a, b ColumnBloomFilterIndex) int {
+		return cmp.Compare(a.ColumnID, b.ColumnID)
+	})
 }
 
 func parseBloomFilterIndex(data []byte) ([]BloomFilter, error) {
