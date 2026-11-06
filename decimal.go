@@ -148,24 +148,29 @@ func decimalCoefficientAtScale(coefficient *big.Int, valueScale, targetScale int
 	return result, nil
 }
 
-func compareDecimalNumbers(left, right string) (int, error) {
+func alignDecimalOperands(left, right string) (*big.Int, *big.Int, int64, error) {
 	leftCoefficient, leftScale, err := parseDecimal(left)
 	if err != nil {
-		return 0, err
+		return nil, nil, 0, err
 	}
 	rightCoefficient, rightScale, err := parseDecimal(right)
 	if err != nil {
-		return 0, err
+		return nil, nil, 0, err
 	}
-	commonScale := leftScale
-	if rightScale > commonScale {
-		commonScale = rightScale
-	}
+	commonScale := max(leftScale, rightScale)
 	leftCoefficient, err = decimalCoefficientAtScale(leftCoefficient, leftScale, commonScale)
 	if err != nil {
-		return 0, err
+		return nil, nil, 0, err
 	}
 	rightCoefficient, err = decimalCoefficientAtScale(rightCoefficient, rightScale, commonScale)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return leftCoefficient, rightCoefficient, commonScale, nil
+}
+
+func compareDecimalNumbers(left, right string) (int, error) {
+	leftCoefficient, rightCoefficient, _, err := alignDecimalOperands(left, right)
 	if err != nil {
 		return 0, err
 	}
@@ -173,23 +178,7 @@ func compareDecimalNumbers(left, right string) (int, error) {
 }
 
 func addDecimalNumbers(left, right string) (string, error) {
-	leftCoefficient, leftScale, err := parseDecimal(left)
-	if err != nil {
-		return "", err
-	}
-	rightCoefficient, rightScale, err := parseDecimal(right)
-	if err != nil {
-		return "", err
-	}
-	commonScale := leftScale
-	if rightScale > commonScale {
-		commonScale = rightScale
-	}
-	leftCoefficient, err = decimalCoefficientAtScale(leftCoefficient, leftScale, commonScale)
-	if err != nil {
-		return "", err
-	}
-	rightCoefficient, err = decimalCoefficientAtScale(rightCoefficient, rightScale, commonScale)
+	leftCoefficient, rightCoefficient, commonScale, err := alignDecimalOperands(left, right)
 	if err != nil {
 		return "", err
 	}
