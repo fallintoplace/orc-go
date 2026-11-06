@@ -221,15 +221,18 @@ func unsignedDelta(first, second uint64) (int8, bool) {
 }
 
 func writeSignedRun(output *bytes.Buffer, first int64, delta int8, count int) {
-	output.WriteByte(byte(count - minRun))
-	output.WriteByte(byte(delta))
+	writeRunHeader(output, delta, count)
 	writeVarint(output, zigzagEncode(first))
 }
 
 func writeUnsignedRun(output *bytes.Buffer, first uint64, delta int8, count int) {
+	writeRunHeader(output, delta, count)
+	writeVarint(output, first)
+}
+
+func writeRunHeader(output *bytes.Buffer, delta int8, count int) {
 	output.WriteByte(byte(count - minRun))
 	output.WriteByte(byte(delta))
-	writeVarint(output, first)
 }
 
 func writeSignedLiterals(output *bytes.Buffer, values []int64) {
