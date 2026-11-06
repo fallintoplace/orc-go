@@ -1392,7 +1392,7 @@ func encodeByteRLE(values []byte) []byte {
 	for position := 0; position < len(values); {
 		runLength := byteRunLength(values[position:])
 		if runLength >= 3 {
-			count := minWriterInt(runLength, 130)
+			count := min(runLength, 130)
 			output.WriteByte(byte(count - 3))
 			output.WriteByte(values[position])
 			position += count
@@ -1595,9 +1595,3 @@ func writeAll(destination io.Writer, data []byte) error {
 	return nil
 }
 
-func minWriterInt(first, second int) int {
-	if first < second {
-		return first
-	}
-	return second
-}
