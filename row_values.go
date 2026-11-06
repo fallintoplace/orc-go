@@ -155,3 +155,25 @@ func (o rowRangeOutput) yieldBatches(stripeIndex int, columns []rowColumn, value
 	}
 	return nil
 }
+
+func fillBatchColumn(output, values []any, rootPresent []bool, batchStart, batchEnd, valueStart, valueEnd int) bool {
+	if valueEnd-valueStart == batchEnd-batchStart {
+		if valueEnd > len(values) {
+			return false
+		}
+		copy(output, values[valueStart:valueEnd])
+		return true
+	}
+	valueIndex := valueStart
+	for rowIndex := batchStart; rowIndex < batchEnd; rowIndex++ {
+		if !rootPresent[rowIndex] {
+			continue
+		}
+		if valueIndex >= len(values) {
+			return false
+		}
+		output[rowIndex-batchStart] = values[valueIndex]
+		valueIndex++
+	}
+	return true
+}
