@@ -2,6 +2,7 @@ package orc
 
 import (
 	"fmt"
+	"slices"
 	"math"
 	"sort"
 
@@ -94,7 +95,7 @@ func (w *Writer) encodeDictionaryColumnGroups(column writerColumn, ranges []writ
 	if uint64(len(unique)) > math.MaxUint32 {
 		return nil, columnEncoding{}, fmt.Errorf("STRING dictionary has more than %d entries", uint64(math.MaxUint32))
 	}
-	sort.Strings(unique)
+	slices.Sort(unique)
 	indices := make(map[string]uint64, len(unique))
 	lengths := make([]uint64, len(unique))
 	var dictionaryData []byte
@@ -589,6 +590,6 @@ func sortedWriterStreamKinds(kinds map[uint32]bool) []uint32 {
 	for kind := range kinds {
 		result = append(result, kind)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	slices.Sort(result)
 	return result
 }
