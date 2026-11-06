@@ -10,22 +10,33 @@ names those children in the same order.
 
 Most ORC files have a `STRUCT` root. Use `orc.Row` to read or write its fields
 by name. Missing fields and `nil` values are stored as ORC nulls. For a scalar,
-list, or map root, use the value-based methods instead.
+list, or map root, write values with `WriteValue` and read them with the value
+methods described below.
 
 `Writer.Close()` finishes the ORC file but does not close the destination. Close
 the file after closing the writer.
 
 ## Reading rows
 
-- `ReadRows` streams rows and keeps one stripe in memory.
-- `ReadAll` loads every row into memory.
-- `ReadRowsRange` and `ReadAllRange` read a row range. The start is included
-  and the end is excluded. For example, `[10, 20)` reads rows 10 through 19.
-- `ReadRowsWithColumns` and `ReadAllWithColumns` read selected top-level
-  fields. A selected nested field is returned in full.
-- Range reads also have `WithColumns` versions to select both rows and fields.
+For a `STRUCT` root:
 
-For a non-`STRUCT` root, use `ReadValues` or `ReadAllValues`. A `STRUCT` value
+- `ReadRows` calls your callback once per row and keeps one stripe of decoded
+  values in memory. `ReadAll` loads every row into memory.
+- `ReadRowsRange` and `ReadAllRange` choose rows. The range is zero-based,
+  includes its start, and excludes its end. For example, `[10, 20)` reads rows
+  10 through 19.
+- Add `WithColumns` to select top-level fields. A selected nested field is
+  returned in full.
+- `ReadRowsValuesWithColumns` and `ReadRowsRangeValuesWithColumns` avoid a map
+  allocation per row. Their callback receives `RowValues`; use `Get` for a
+  field name or `Field` for fields in request order.
+- `ReadRowBatches` and `ReadRowBatchesWithColumns` call your callback with up
+  to 1,024 rows. `RowBatch.Column` returns a row-aligned field slice, and
+  `Get` reads one value. Use `IsNull` to distinguish a null root row from a
+  null field.
+
+For any root type, `ReadValues` and `ReadValuesRange` stream values, while
+`ReadAllValues` and `ReadAllValuesRange` load them into memory. A `STRUCT` value
 is returned as `orc.Row`; other values use the types below.
 
 ## Go value types

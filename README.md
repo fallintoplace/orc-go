@@ -2,9 +2,9 @@
 
 Read and write [Apache ORC](https://orc.apache.org/) files in Go.
 
-Use `orc.Row` for rows with named fields. `ReadRows` streams a file; `ReadAll`
-loads it into memory. The writer supports nested data, compression, indexes,
-metadata, and encrypted columns.
+Use `orc.Row` for named fields. `ReadRows` delivers rows to a callback one at
+a time; `ReadAll` loads every row into memory. The writer supports nested data,
+compression, indexes, metadata, and encrypted columns.
 
 Built for Go 1.22 or newer.
 
@@ -72,24 +72,7 @@ func main() {
 }
 ```
 
-## Read data
-
-Use `ReadRows` to process a large file one row at a time. Use `ReadAll` when
-the full result fits in memory. Range methods read selected rows; column
-methods read selected fields. For files whose root is a scalar, list, or map,
-use `ReadValues` or `ReadAllValues` to read, and `WriteValue` to write.
-
-For reads that select fields, `ReadRowsValuesWithColumns` and
-`ReadRowsRangeValuesWithColumns` avoid a map allocation for each row. Use
-`RowValues.Get` to look up a field by name, or `RowValues.Field` to read fields
-in the order requested.
-
-For higher-throughput scans, `ReadRowBatches` and
-`ReadRowBatchesWithColumns` return up to 1,024 rows as named columns without
-building a map for each row. Use `RowBatch.Column` to process a whole field at
-once, or `RowBatch.Get` to read a single value.
-
-## What's supported
+## Features
 
 - Standard ORC types, including nested structs, lists, maps, and unions.
 - NONE, ZLIB, SNAPPY, LZO, LZ4, ZSTD, and BROTLI compression.
@@ -97,7 +80,7 @@ once, or `RowBatch.Get` to read a single value.
 - Row indexes, bloom filters, file and stripe statistics, and user metadata.
 - AES-CTR column encryption with Hadoop key wrapping or a custom key provider.
 
-See the [usage guide](docs/guide.md) for Go value types, read and write
+See the [usage guide](docs/guide.md) for read modes, Go value types, writer
 options, and encryption details.
 
 ## Check interoperability
