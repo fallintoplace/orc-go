@@ -1,12 +1,12 @@
 package orc
 
 import (
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
 	"math/bits"
-	"cmp"
 	"slices"
 
 	"github.com/fallintoplace/orc-go/internal/wire"
