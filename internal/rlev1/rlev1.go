@@ -34,7 +34,7 @@ func EncodeSigned(values []int64) []byte {
 	for position := 0; position < len(values); {
 		delta, runLength := signedRunLength(values[position:])
 		if runLength >= minRun {
-			count := minInt(runLength, maxRun)
+			count := min(runLength, maxRun)
 			writeSignedRun(&output, values[position], delta, count)
 			position += count
 			continue
@@ -60,7 +60,7 @@ func EncodeUnsigned(values []uint64) []byte {
 	for position := 0; position < len(values); {
 		delta, runLength := unsignedRunLength(values[position:])
 		if runLength >= minRun {
-			count := minInt(runLength, maxRun)
+			count := min(runLength, maxRun)
 			writeUnsignedRun(&output, values[position], delta, count)
 			position += count
 			continue
@@ -237,7 +237,7 @@ func writeRunHeader(output *bytes.Buffer, delta int8, count int) {
 
 func writeSignedLiterals(output *bytes.Buffer, values []int64) {
 	for start := 0; start < len(values); {
-		count := minInt(len(values)-start, maxLiteral)
+		count := min(len(values)-start, maxLiteral)
 		output.WriteByte(byte(-count))
 		for _, value := range values[start : start+count] {
 			writeVarint(output, zigzagEncode(value))
@@ -248,7 +248,7 @@ func writeSignedLiterals(output *bytes.Buffer, values []int64) {
 
 func writeUnsignedLiterals(output *bytes.Buffer, values []uint64) {
 	for start := 0; start < len(values); {
-		count := minInt(len(values)-start, maxLiteral)
+		count := min(len(values)-start, maxLiteral)
 		output.WriteByte(byte(-count))
 		for _, value := range values[start : start+count] {
 			writeVarint(output, value)
@@ -315,11 +315,4 @@ func addUnsignedDelta(value uint64, delta int8) (uint64, error) {
 
 func tooManyValues(run, remaining int) error {
 	return fmt.Errorf("RLEv1 run has %d values, only %d remain", run, remaining)
-}
-
-func minInt(first, second int) int {
-	if first < second {
-		return first
-	}
-	return second
 }
