@@ -5,18 +5,18 @@ import "fmt"
 // RowValues contains one row's selected fields without constructing a Row map.
 // Its values remain valid after the callback returns.
 type RowValues struct {
-	schema *rowValuesSchema
+	schema *rowResultSchema
 	values []any
 	isNull bool
 }
 
-type rowValuesSchema struct {
+type rowResultSchema struct {
 	names   []string
 	indexes map[string]int
 }
 
-func newRowValuesSchema(columns []rowColumn) *rowValuesSchema {
-	schema := &rowValuesSchema{
+func newRowResultSchema(columns []rowColumn) *rowResultSchema {
+	schema := &rowResultSchema{
 		names:   make([]string, len(columns)),
 		indexes: make(map[string]int, len(columns)),
 	}
@@ -25,6 +25,21 @@ func newRowValuesSchema(columns []rowColumn) *rowValuesSchema {
 		schema.indexes[column.name] = index
 	}
 	return schema
+}
+
+func (s *rowResultSchema) indexOf(name string) (int, bool) {
+	if s == nil {
+		return 0, false
+	}
+	index, ok := s.indexes[name]
+	return index, ok
+}
+
+func (s *rowResultSchema) nameAt(index int) (string, bool) {
+	if s == nil || index < 0 || index >= len(s.names) {
+		return "", false
+	}
+	return s.names[index], true
 }
 
 // Len returns the number of selected fields in the row.
@@ -44,10 +59,7 @@ func (r RowValues) IsNull() bool {
 // field was not selected. It is true when the selected value is nil, including
 // when the row has a null root STRUCT.
 func (r RowValues) Get(name string) (any, bool) {
-	if r.schema == nil {
-		return nil, false
-	}
-	index, ok := r.schema.indexes[name]
+	index, ok := r.schema.indexOf(name)
 	if !ok {
 		return nil, false
 	}
@@ -59,20 +71,21 @@ func (r RowValues) Get(name string) (any, bool) {
 
 // Field returns the name and value at the selected-field index.
 func (r RowValues) Field(index int) (string, any, bool) {
-	if r.schema == nil || index < 0 || index >= len(r.schema.names) {
+	name, ok := r.schema.nameAt(index)
+	if !ok {
 		return "", nil, false
 	}
 	if r.isNull {
-		return r.schema.names[index], nil, true
+		return name, nil, true
 	}
-	return r.schema.names[index], r.values[index], true
+	return name, r.values[index], true
 }
 
 type rowRangeOutput struct {
 	row         func(any) error
 	rowValues   func(RowValues) error
 	rowBatch    func(RowBatch) error
-	valueSchema *rowValuesSchema
+	valueSchema *rowResultSchema
 }
 
 func (o rowRangeOutput) yieldProjected(columns []rowColumn, values [][]any, rowIndex int) error {
