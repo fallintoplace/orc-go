@@ -66,8 +66,9 @@ func encodeUserMetadataItem(item UserMetadataItem) []byte {
 
 func cloneUserMetadata(items []UserMetadataItem) []UserMetadataItem {
 	cloned := make([]UserMetadataItem, len(items))
+	copy(cloned, items)
 	for i, item := range items {
-		cloned[i] = UserMetadataItem{Name: item.Name, Value: append([]byte(nil), item.Value...)}
+		cloned[i].Value = append([]byte(nil), item.Value...)
 	}
 	return cloned
 }
