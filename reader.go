@@ -355,13 +355,15 @@ func decodeSection(kind CompressionKind, blockSize uint64, data []byte) ([]byte,
 	if blockSize > maxBlockSize {
 		return nil, fmt.Errorf("ORC compression block size %d exceeds the %d-byte reader limit", blockSize, maxBlockSize)
 	}
+
+	var decode func([]byte) ([]byte, error)
 	switch kind {
 	case CompressionZlib:
-		return decodeORCChunks(data, blockSize, func(data []byte) ([]byte, error) {
+		decode = func(data []byte) ([]byte, error) {
 			return decodeDeflateChunk(data, blockSize)
-		})
+		}
 	case CompressionSnappy:
-		return decodeORCChunks(data, blockSize, func(data []byte) ([]byte, error) {
+		decode = func(data []byte) ([]byte, error) {
 			decodedLength, err := snappy.DecodedLen(data)
 			if err != nil {
 				return nil, err
@@ -370,9 +372,9 @@ func decodeSection(kind CompressionKind, blockSize uint64, data []byte) ([]byte,
 				return nil, fmt.Errorf("Snappy chunk expands to %d bytes, limit is %d", decodedLength, blockSize)
 			}
 			return snappy.Decode(nil, data)
-		})
+		}
 	case CompressionLZO:
-		return decodeORCChunks(data, blockSize, func(data []byte) ([]byte, error) {
+		decode = func(data []byte) ([]byte, error) {
 			decoded, consumed, err := lzo.DecompressN(data, lzo.DefaultDecompressOptions(int(blockSize)))
 			if err != nil {
 				return nil, err
@@ -381,27 +383,28 @@ func decodeSection(kind CompressionKind, blockSize uint64, data []byte) ([]byte,
 				return nil, fmt.Errorf("LZO chunk consumed %d of %d bytes", consumed, len(data))
 			}
 			return decoded, nil
-		})
+		}
 	case CompressionLZ4:
-		return decodeORCChunks(data, blockSize, func(data []byte) ([]byte, error) {
+		decode = func(data []byte) ([]byte, error) {
 			decoded := make([]byte, int(blockSize))
 			length, err := lz4.UncompressBlock(data, decoded)
 			if err != nil {
 				return nil, err
 			}
 			return decoded[:length], nil
-		})
+		}
 	case CompressionZstd:
-		return decodeORCChunks(data, blockSize, func(data []byte) ([]byte, error) {
+		decode = func(data []byte) ([]byte, error) {
 			return decodeZstdChunk(data, blockSize)
-		})
+		}
 	case CompressionBrotli:
-		return decodeORCChunks(data, blockSize, func(data []byte) ([]byte, error) {
+		decode = func(data []byte) ([]byte, error) {
 			return decodeBrotliChunk(data, blockSize)
-		})
+		}
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedCompression, kind)
 	}
+	return decodeORCChunks(data, blockSize, decode)
 }
 
 func decodeZstdChunk(data []byte, blockSize uint64) ([]byte, error) {
