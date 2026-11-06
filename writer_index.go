@@ -2,8 +2,8 @@ package orc
 
 import (
 	"fmt"
-	"slices"
 	"math"
+	"slices"
 	"sort"
 
 	"github.com/fallintoplace/orc-go/internal/rlev1"
