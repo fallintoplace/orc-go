@@ -381,29 +381,23 @@ func encryptionKeyLength(algorithm EncryptionAlgorithm) (int, error) {
 }
 
 func validateMasterKey(key []byte, algorithm EncryptionAlgorithm) error {
-	keyLength, err := encryptionKeyLength(algorithm)
-	if err != nil {
-		return err
-	}
-	if len(key) != keyLength {
-		return fmt.Errorf("ORC master key has %d bytes, want %d for algorithm %d", len(key), keyLength, algorithm)
-	}
-	if _, err := aes.NewCipher(key); err != nil {
-		return fmt.Errorf("ORC master key must be a valid AES key: %w", err)
-	}
-	return nil
+	return validateEncryptionKey(key, algorithm, "master")
 }
 
 func validateLocalKey(key []byte, algorithm EncryptionAlgorithm) error {
+	return validateEncryptionKey(key, algorithm, "local")
+}
+
+func validateEncryptionKey(key []byte, algorithm EncryptionAlgorithm, keyKind string) error {
 	keyLength, err := encryptionKeyLength(algorithm)
 	if err != nil {
 		return err
 	}
 	if len(key) != keyLength {
-		return fmt.Errorf("ORC local key has %d bytes, want %d for algorithm %d", len(key), keyLength, algorithm)
+		return fmt.Errorf("ORC %s key has %d bytes, want %d for algorithm %d", keyKind, len(key), keyLength, algorithm)
 	}
 	if _, err := aes.NewCipher(key); err != nil {
-		return fmt.Errorf("ORC local key must be a valid AES key: %w", err)
+		return fmt.Errorf("ORC %s key must be a valid AES key: %w", keyKind, err)
 	}
 	return nil
 }
