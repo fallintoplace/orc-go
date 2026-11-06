@@ -7,7 +7,7 @@ const defaultRowBatchSize = 1_024
 // callback returns. A null root has nil values in every column; use IsNull to
 // distinguish it from a non-null row with a null field.
 type RowBatch struct {
-	schema      *rowValuesSchema
+	schema      *rowResultSchema
 	columns     [][]any
 	rowCount    int
 	rootPresent []bool
@@ -44,7 +44,7 @@ func (b RowBatch) Get(row int, name string) (any, bool) {
 	if row < 0 || row >= b.rowCount {
 		return nil, false
 	}
-	column, ok := b.columnIndex(name)
+	column, ok := b.schema.indexOf(name)
 	if !ok {
 		return nil, false
 	}
@@ -56,29 +56,25 @@ func (b RowBatch) Get(row int, name string) (any, bool) {
 
 // Field returns the name and value at the field index for row.
 func (b RowBatch) Field(row, field int) (string, any, bool) {
-	if b.schema == nil || row < 0 || row >= b.rowCount || field < 0 || field >= len(b.schema.names) {
+	if row < 0 || row >= b.rowCount {
+		return "", nil, false
+	}
+	name, ok := b.schema.nameAt(field)
+	if !ok {
 		return "", nil, false
 	}
 	if b.rootPresent != nil && !b.rootPresent[row] {
-		return b.schema.names[field], nil, true
+		return name, nil, true
 	}
-	return b.schema.names[field], b.columns[field][row], true
+	return name, b.columns[field][row], true
 }
 
 // Column returns the row-aligned values for name. Null root rows contain nil;
 // use IsNull to distinguish them from null fields.
 func (b RowBatch) Column(name string) ([]any, bool) {
-	column, ok := b.columnIndex(name)
+	column, ok := b.schema.indexOf(name)
 	if !ok {
 		return nil, false
 	}
 	return b.columns[column], true
-}
-
-func (b RowBatch) columnIndex(name string) (int, bool) {
-	if b.schema == nil {
-		return 0, false
-	}
-	column, ok := b.schema.indexes[name]
-	return column, ok
 }

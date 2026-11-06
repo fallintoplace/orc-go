@@ -168,3 +168,30 @@ func TestReadRowBatchesAcrossStripes(t *testing.T) {
 		}
 	}
 }
+
+func TestRowResultZeroValuesHaveNoFields(t *testing.T) {
+	var row RowValues
+	if row.Len() != 0 {
+		t.Fatalf("RowValues.Len() = %d, want 0", row.Len())
+	}
+	if _, ok := row.Get("id"); ok {
+		t.Fatal("RowValues.Get() found a field in the zero value")
+	}
+	if _, _, ok := row.Field(0); ok {
+		t.Fatal("RowValues.Field() found a field in the zero value")
+	}
+
+	var batch RowBatch
+	if batch.Len() != 0 || batch.FieldNames() != nil {
+		t.Fatalf("zero RowBatch has %d rows and fields %v", batch.Len(), batch.FieldNames())
+	}
+	if _, ok := batch.Get(0, "id"); ok {
+		t.Fatal("RowBatch.Get() found a field in the zero value")
+	}
+	if _, _, ok := batch.Field(0, 0); ok {
+		t.Fatal("RowBatch.Field() found a field in the zero value")
+	}
+	if _, ok := batch.Column("id"); ok {
+		t.Fatal("RowBatch.Column() found a field in the zero value")
+	}
+}
