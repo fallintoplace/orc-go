@@ -42,12 +42,9 @@ func normalizeReadStringTypeValue(value string, kind TypeKind, maxLength uint32)
 }
 
 func truncateUTF8Characters(value string, maxLength uint32) string {
-	if uint64(utf8.RuneCountInString(value)) <= uint64(maxLength) {
-		return value
-	}
-	var characters uint32
+	var characters uint64
 	for index := range value {
-		if characters == maxLength {
+		if characters == uint64(maxLength) {
 			return value[:index]
 		}
 		characters++
