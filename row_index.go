@@ -2,7 +2,8 @@ package orc
 
 import (
 	"fmt"
-	"sort"
+	"cmp"
+	"slices"
 
 	"github.com/fallintoplace/orc-go/internal/wire"
 )
@@ -73,8 +74,8 @@ func (r *Reader) RowIndexes() ([]StripeRowIndexes, error) {
 				Entries:  entries,
 			})
 		}
-		sort.Slice(result[stripeIndex].Columns, func(i, j int) bool {
-			return result[stripeIndex].Columns[i].ColumnID < result[stripeIndex].Columns[j].ColumnID
+		slices.SortFunc(result[stripeIndex].Columns, func(a, b ColumnRowIndex) int {
+			return cmp.Compare(a.ColumnID, b.ColumnID)
 		})
 	}
 	return result, nil
