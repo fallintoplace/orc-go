@@ -3,6 +3,7 @@
 package wire
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -64,14 +65,7 @@ func Walk(data []byte, visit func(Field) error) error {
 			if len(data) < 8 {
 				return io.ErrUnexpectedEOF
 			}
-			field.Fixed64 = uint64(data[0]) |
-				uint64(data[1])<<8 |
-				uint64(data[2])<<16 |
-				uint64(data[3])<<24 |
-				uint64(data[4])<<32 |
-				uint64(data[5])<<40 |
-				uint64(data[6])<<48 |
-				uint64(data[7])<<56
+			field.Fixed64 = binary.LittleEndian.Uint64(data)
 			data = data[8:]
 		case 2:
 			length, n, err := readVarint(data)
@@ -88,10 +82,7 @@ func Walk(data []byte, visit func(Field) error) error {
 			if len(data) < 4 {
 				return io.ErrUnexpectedEOF
 			}
-			field.Fixed32 = uint32(data[0]) |
-				uint32(data[1])<<8 |
-				uint32(data[2])<<16 |
-				uint32(data[3])<<24
+			field.Fixed32 = binary.LittleEndian.Uint32(data)
 			data = data[4:]
 		default:
 			return fmt.Errorf("unsupported protobuf wire type %d", wireType)
