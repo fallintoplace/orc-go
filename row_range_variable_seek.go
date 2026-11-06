@@ -146,7 +146,7 @@ func (r *Reader) readIndexedVariableRangeStripe(
 		switch encoding.kind {
 		case columnEncodingDirect, columnEncodingDirectV2:
 		case columnEncodingDictionary, columnEncodingDictionaryV2:
-			if !isIndexedDictionaryType(column.kind) {
+			if !isWriterStringType(column.kind) {
 				return false, nil
 			}
 		default:
@@ -245,7 +245,7 @@ func (r *Reader) readIndexedVariableRangeStripe(
 		if err != nil {
 			return true, fmt.Errorf("stripe %d column %q (id %d): decode DICTIONARY_DATA stream: %w", stripeIndex, plan.column.name, plan.column.id, err)
 		}
-		if isIndexedStringType(plan.column.kind) {
+		if isWriterStringType(plan.column.kind) {
 			plan.dictionaryValues = make([]any, len(plan.dictionary))
 			for index, value := range plan.dictionary {
 				plan.dictionaryValues[index] = variableColumnValue(plan.column, value)
@@ -450,14 +450,6 @@ func isIndexedVariableType(kind TypeKind) bool {
 	default:
 		return false
 	}
-}
-
-func isIndexedDictionaryType(kind TypeKind) bool {
-	return kind == TypeKindString || kind == TypeKindChar || kind == TypeKindVarchar
-}
-
-func isIndexedStringType(kind TypeKind) bool {
-	return isIndexedDictionaryType(kind)
 }
 
 func isRLEv2Encoding(kind uint32) bool {
