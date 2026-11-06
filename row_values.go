@@ -122,23 +122,8 @@ func (o rowRangeOutput) yieldBatches(stripeIndex int, columns []rowColumn, value
 				return fmt.Errorf("stripe %d has too few decoded root columns", stripeIndex)
 			}
 			columnValues := make([]any, batchEnd-batchStart)
-			if batchValueEnd-rootValueIndex == batchEnd-batchStart {
-				if batchValueEnd > len(values[columnIndex]) {
-					return fmt.Errorf("stripe %d root STRUCT has too few decoded field values", stripeIndex)
-				}
-				copy(columnValues, values[columnIndex][rootValueIndex:batchValueEnd])
-			} else {
-				valueIndex := rootValueIndex
-				for rowIndex := batchStart; rowIndex < batchEnd; rowIndex++ {
-					if !rootPresent[rowIndex] {
-						continue
-					}
-					if valueIndex >= len(values[columnIndex]) {
-						return fmt.Errorf("stripe %d root STRUCT has too few decoded field values", stripeIndex)
-					}
-					columnValues[rowIndex-batchStart] = values[columnIndex][valueIndex]
-					valueIndex++
-				}
+			if !fillBatchColumn(columnValues, values[columnIndex], rootPresent, batchStart, batchEnd, rootValueIndex, batchValueEnd) {
+				return fmt.Errorf("stripe %d root STRUCT has too few decoded field values", stripeIndex)
 			}
 			batchColumns[columnIndex] = columnValues
 		}
