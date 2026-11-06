@@ -50,37 +50,25 @@ func parseFooter(data []byte) (fileFooter, error) {
 				}
 			}
 		case 4:
-			var data []byte
-			data, err = fieldBytes(field)
+			var typ Type
+			typ, err = parseEmbeddedField(field, parseType)
 			if err == nil {
-				var typ Type
-				typ, err = parseType(data)
-				if err == nil {
-					result.types = append(result.types, typ)
-				}
+				result.types = append(result.types, typ)
 			}
 		case 5:
-			var data []byte
-			data, err = fieldBytes(field)
+			var item UserMetadataItem
+			item, err = parseEmbeddedField(field, parseUserMetadataItem)
 			if err == nil {
-				var item UserMetadataItem
-				item, err = parseUserMetadataItem(data)
-				if err == nil {
-					result.userMetadata = append(result.userMetadata, item)
-				}
+				result.userMetadata = append(result.userMetadata, item)
 			}
 		case 6:
 			result.numberOfRows, err = fieldVarint(field)
 			result.hasNumberOfRows = err == nil
 		case 7:
-			var data []byte
-			data, err = fieldBytes(field)
+			var statistics ColumnStatistics
+			statistics, err = parseEmbeddedField(field, parseColumnStatistics)
 			if err == nil {
-				var statistics ColumnStatistics
-				statistics, err = parseColumnStatistics(data)
-				if err == nil {
-					result.statistics = append(result.statistics, statistics)
-				}
+				result.statistics = append(result.statistics, statistics)
 			}
 		case 8:
 			result.rowIndexStride, err = fieldVarint(field)
@@ -97,14 +85,10 @@ func parseFooter(data []byte) (fileFooter, error) {
 				result.calendar = CalendarKind(value)
 			}
 		case 10:
-			var data []byte
-			data, err = fieldBytes(field)
+			var encryption fileEncryption
+			encryption, err = parseEmbeddedField(field, parseFileEncryption)
 			if err == nil {
-				var encryption fileEncryption
-				encryption, err = parseFileEncryption(data)
-				if err == nil {
-					result.encryption = &encryption
-				}
+				result.encryption = &encryption
 			}
 		case 12:
 			result.softwareVersion, err = fieldString(field)
@@ -118,6 +102,15 @@ func parseFooter(data []byte) (fileFooter, error) {
 		return fileFooter{}, err
 	}
 	return result, nil
+}
+
+func parseEmbeddedField[T any](field wire.Field, parse func([]byte) (T, error)) (T, error) {
+	data, err := fieldBytes(field)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return parse(data)
 }
 
 func parseType(data []byte) (Type, error) {
