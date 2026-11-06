@@ -161,14 +161,13 @@ func timestampWriterLocation(name string) (*time.Location, error) {
 }
 
 func parseGMTOffset(name string) (int, bool) {
-	prefix := "GMT"
-	if strings.HasPrefix(name, "UTC") {
-		prefix = "UTC"
+	offset, ok := strings.CutPrefix(name, "GMT")
+	if !ok {
+		offset, ok = strings.CutPrefix(name, "UTC")
 	}
-	if !strings.HasPrefix(name, prefix) || len(name) <= len(prefix) {
+	if !ok || offset == "" {
 		return 0, false
 	}
-	offset := name[len(prefix):]
 	sign := 1
 	if offset[0] == '-' {
 		sign = -1
